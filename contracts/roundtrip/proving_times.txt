@@ -1,0 +1,4 @@
+circuit | prove_ms | verify_ms | gates | public_inputs
+deposit | 1988 | 410 | 2969 | 5
+transfer | 5544 | 136 | 24576 | 11
+withdraw | 3406 | 120 | 24420 | 12

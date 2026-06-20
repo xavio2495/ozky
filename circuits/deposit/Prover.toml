@@ -1,0 +1,8 @@
+domain_sep = "0x0432a63b9b466eb5d74081da0e9b9accb182ccadbbb5a0ffc340fc18c2bb512d"
+asset_tag = "0x01"
+epoch = "0x1c"
+amount = "0x03e8"
+out_commitment = "0x0db85f2d93c5b92a58e4a755ca6a829e24f3d6400e93dbcfd0eaadb19e0316fc"
+owner_pk = "0x2c4e230de185e2ffa3ee2f95b2895c8a30241018973f57f0e16102c36de1590e"
+blinding = "0x0309"
+rho = "0x6f"

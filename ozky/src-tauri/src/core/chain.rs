@@ -7,7 +7,8 @@
 
 use super::config::PoolConfig;
 use super::poseidon::Fr;
-use super::CoreError;
+use super::{notes, CoreError};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,7 +29,7 @@ const EMPTY_TOLERANCE: u32 = 4;
 
 /// One commitment leaf + its (optional) encrypted payload, decoded from a `commit`
 /// event. (Same shape the indexer's `/scan` served, now sourced from raw RPC.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitEntry {
     pub leaf_index: u32,
     pub commitment: String,
@@ -218,31 +219,101 @@ fn classify(e: &RawEvent) -> Option<Decoded> {
 
 // ----------------------------- pool state -----------------------------
 
-/// Drain all of a pool's `commit`/`nullif` events from RPC and reconstruct its state.
-/// Pages via the cursor to the tip (the Z6 drain: keep paging while the cursor
-/// advances; stop after a few empty windows once events have been seen).
+/// An on-disk, per-pool **incremental scan cache** (G9). Pool events are public, so this
+/// is plaintext (the secret-bearing openings live in the encrypted notes store). A scan
+/// resumes from `cursor_ledger` (the highest ledger seen so far) instead of re-draining
+/// the whole retention window, then appends only the new events.
+#[derive(Serialize, Deserialize, Default)]
+struct PoolCache {
+    cursor_ledger: u32,
+    commits: Vec<CommitEntry>,
+    /// Published nullifiers (hex) seen so far.
+    nullifiers: Vec<String>,
+}
+
+/// `poolcache-<pool id>.json` under the app data dir. Pool ids are StrKey (filesystem-safe).
+fn cache_path(pool: &str) -> PathBuf {
+    notes::data_dir().join(format!("poolcache-{pool}.json"))
+}
+
+/// Load the pool's scan cache (empty/default on any miss — the cache is best-effort and
+/// never a correctness dependency: a missing/corrupt cache just means a full re-drain).
+fn load_cache(pool: &str) -> PoolCache {
+    std::fs::read(cache_path(pool))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the pool's scan cache (best-effort: a write failure never fails the scan).
+fn save_cache(pool: &str, c: &PoolCache) {
+    if let Ok(b) = serde_json::to_vec(c) {
+        let dir = notes::data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(cache_path(pool), b);
+    }
+}
+
+/// Reconstruct a pool's `commit`/`nullif` state from RPC. **Incremental (G9):** seeds
+/// from the per-pool cache and resumes the `getEvents` drain from the last ledger seen,
+/// so a repeat call costs O(new events) instead of re-draining the whole window. The
+/// cumulative set is identical to a full drain (events are append-only + deduped); set
+/// `OZKY_NO_POOL_CACHE` to force a fresh full drain. Pages to the tip via the cursor
+/// (the Z6 drain: keep paging while the cursor advances; stop after a few empty windows
+/// once events have been seen).
 pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
     let pool = &cfg.pool_contract;
-    let start = resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?;
+    let use_cache = std::env::var("OZKY_NO_POOL_CACHE").is_err();
 
-    let mut commits: Vec<CommitEntry> = Vec::new();
-    let mut nullifiers: Vec<Fr> = Vec::new();
+    // Seed accumulators from the cache (resume), or start empty (fresh full drain).
+    let cache = if use_cache { load_cache(pool) } else { PoolCache::default() };
+    let mut commits: Vec<CommitEntry> = cache.commits;
+    let mut nullifiers: Vec<Fr> = cache
+        .nullifiers
+        .iter()
+        .filter_map(|h| Fr::from_hex(h))
+        .collect();
+
+    // Resume from the cached cursor; else from the retention-window start.
+    let mut start = if use_cache && cache.cursor_ledger > 0 {
+        cache.cursor_ledger
+    } else {
+        resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?
+    };
+
     let mut cursor: Option<String> = None;
     let mut total = 0usize;
     let mut empty_run = 0u32;
+    let mut max_ledger = start;
+    let mut tried_fallback = false;
 
     for _ in 0..MAX_PAGES {
-        let (events, next) = get_events_page(
+        let page = get_events_page(
             &cfg.rpc_url,
             pool,
             if cursor.is_none() { Some(start) } else { None },
             cursor.as_deref(),
-        )
-        .map_err(CoreError::Chain)?;
+        );
+        let (events, next) = match page {
+            Ok(p) => p,
+            // The cached cursor aged out of the RPC retention window: fall back to a
+            // fresh in-window start ONCE (older cached commits stay; the unqueryable gap
+            // is the same horizon the non-cached path has, so this is no regression).
+            Err(_) if use_cache && cursor.is_none() && !tried_fallback => {
+                tried_fallback = true;
+                start = resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?;
+                max_ledger = max_ledger.max(start);
+                continue;
+            }
+            Err(e) => return Err(CoreError::Chain(e)),
+        };
         let n = events.len();
         total += n;
 
         for raw in &events {
+            if raw.ledger > max_ledger {
+                max_ledger = raw.ledger;
+            }
             match classify(raw) {
                 Some(Decoded::Commit(c)) => {
                     if !commits.iter().any(|x| x.leaf_index == c.leaf_index) {
@@ -275,6 +346,18 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
     }
 
     commits.sort_by_key(|c| c.leaf_index);
+
+    if use_cache {
+        save_cache(
+            pool,
+            &PoolCache {
+                cursor_ledger: max_ledger,
+                commits: commits.clone(),
+                nullifiers: nullifiers.iter().map(|f| f.to_hex()).collect(),
+            },
+        );
+    }
+
     Ok(PoolState { commits, nullifiers })
 }
 
@@ -287,6 +370,71 @@ pub fn commitment_leaves_from(commits: &[CommitEntry]) -> Result<Vec<Fr>, CoreEr
                 .ok_or_else(|| CoreError::Chain(format!("bad commitment hex: {}", c.commitment)))
         })
         .collect()
+}
+
+// ----------------------------- ASP approved set -----------------------------
+
+/// Decode a policy `asp_mem` event → `(leaf index, owner_pk)`. Topics are
+/// `[Symbol("asp_mem"), U32 index]`; value is the bare `U256 owner_pk` (single-value).
+fn classify_member(e: &RawEvent) -> Option<(u32, Fr)> {
+    match scval(e.topics.first()?)? {
+        ScVal::Symbol(s) if s.0.as_slice() == b"asp_mem" => {}
+        _ => return None,
+    }
+    let index = match scval(e.topics.get(1)?)? {
+        ScVal::U32(n) => n,
+        _ => return None,
+    };
+    let owner_pk = Fr::from_hex(&u256_hex(&scval(&e.value)?)?)?;
+    Some((index, owner_pk))
+}
+
+/// Reconstruct the ASP approved set (the ordered `owner_pk` leaves) by draining the
+/// policy contract's `asp_mem` events from raw RPC — so a client builds its membership
+/// path with no indexer (the reconstructed root self-checks against the pool's
+/// `asp_root`). Returns leaves in enrollment order (= Merkle leaf order).
+pub fn approved_set(cfg: &PoolConfig) -> Result<Vec<Fr>, CoreError> {
+    let policy = &cfg.policy_contract;
+    let start = resolve_start(&cfg.rpc_url, policy).map_err(CoreError::Chain)?;
+
+    let mut members: Vec<(u32, Fr)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut total = 0usize;
+    let mut empty_run = 0u32;
+
+    for _ in 0..MAX_PAGES {
+        let (events, next) = get_events_page(
+            &cfg.rpc_url,
+            policy,
+            if cursor.is_none() { Some(start) } else { None },
+            cursor.as_deref(),
+        )
+        .map_err(CoreError::Chain)?;
+        let n = events.len();
+        total += n;
+        for raw in &events {
+            if let Some((index, owner_pk)) = classify_member(raw) {
+                if !members.iter().any(|(i, _)| *i == index) {
+                    members.push((index, owner_pk));
+                }
+            }
+        }
+        let advanced = next.is_some() && next != cursor;
+        if next.is_some() {
+            cursor = next;
+        }
+        if n == 0 {
+            empty_run += 1;
+            if !advanced || (total > 0 && empty_run >= EMPTY_TOLERANCE) {
+                break;
+            }
+        } else {
+            empty_run = 0;
+        }
+    }
+
+    members.sort_by_key(|(i, _)| *i);
+    Ok(members.into_iter().map(|(_, pk)| pk).collect())
 }
 
 // ----------------------------- on-chain submission -----------------------------
@@ -406,6 +554,75 @@ pub fn withdraw_invoke_script(
     )
 }
 
+/// `enroll` invoke (admin path): approve the wallet's `owner_pk` into the policy's ASP
+/// set AND allow-list its funding address, then `sync_asp_root` on the pool so the
+/// cached root tracks the new set. `owner_pk_dec` is the decimal `U256`.
+pub fn enroll_invoke_script(cfg: &PoolConfig, owner_pk_dec: &str, who: &str) -> String {
+    format!(
+        "{prelude}\
+         stellar contract invoke --id {policy} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
+           enroll --owner_pk {pk} --who {who}; \
+         stellar contract invoke --id {pool} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
+           sync_asp_root",
+        prelude = prelude(cfg),
+        policy = cfg.policy_contract,
+        pool = cfg.pool_contract,
+        net = cfg.network,
+        pk = owner_pk_dec,
+        who = who,
+    )
+}
+
+/// Enroll a wallet (admin path) + sync the pool's cached root. Returns the tx hash.
+pub fn submit_enroll(
+    cfg: &PoolConfig,
+    admin_secret: &str,
+    owner_pk_dec: &str,
+    who: &str,
+) -> Result<String, CoreError> {
+    let script = enroll_invoke_script(cfg, owner_pk_dec, who);
+    run_invoke(admin_secret, "enroll", &script)
+}
+
+/// Record a disclosure grant on the viewkeys contract: `register_view_key` (publish the
+/// scope's PUBLIC key halves) then `disclose` (the auditable, revocable grant). Both
+/// require the owner's auth, so they are submitted by the wallet. `viewing_pub`/
+/// `detection_pub` are 32-byte hex (no `0x`); the `ViewScope` struct is passed as JSON.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_disclosure(
+    cfg: &PoolConfig,
+    viewkeys: &str,
+    owner_secret: &str,
+    owner_addr: &str,
+    auditor_addr: &str,
+    account: u32,
+    asset_tag_dec: &str,
+    epoch: u32,
+    viewing_pub: &str,
+    detection_pub: &str,
+) -> Result<String, CoreError> {
+    // ViewScope { account: u32, asset_tag: U256, epoch: u32 } as the CLI's JSON form.
+    let scope = format!(
+        "{{\"account\":{account},\"asset_tag\":\"{asset_tag_dec}\",\"epoch\":{epoch}}}"
+    );
+    let script = format!(
+        "{prelude}\
+         stellar contract invoke --id {vk} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
+           register_view_key --owner {owner} --scope '{scope}' --viewing_pub {vp} --detection_pub {dp}; \
+         stellar contract invoke --id {vk} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
+           disclose --owner {owner} --auditor {auditor} --scope '{scope}'",
+        prelude = prelude(cfg),
+        vk = viewkeys,
+        net = cfg.network,
+        owner = owner_addr,
+        auditor = auditor_addr,
+        scope = scope,
+        vp = viewing_pub,
+        dp = detection_pub,
+    );
+    run_invoke(owner_secret, "disclose", &script)
+}
+
 fn repo_root() -> PathBuf {
     if let Ok(p) = std::env::var("OZKY_REPO_ROOT") {
         return PathBuf::from(p);
@@ -478,4 +695,47 @@ pub fn submit_withdraw(
 ) -> Result<String, CoreError> {
     let script = withdraw_invoke_script(cfg, dest, amount, public_inputs_path, proof_path);
     run_invoke(source_secret, "withdraw", &script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(leaf: u32) -> CommitEntry {
+        CommitEntry {
+            leaf_index: leaf,
+            commitment: format!("0x{leaf:064x}"),
+            enc_note: Some("0xabcd".into()),
+            ephemeral_pub: Some("0x00".into()),
+            view_tag: Some(7),
+        }
+    }
+
+    #[test]
+    fn pool_cache_roundtrips_cursor_and_state() {
+        // The scan cache must serialize losslessly so an incremental resume sees the
+        // same commits/nullifiers/cursor it persisted (the basis of O(new-events) scans).
+        let c = PoolCache {
+            cursor_ledger: 123_456,
+            commits: vec![entry(0), entry(1)],
+            nullifiers: vec![Fr::from_u64(9).to_hex(), Fr::from_u64(10).to_hex()],
+        };
+        let bytes = serde_json::to_vec(&c).unwrap();
+        let back: PoolCache = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.cursor_ledger, 123_456);
+        assert_eq!(back.commits.len(), 2);
+        assert_eq!(back.commits[1].leaf_index, 1);
+        assert_eq!(back.commits[0].view_tag, Some(7));
+        assert_eq!(back.nullifiers.len(), 2);
+        // Nullifier hex round-trips back to the same field element.
+        assert_eq!(Fr::from_hex(&back.nullifiers[0]).unwrap(), Fr::from_u64(9));
+    }
+
+    #[test]
+    fn missing_cache_is_default_not_an_error() {
+        // A miss (no file / bad json) yields an empty cache → a full drain, never a failure.
+        let c = load_cache("CNONEXISTENTPOOLIDFORTEST______________________________");
+        assert_eq!(c.cursor_ledger, 0);
+        assert!(c.commits.is_empty());
+    }
 }

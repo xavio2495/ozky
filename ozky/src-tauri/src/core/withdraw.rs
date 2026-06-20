@@ -30,11 +30,12 @@ pub struct WithdrawReceipt {
     pub change_epoch: u32,
 }
 
-/// Withdraw `amount` of the configured asset to the public Stellar `dest`, using the
-/// wallet in the OS keychain. Returns the tx hash (change opening is in the `_with` form).
-pub fn withdraw(dest: &str, amount: u64) -> Result<String, CoreError> {
+/// Withdraw `amount` of `asset` (a v1 code, e.g. "USDC") to the public Stellar `dest`,
+/// using the wallet in the OS keychain. Returns the tx hash (change opening is in the
+/// `_with` form).
+pub fn withdraw(asset: &str, dest: &str, amount: u64) -> Result<String, CoreError> {
     let wallet = keys::current_wallet()?;
-    let cfg = PoolConfig::load()?;
+    let cfg = PoolConfig::load()?.with_asset(asset)?;
     Ok(withdraw_with(&wallet, &cfg, dest, amount)?.tx_hash)
 }
 
@@ -54,18 +55,23 @@ pub fn withdraw_with(
     // recovered from the local store, e.g. a prior withdraw change).
     let state = chain::pool_state(cfg)?;
     let commitment_leaves = chain::commitment_leaves_from(&state.commits)?;
+    let asp_leaves = chain::approved_set(cfg)?;
     let local = notes::load(wallet)?;
     let note = scan::owned_notes(&id, &state, &local, 0)?
         .into_iter()
         .find(|n| n.value >= amount && n.asset_tag == cfg.asset_tag)
         .ok_or_else(|| CoreError::Proving(format!("no single owned note covers {amount}")))?;
+    if !asp_leaves.contains(&id.owner_pk) {
+        return Err(CoreError::Proving(
+            "wallet not enrolled in this pool's ASP approved set (cannot prove membership)".into(),
+        ));
+    }
 
     // dest_bind = Poseidon(DOMAIN_DEST, dest_pubkey). NOTE: the pool only checks this
     // is non-zero today (Z4 debt), so the on-chain dest binding is not yet enforced.
     let dest_field = dest_to_field(dest)?;
     let dest_bind = h.hash(&[Fr::from_u64(DOMAIN_DEST), dest_field]);
 
-    let asp_leaves = vec![id.owner_pk];
     let change_blinding = Fr::random();
     let change_rho = Fr::random();
     let witness = WithdrawWitness::build(
@@ -94,9 +100,10 @@ pub fn withdraw_with(
     // Prove (writes proof + public_inputs to circuits/withdraw/target; verifies vs VK).
     proving::prove_withdraw_witness(&witness)?;
 
+    // Relayer-submitted if configured (fee abstraction; withdraw is permissionless).
     let tx_hash = chain::submit_withdraw(
         cfg,
-        wallet.stellar_secret(),
+        cfg.submit_source(wallet.stellar_secret()),
         dest,
         amount,
         PUBLIC_INPUTS_PATH,

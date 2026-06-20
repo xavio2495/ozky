@@ -17,11 +17,12 @@ use super::{chain, keys, proving, scan, CoreError};
 const PROOF_PATH: &str = "/workspace/circuits/deposit/target/proof";
 const PUBLIC_INPUTS_PATH: &str = "/workspace/circuits/deposit/target/public_inputs";
 
-/// Deposit `amount` of the configured asset from the wallet's Stellar account into the
-/// shielded pool, using the wallet stored in the OS keychain. Returns the tx hash.
-pub fn deposit(amount: u64) -> Result<String, CoreError> {
+/// Deposit `amount` of `asset` (a v1 code, e.g. "USDC") from the wallet's Stellar
+/// account into the shielded pool, using the wallet stored in the OS keychain. Returns
+/// the tx hash.
+pub fn deposit(asset: &str, amount: u64) -> Result<String, CoreError> {
     let wallet = keys::current_wallet()?;
-    let cfg = PoolConfig::load()?;
+    let cfg = PoolConfig::load()?.with_asset(asset)?;
     deposit_with(&wallet, &cfg, amount)
 }
 

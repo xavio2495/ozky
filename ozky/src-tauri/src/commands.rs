@@ -45,32 +45,89 @@ pub fn restore_wallet(phrase: String) -> Result<(), CoreError> {
     core::keychain::store(core::keys::SEED_ACCOUNT, phrase.trim())
 }
 
-/// Total spendable balance per asset. (A2)
-#[tauri::command]
-pub fn balance() -> Result<u64, CoreError> {
-    core::scan::scan(0).map(|notes| notes.iter().map(|n| n.value).sum())
+/// Spendable balance of one asset the wallet holds shielded notes in.
+#[derive(Serialize)]
+pub struct AssetBalance {
+    /// v1 asset code (e.g. "USDC"), or the raw `asset_tag` decimal if unknown.
+    pub code: String,
+    /// The in-circuit `asset_tag` (decimal).
+    pub asset_tag: String,
+    /// Total spendable value in base units.
+    pub raw: u64,
+    /// Human-readable amount (base units scaled by `decimals`).
+    pub display: String,
+    pub decimals: u32,
 }
 
-/// Deposit `amount` of the configured asset into the shielded pool from the wallet's
-/// Stellar account (the public on-ramp: fund [`funding_address`] from any wallet, then
-/// deposit to shield it). Returns the tx hash. (A3)
+/// Total spendable balance **per asset** (one row per known v1 asset; 0 if none held).
+/// Notes carry their `asset_tag` in plaintext, so a single scan covers every asset. (A2/G6)
 #[tauri::command]
-pub fn deposit(amount: u64) -> Result<String, CoreError> {
-    core::deposit::deposit(amount)
+pub fn balance() -> Result<Vec<AssetBalance>, CoreError> {
+    let notes = core::scan::scan(0)?;
+    let mut out = Vec::new();
+    for a in core::config::ASSETS {
+        let tag_dec = a.tag.to_string();
+        let raw: u64 = notes
+            .iter()
+            .filter(|n| n.asset_tag.to_decimal() == tag_dec)
+            .map(|n| n.value)
+            .sum();
+        out.push(AssetBalance {
+            code: a.code.to_string(),
+            asset_tag: tag_dec,
+            raw,
+            display: format_units(raw, a.decimals),
+            decimals: a.decimals,
+        });
+    }
+    Ok(out)
 }
 
-/// Send `amount` privately to `recipient` (a shielded payment code). Builds + proves
-/// the transfer against live pool state and submits it; returns the tx hash. (A3)
-#[tauri::command]
-pub fn send(recipient: String, amount: u64) -> Result<String, CoreError> {
-    core::send::send(&recipient, amount)
+/// Format `raw` base units as a decimal string scaled by `decimals` (e.g. 1000 @ 7 → "0.0001000").
+fn format_units(raw: u64, decimals: u32) -> String {
+    if decimals == 0 {
+        return raw.to_string();
+    }
+    let scale = 10u64.pow(decimals);
+    let whole = raw / scale;
+    let frac = raw % scale;
+    format!("{whole}.{frac:0>width$}", width = decimals as usize)
 }
 
-/// Withdraw `amount` out of the shielded pool to a public Stellar `dest` address (the
-/// off-ramp). Returns the tx hash. (A3)
+/// This wallet's spending public key (`owner_pk`, hex) — share it with the ASP to be
+/// enrolled into a shared pool's anonymity set. (A3 / ASP enrollment)
 #[tauri::command]
-pub fn withdraw(dest: String, amount: u64) -> Result<String, CoreError> {
-    core::withdraw::withdraw(&dest, amount)
+pub fn spending_key() -> Result<String, CoreError> {
+    core::enroll::spending_key()
+}
+
+/// Enroll this wallet into the configured pool's ASP approved set + deposit allow-list
+/// (testnet/dev: the wallet must be the policy admin). Returns the tx hash. (A3)
+#[tauri::command]
+pub fn enroll() -> Result<String, CoreError> {
+    core::enroll::enroll_self()
+}
+
+/// Deposit `amount` of `asset` (a v1 code, e.g. "USDC") into the shielded pool from the
+/// wallet's Stellar account (the public on-ramp: fund [`funding_address`] from any
+/// wallet, then deposit to shield it). Returns the tx hash. (A3/G6)
+#[tauri::command]
+pub fn deposit(asset: String, amount: u64) -> Result<String, CoreError> {
+    core::deposit::deposit(&asset, amount)
+}
+
+/// Send `amount` of `asset` privately to `recipient` (a shielded payment code). Builds +
+/// proves the transfer against live pool state and submits it; returns the tx hash. (A3/G6)
+#[tauri::command]
+pub fn send(asset: String, recipient: String, amount: u64) -> Result<String, CoreError> {
+    core::send::send(&asset, &recipient, amount)
+}
+
+/// Withdraw `amount` of `asset` out of the shielded pool to a public Stellar `dest`
+/// address (the off-ramp). Returns the tx hash. (A3/G6)
+#[tauri::command]
+pub fn withdraw(asset: String, dest: String, amount: u64) -> Result<String, CoreError> {
+    core::withdraw::withdraw(&asset, &dest, amount)
 }
 
 /// This wallet's **public Stellar funding address** (`G…`). Give this to any wallet or
@@ -90,8 +147,22 @@ pub fn receive_address() -> Result<String, CoreError> {
     core::send::receive_code()
 }
 
-/// Export a scoped disclosure for an auditor (account / asset / epoch). (A2/A3)
+/// Export a scoped, read-only disclosure for an auditor (a Stellar `G…`) and record the
+/// auditable on-chain grant. Returns the disclosure package (JSON) to hand the auditor
+/// out-of-band: it lets them re-derive + verify this wallet's notes for the scope, with
+/// no spend authority. (A3 / G5)
 #[tauri::command]
-pub fn share_with_auditor(_auditor: String, _epoch: u32) -> Result<String, CoreError> {
-    Err(CoreError::not_implemented("share_with_auditor (A3)"))
+pub fn share_with_auditor(auditor: String, epoch: u32) -> Result<String, CoreError> {
+    core::disclose::share_with_auditor(&auditor, epoch)
+}
+
+/// Auditor side: given a disclosure package (JSON from [`share_with_auditor`]), scan the
+/// disclosed pool and return the owner's notes it reveals (each verified against its
+/// on-chain commitment), as JSON. Read-only; needs no wallet. (A3 / G5)
+#[tauri::command]
+pub fn audit_disclosure(package: String) -> Result<String, CoreError> {
+    let notes = core::disclose::audit(&package)?;
+    let total = core::disclose::disclosed_total(&notes);
+    serde_json::to_string(&serde_json::json!({ "total": total, "notes": notes }))
+        .map_err(|e| CoreError::Crypto(format!("serialize audit: {e}")))
 }

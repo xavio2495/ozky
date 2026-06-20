@@ -23,9 +23,10 @@ use std::path::PathBuf;
 
 const RECORD_LEN: usize = 108; // NotePlaintext serialized length.
 
-/// Directory for per-wallet note files. `OZKY_NOTES_DIR` overrides (set by the command
-/// layer to Tauri's app-data dir, or by tests to a temp dir); else a platform default.
-fn notes_dir() -> PathBuf {
+/// App data directory. `OZKY_NOTES_DIR` overrides (set by the command layer to Tauri's
+/// app-data dir, or by tests to a temp dir); else a platform default. Shared by the
+/// encrypted notes store and the (plaintext) per-pool scan cache ([`super::chain`]).
+pub(crate) fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("OZKY_NOTES_DIR") {
         return PathBuf::from(d);
     }
@@ -40,7 +41,7 @@ fn notes_dir() -> PathBuf {
 /// multiple wallets on one machine don't collide. The address is public (not secret).
 fn store_path(wallet: &WalletKeys) -> PathBuf {
     let digest = Sha256::digest(wallet.stellar_address().as_bytes());
-    notes_dir().join(format!("notes-{}.enc", hex::encode(&digest[..8])))
+    data_dir().join(format!("notes-{}.enc", hex::encode(&digest[..8])))
 }
 
 fn cipher(wallet: &WalletKeys) -> ChaCha20Poly1305 {
@@ -83,7 +84,7 @@ fn save(wallet: &WalletKeys, notes: &[NotePlaintext]) -> Result<(), CoreError> {
         .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
         .map_err(|_| CoreError::Crypto("notes store encrypt failed".into()))?;
 
-    let dir = notes_dir();
+    let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| CoreError::Crypto(format!("mkdir notes dir: {e}")))?;
     let mut blob = Vec::with_capacity(12 + ct.len());
     blob.extend_from_slice(&nonce);
@@ -118,14 +119,27 @@ mod tests {
     use crate::core::keys;
     use crate::core::poseidon::Fr;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
     const MNEMONIC: &str =
         "illness spike retreat truth genius clock brain pass fit cave bargain toe";
 
-    fn temp_dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("ozky-notes-test-{}", std::process::id()));
+    // `OZKY_NOTES_DIR` is a process-global env var; serialize the notes tests (which
+    // run as threads in one process) so they don't clobber each other's dir. Each test
+    // also gets a unique dir, so even the serialized runs never share a store file.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Hold the env lock for the test's lifetime + point `OZKY_NOTES_DIR` at a fresh
+    /// unique dir. Returns the guard (kept alive by the caller).
+    fn isolated_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("ozky-notes-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::env::set_var("OZKY_NOTES_DIR", &d);
-        d
+        guard
     }
 
     fn sample(rho: u64) -> NotePlaintext {
@@ -140,7 +154,7 @@ mod tests {
 
     #[test]
     fn add_then_load_roundtrips_and_dedups() {
-        let _dir = temp_dir();
+        let _env = isolated_env();
         let wallet = keys::derive_from_mnemonic(MNEMONIC).unwrap();
 
         assert!(load(&wallet).unwrap().is_empty(), "empty before any add");
@@ -156,7 +170,7 @@ mod tests {
 
     #[test]
     fn store_is_encrypted_at_rest() {
-        let _dir = temp_dir();
+        let _env = isolated_env();
         let wallet = keys::derive_from_mnemonic(MNEMONIC).unwrap();
         add(&wallet, sample(0xfeed)).unwrap();
         let raw = std::fs::read(store_path(&wallet)).unwrap();

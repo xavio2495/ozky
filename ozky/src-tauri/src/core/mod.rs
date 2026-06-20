@@ -22,7 +22,9 @@
 pub mod chain;
 pub mod config;
 pub mod deposit;
+pub mod disclose;
 pub mod encrypt;
+pub mod enroll;
 pub mod keychain;
 pub mod keys;
 pub mod notes;

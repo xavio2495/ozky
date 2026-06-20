@@ -58,10 +58,12 @@ fn parse_pub32(h: &str) -> Option<[u8; 32]> {
     })
 }
 
-/// Try to match a single scan entry to this wallet: view-tag filter, decrypt, then
-/// re-derive the commitment with our `owner_pk` and require it to equal the on-chain
-/// leaf. Returns the owned note only on a full, authenticated match.
-fn try_match(
+/// Try to match a single scan entry to a wallet/scope: view-tag filter, decrypt, then
+/// re-derive the commitment with `owner_pk` and require it to equal the on-chain leaf.
+/// Returns the owned note only on a full, authenticated match. Public so the
+/// disclosure flow ([`super::disclose`]) can reuse it with a DISCLOSED viewing key +
+/// the owner's `owner_pk` (the auditor re-derives exactly the owner's notes for a scope).
+pub fn match_owned(
     h: &Hasher,
     entry: &chain::CommitEntry,
     transmission_sk: &StaticSecret,
@@ -200,7 +202,7 @@ pub fn owned_notes(
         if entry.leaf_index < from_leaf {
             continue;
         }
-        let note = try_match(&h, entry, &id.transmission_sk, &id.owner_pk)
+        let note = match_owned(&h, entry, &id.transmission_sk, &id.owner_pk)
             .or_else(|| match_local(&h, entry, &id.owner_pk, local));
         if let Some(note) = note {
             // Exclude already-spent notes (nullifier published).
@@ -257,12 +259,12 @@ mod tests {
 
         // Ours.
         let mine = owned_entry(&h, &owner_pk, &ivk, 0);
-        assert!(try_match(&h, &mine, &tsk, &owner_pk).is_some(), "must match own note");
+        assert!(match_owned(&h, &mine, &tsk, &owner_pk).is_some(), "must match own note");
 
         // Someone else's note (encrypted to a different transmission key).
         let other = owned_entry(&h, &h.owner_pk(&Fr::from_u64(99)), &[8u8; 32], 1);
         assert!(
-            try_match(&h, &other, &tsk, &owner_pk).is_none(),
+            match_owned(&h, &other, &tsk, &owner_pk).is_none(),
             "must NOT match a foreign note"
         );
 
@@ -274,7 +276,7 @@ mod tests {
             ephemeral_pub: None,
             view_tag: None,
         };
-        assert!(try_match(&h, &bare, &tsk, &owner_pk).is_none());
+        assert!(match_owned(&h, &bare, &tsk, &owner_pk).is_none());
     }
 
     #[test]
@@ -282,7 +284,7 @@ mod tests {
         let h = Hasher::new();
         let owner_pk = h.owner_pk(&Fr::from_u64(12345));
         let ivk = [7u8; 32];
-        let note = try_match(
+        let note = match_owned(
             &h,
             &owned_entry(&h, &owner_pk, &ivk, 5),
             &encrypt::transmission_secret(&ivk),

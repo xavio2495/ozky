@@ -87,6 +87,7 @@ pub fn build_transfer_witness(
     note: &OwnedNote,
     commitment_leaves: &[Fr],
     prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
     recipient_owner_pk: Fr,
     amount: u64,
     rnd: &OutputRandomness,
@@ -100,9 +101,14 @@ pub fn build_transfer_witness(
     if note.asset_tag != cfg.asset_tag {
         return Err(CoreError::Proving("note asset_tag != pool asset_tag".into()));
     }
+    // The spender must be in the pool's ASP approved set (anonymity set of size
+    // `asp_leaves.len()`); proving `owner_pk ∈ asp_root` for a hidden index.
+    if !asp_leaves.contains(&id.owner_pk) {
+        return Err(CoreError::Proving(
+            "wallet not enrolled in this pool's ASP approved set (cannot prove membership)".into(),
+        ));
+    }
     let domain_sep = h.domain_sep(&cfg.pool_id, &cfg.network_id, SELECTOR_TRANSFER);
-    // Testnet single-user approved set = the spender's own owner_pk.
-    let asp_leaves = vec![id.owner_pk];
 
     Ok(TransferWitness::build(
         h,
@@ -117,7 +123,7 @@ pub fn build_transfer_witness(
             note_rho: note.rho,
             note_leaf_index: note.leaf_index as usize,
             commitment_leaves,
-            asp_leaves: &asp_leaves,
+            asp_leaves,
             prior_nullifiers,
             dummy_rho: rnd.dummy_rho,
             recipient_owner_pk,
@@ -165,11 +171,12 @@ fn output_payloads(
 
 // ----------------------------- orchestration -----------------------------
 
-/// Send `amount` privately to the holder of `recipient_code`, using the wallet stored
-/// in the OS keychain. Thin wrapper over [`send_with`].
-pub fn send(recipient_code: &str, amount: u64) -> Result<String, CoreError> {
+/// Send `amount` of `asset` (a v1 code, e.g. "USDC") privately to the holder of
+/// `recipient_code`, using the wallet stored in the OS keychain. Thin wrapper over
+/// [`send_with`].
+pub fn send(asset: &str, recipient_code: &str, amount: u64) -> Result<String, CoreError> {
     let wallet = keys::current_wallet()?;
-    let cfg = PoolConfig::load()?;
+    let cfg = PoolConfig::load()?.with_asset(asset)?;
     send_with(&wallet, &cfg, recipient_code, amount)
 }
 
@@ -187,6 +194,7 @@ pub fn send_with(
     // One RPC drain of the target pool -> commitment leaves + nullifier set + owned notes.
     let state = chain::pool_state(cfg)?;
     let commitment_leaves = chain::commitment_leaves_from(&state.commits)?;
+    let asp_leaves = chain::approved_set(cfg)?;
     let local = notes::load(wallet)?;
 
     // Select an owned, unspent note that covers `amount` (single-input v1); includes
@@ -204,14 +212,16 @@ pub fn send_with(
         &note,
         &commitment_leaves,
         &state.nullifiers,
+        &asp_leaves,
         epoch,
     )
 }
 
 /// Send against EXPLICIT live state — the state-injected core of the send flow
 /// (build witness -> prove -> encrypt -> submit). Separated from [`send_with`] so the
-/// caller can supply pool state from any source (the indexer, raw RPC, or, in the
-/// live-run driver, ground truth it already holds). Returns the transaction hash.
+/// caller can supply pool state from any source (raw RPC, or, in the live-run driver,
+/// ground truth it already holds). `asp_leaves` is the pool's approved set (the
+/// anonymity set the spender proves membership in). Returns the transaction hash.
 #[allow(clippy::too_many_arguments)]
 pub fn send_prepared(
     wallet: &keys::WalletKeys,
@@ -221,6 +231,7 @@ pub fn send_prepared(
     note: &OwnedNote,
     commitment_leaves: &[Fr],
     prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
     epoch: u32,
 ) -> Result<String, CoreError> {
     let id = scan::wallet_identity(wallet)?;
@@ -237,6 +248,7 @@ pub fn send_prepared(
         note,
         commitment_leaves,
         prior_nullifiers,
+        asp_leaves,
         recipient_owner_pk,
         amount,
         &rnd,
@@ -256,9 +268,11 @@ pub fn send_prepared(
         &rnd,
     )?;
 
+    // Submit via the relayer if configured (fee abstraction: the user holds no XLM and
+    // isn't linked as the fee-payer of this private transfer), else the wallet itself.
     chain::submit_transfer(
         cfg,
-        wallet.stellar_secret(),
+        cfg.submit_source(wallet.stellar_secret()),
         PUBLIC_INPUTS_PATH,
         PROOF_PATH,
         &outputs,
@@ -278,13 +292,26 @@ mod tests {
     fn test_cfg() -> PoolConfig {
         PoolConfig {
             pool_contract: "CTEST".into(),
+            policy_contract: "CPOLICY".into(),
+            viewkeys_contract: None,
             pool_id: Fr::from_u64(7),
             network_id: Fr::from_u64(42),
             asset_tag: Fr::from_u64(1),
             rpc_url: "http://localhost".into(),
             network: "testnet".into(),
             network_passphrase: "Test SDF Network ; September 2015".into(),
+            relayer_secret: None,
         }
+    }
+
+    #[test]
+    fn submit_source_prefers_relayer() {
+        let mut cfg = test_cfg();
+        // No relayer -> wallet pays its own fee.
+        assert_eq!(cfg.submit_source("SWALLET"), "SWALLET");
+        // Relayer configured -> the relayer is the fee-payer (user holds no XLM).
+        cfg.relayer_secret = Some("SRELAYER".into());
+        assert_eq!(cfg.submit_source("SWALLET"), "SRELAYER");
     }
 
     fn test_identity(h: &Hasher) -> WalletIdentity {
@@ -359,7 +386,8 @@ mod tests {
             dummy_rho: Fr::from_u64(0xdead),
         };
         let recipient = h.owner_pk(&Fr::from_u64(99));
-        let w = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], recipient, 600, &rnd)
+        let asp = [id.owner_pk]; // single-member approved set (matches the frozen ASP_ROOT)
+        let w = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], &asp, recipient, 600, &rnd)
             .unwrap();
 
         // domain_sep binds the pool/network/TRANSFER selector.
@@ -383,8 +411,38 @@ mod tests {
         let (note, leaves) = demo_owned_note(&h, &id);
         let rnd = OutputRandomness::random();
         // Note holds 1000; asking to send 2000 must fail.
-        let r = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], id.owner_pk, 2000, &rnd);
+        let asp = [id.owner_pk];
+        let r = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], &asp, id.owner_pk, 2000, &rnd);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn witness_rejects_unenrolled_spender() {
+        let h = Hasher::new();
+        let id = test_identity(&h);
+        let cfg = test_cfg();
+        let (note, leaves) = demo_owned_note(&h, &id);
+        let rnd = OutputRandomness::random();
+        // An approved set that does NOT contain our owner_pk -> can't prove membership.
+        let asp = [h.owner_pk(&Fr::from_u64(1)), h.owner_pk(&Fr::from_u64(2))];
+        let r = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], &asp, id.owner_pk, 600, &rnd);
+        assert!(r.is_err(), "spender not in the approved set must be rejected");
+    }
+
+    #[test]
+    fn witness_membership_in_set_of_three() {
+        // The spender is one of THREE approved keys (a real anonymity set): the proof
+        // reveals only asp_root, proving owner_pk ∈ set for a hidden index.
+        let h = Hasher::new();
+        let id = test_identity(&h);
+        let cfg = test_cfg();
+        let (note, leaves) = demo_owned_note(&h, &id);
+        let rnd = OutputRandomness::random();
+        let asp = [h.owner_pk(&Fr::from_u64(0xDEC0)), id.owner_pk, h.owner_pk(&Fr::from_u64(0xDEC1))];
+        let w = build_transfer_witness(&h, &id, &cfg, 28, &note, &leaves, &[], &asp, h.owner_pk(&Fr::from_u64(99)), 600, &rnd)
+            .expect("member of a 3-key set can build the witness");
+        // asp_root is the 3-leaf root (NOT the single-leaf vector) — a real anon set.
+        assert_ne!(w.asp_root.to_hex(), ASP_ROOT, "multi-member root differs from single-leaf");
     }
 
     #[test]
@@ -433,7 +491,7 @@ mod tests {
     //   cargo test --lib -- --ignored --test-threads=1 send_lifecycle_on_testnet
     // Prereq: pool/policy/verifier wasm built (contracts/target/wasm32v1-none/release)
     // and the CRS volume warmed (see ERRORS.md).
-    use crate::core::{deposit, withdraw, witness};
+    use crate::core::{deposit, withdraw};
     use std::process::Command;
 
     /// A throwaway test wallet (the SEP-0005 vector phrase) — NOT the user's wallet.
@@ -482,10 +540,13 @@ mod tests {
         let notes_dir = std::env::temp_dir().join(format!("ozky-notes-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&notes_dir);
         std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
-        // asp_root for the test wallet's single-key approved set (matches send's).
-        let asp_root = witness::single_leaf_tree(&h, id.owner_pk).root.to_decimal();
+        // A REAL anonymity set: enroll the wallet + 2 decoy approved keys (set of 3).
+        // owner_pk decimals for the policy `enroll`/`approve_member` U256 args.
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
 
-        // --- 1. fund + deploy verifiers / policy / pool + register native asset ---
+        // --- 1. fund + deploy verifiers/policy, enroll a 3-key ASP set, deploy pool ---
         let setup = format!(
             "set -e\n\
              stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
@@ -496,25 +557,54 @@ mod tests {
              VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
              VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
              VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
-             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr} --asp_root {asp})\n\
-             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- set_allowed --who {addr} --allowed true >/dev/null\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
              SAC=$(stellar contract id asset --asset native --network testnet)\n\
              stellar contract asset deploy --asset native --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
-             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --policy $POLICY --asp_root {asp} --admin {addr})\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --policy $POLICY --asp_root $ASP --admin {addr})\n\
              stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset USDC:$USDC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
              stellar keys generate dest --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             stellar tx new change-trust --source-account dest --network testnet --line USDC:$USDC_ISSUER >/dev/null 2>&1\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             stellar keys generate auditor --network testnet --fund --overwrite >/dev/null 2>&1\n\
              echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
              echo \"SAC=$SAC\"\n\
-             echo \"DEST=$(stellar keys address dest)\"",
-            addr = addr, asp = asp_root,
+             echo \"USDC_SAC=$USDC_SAC\"\n\
+             echo \"DEST=$(stellar keys address dest)\"\n\
+             echo \"AUDITOR=$(stellar keys address auditor)\"\n\
+             echo \"RELAYER_ADDR=$(stellar keys address relayer)\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
         );
         let setup_out = run_zk(&secret, &setup);
         let pool = kv(&setup_out, "POOL");
+        let policy = kv(&setup_out, "POLICY");
+        let viewkeys = kv(&setup_out, "VIEWKEYS");
         let sac = kv(&setup_out, "SAC");
+        let usdc_sac = kv(&setup_out, "USDC_SAC");
         let dest = kv(&setup_out, "DEST");
+        let auditor = kv(&setup_out, "AUDITOR");
+        let relayer_addr = kv(&setup_out, "RELAYER_ADDR");
+        let relayer_secret = kv(&setup_out, "RELAYER_SECRET");
+        eprintln!("SETUP OK — shared pool {pool}, ASP anonymity set = 3 (wallet + 2 decoys)");
 
-        // Point the flows at the freshly-deployed pool.
+        // Point the flows at the freshly-deployed pool + policy + viewkeys, and route
+        // interior ops through a pre-funded RELAYER (fee abstraction: the wallet pays no
+        // fee + isn't linked as the fee-payer of its private transfer).
         std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        std::env::set_var("OZKY_RELAYER_SECRET", &relayer_secret);
         let cfg = PoolConfig::load().unwrap();
 
         // Native XLM balance of an account via the SAC `balance` (read-only invoke).
@@ -539,12 +629,24 @@ mod tests {
 
         // --- 3. SEND 600 to ourselves through the FULL app path: `send_with` scans the
         // freshly-deployed pool from raw RPC (the scan-on-any-pool fix), rediscovers the
-        // deposited note, then builds + proves + submits the transfer. No indexer. ---
+        // deposited note, then builds + proves + submits the transfer. The RELAYER pays
+        // the fee, so the wallet's XLM must be UNCHANGED across the send (G4). ---
+        let wallet_xlm_before = bal(&addr);
+        let relayer_xlm_before = bal(&relayer_addr);
         let code = payment_code(&id);
         let txhash = send_with(&wallet, &cfg, &code, 600)
             .expect("send_with must scan the new pool, find the note, and succeed on-chain");
         assert!(!txhash.is_empty());
-        eprintln!("SEND OK — send_with scanned the pool + transfer accepted on testnet (tx {txhash})");
+        assert_eq!(
+            bal(&addr),
+            wallet_xlm_before,
+            "wallet XLM must be unchanged across a relayed send (relayer pays the fee)"
+        );
+        assert!(
+            bal(&relayer_addr) < relayer_xlm_before,
+            "the relayer's XLM must have decreased (it paid the transfer fee)"
+        );
+        eprintln!("SEND OK — relayer-paid transfer accepted; wallet XLM unchanged (fee abstraction, tx {txhash})");
 
         // --- 4. on-chain confirmation: a replay of the same transfer must be REJECTED
         // (the nullifier root advanced), proving the send truly mutated chain state. ---
@@ -607,6 +709,86 @@ mod tests {
         eprintln!("NOTES STORE OK — change {chg} invisible to chain scan, recovered from store");
         // (The recovered note carries a real leaf_index from chain, so it is spendable
         // through the identical owned_notes path send/withdraw already use.)
-        eprintln!("A3.3 deposit -> send -> withdraw + notes-store recovery lifecycle OK");
+
+        // --- 7. SELECTIVE DISCLOSURE (G5): share a scoped read-only disclosure with an
+        // auditor + record the on-chain grant; the auditor re-derives THIS wallet's
+        // notes (verified against on-chain commitments) with no spend authority. ---
+        use crate::core::disclose;
+        let epoch = chain::current_epoch(&cfg.rpc_url).unwrap();
+        let pkg = disclose::share_with_auditor_with(&wallet, &cfg, &auditor, epoch)
+            .expect("share_with_auditor builds the package + records the on-chain grant");
+        let disclosed = disclose::audit(&pkg).expect("auditor re-derives the disclosed notes");
+        let total = disclose::disclosed_total(&disclosed);
+        // The auditor sees the wallet's shielded outputs (the 600 self-output landed
+        // back to us; the change 200 too). They must see >0 and only OUR notes.
+        assert!(!disclosed.is_empty(), "auditor must recover at least one disclosed note");
+        assert!(total > 0, "auditor sees the disclosed balance");
+        // The package must NOT carry spend authority.
+        assert!(!pkg.contains(wallet.owner_sk_hex().trim_start_matches("0x")), "no owner_sk leak");
+        // On-chain grant recorded + provable.
+        let granted = run_zk(&secret, &format!(
+            "stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true; \
+             stellar contract invoke --id {vk} --source \"$OZKY_SOURCE_SECRET\" --network testnet -- \
+               is_disclosed --owner {owner} --auditor {auditor} --scope '{{\"account\":0,\"asset_tag\":\"1\",\"epoch\":{epoch}}}'",
+            vk = viewkeys, owner = addr, auditor = auditor, epoch = epoch,
+        ));
+        assert!(granted.trim().contains("true"), "on-chain disclosure grant must be provable");
+        eprintln!("DISCLOSURE OK — auditor re-derived {} notes (total {total}); grant recorded on-chain, no spend leak", disclosed.len());
+
+        // --- 8. MULTI-ASSET (G6): the SAME pool also holds USDC (asset_tag 2, a distinct
+        // SAC vault). Run the full public->shielded->public lifecycle for a NON-NATIVE
+        // asset: deposit USDC, send it privately to ourselves, withdraw to `dest`. Proves
+        // `asset_tag` is carried correctly through the note commitment, scanning, and the
+        // per-asset vault — the only change is `cfg.with_asset("USDC")`. (Needs the test
+        // wallet pre-funded with testnet USDC; trustline added in setup.) ---
+        let cfg_usdc = cfg.with_asset("USDC").unwrap();
+        let usdc_bal = |acct: &str| -> i128 {
+            let s = run_zk(
+                &secret,
+                &format!(
+                    "stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true; \
+                     stellar contract invoke --id {sac} --source \"$OZKY_SOURCE_SECRET\" --network testnet -- balance --id {acct}",
+                    sac = usdc_sac, acct = acct,
+                ),
+            );
+            s.trim().trim_matches('"').trim().parse::<i128>().unwrap_or(0)
+        };
+        let wallet_usdc = usdc_bal(&addr);
+        assert!(
+            wallet_usdc >= 1000,
+            "test wallet must hold >=1000 USDC base units for the G6 leg — faucet \
+             GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6 with testnet USDC (have {wallet_usdc})"
+        );
+        deposit::deposit_with(&wallet, &cfg_usdc, 1000)
+            .expect("USDC deposit must lock 1000 base units + mint the note");
+        send_with(&wallet, &cfg_usdc, &code, 600)
+            .expect("USDC send must scan the pool, find the USDC note, prove + submit");
+        let dest_usdc_before = usdc_bal(&dest);
+        withdraw::withdraw_with(&wallet, &cfg_usdc, &dest, 400)
+            .expect("USDC withdraw must release 400 base units to dest");
+        assert_eq!(
+            usdc_bal(&dest) - dest_usdc_before,
+            400,
+            "dest must receive exactly 400 USDC base units (non-native asset off-ramp)"
+        );
+        eprintln!("MULTI-ASSET OK (G6) — USDC deposit 1000 -> send 600 -> withdraw 400 on the SAME pool (asset_tag 2); dest +400 USDC");
+
+        // --- 9. INCREMENTAL SCAN CACHE (G9): the cached `pool_state` (resumed from the
+        // per-pool cursor across all the calls above) must yield the SAME owned-note set
+        // as a cache-bypassing full re-drain from the retention window. Correctness is
+        // independent of the cache; the cache only changes how many events are fetched. ---
+        let local_g9 = notes::load(&wallet).unwrap();
+        let cached = scan::owned_notes(&id, &chain::pool_state(&cfg).unwrap(), &local_g9, 0).unwrap();
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
+        let full = scan::owned_notes(&id, &chain::pool_state(&cfg).unwrap(), &local_g9, 0).unwrap();
+        std::env::remove_var("OZKY_NO_POOL_CACHE");
+        let mut a: Vec<String> = cached.iter().map(|n| n.commitment.to_hex()).collect();
+        let mut b: Vec<String> = full.iter().map(|n| n.commitment.to_hex()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "incremental (cached) scan must equal a full re-drain (G9 correctness)");
+        eprintln!("SCAN CACHE OK (G9) — incremental scan == full re-drain ({} owned notes)", a.len());
+
+        eprintln!("A3 + G1/G4/G5/G6/G9 deposit -> enroll -> send(relayer) -> withdraw -> notes-store -> disclosure -> multi-asset(USDC) -> scan-cache lifecycle OK");
     }
 }

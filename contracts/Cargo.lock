@@ -1032,6 +1032,7 @@ dependencies = [
 name = "policy"
 version = "0.0.0"
 dependencies = [
+ "soroban-poseidon",
  "soroban-sdk",
 ]
 

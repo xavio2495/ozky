@@ -9,7 +9,10 @@ crate-type = ["lib", "cdylib"]
 doctest = false
 
 [dependencies]
-soroban-sdk = { workspace = true }
+soroban-sdk = { workspace = true, features = ["alloc"] }
+# Circuit-matching Poseidon2 for the on-chain ASP approved-set Merkle root (same
+# crate + parity the pool/indexer use, so the root equals the circuit's).
+soroban-poseidon = "26.0.0"
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils", "alloc"] }

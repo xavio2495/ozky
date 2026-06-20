@@ -111,6 +111,22 @@ impl Pool {
         config::set(&env, &cfg);
     }
 
+    /// Pull the canonical approved-set root from the policy contract into the cached
+    /// `asp_root` (permissionless — it only mirrors the policy's value; spends still
+    /// verify the proof's `asp_root` against this cache, and clients self-check the
+    /// reconstructed members against it). Call after the policy enrolls a member so the
+    /// hot interior path sees the updated set.
+    pub fn sync_asp_root(env: Env) {
+        let mut cfg = config::get(&env);
+        let root = env.invoke_contract::<U256>(
+            &cfg.policy,
+            &Symbol::new(&env, "asp_root"),
+            Vec::new(&env),
+        );
+        cfg.asp_root = root;
+        config::set(&env, &cfg);
+    }
+
     /// Public deposit: lock `amount` of `asset_tag` from `from` into the vault and
     /// mint the proven shielded note (`out_commitment`).
     /// Public inputs: [domain_sep, asset_tag, epoch, amount, out_commitment].
@@ -440,7 +456,7 @@ mod entrypoint_tests {
 
         // Policy contract: allow `from` to deposit.
         let from = Address::generate(&env);
-        let policy_addr = env.register(Policy, (admin.clone(), asp_root.clone()));
+        let policy_addr = env.register(Policy, (admin.clone(),));
         let policy = PolicyClient::new(&env, &policy_addr);
         policy.set_allowed(&from, &true);
 

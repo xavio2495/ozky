@@ -13,6 +13,10 @@ services:
       - .:/workspace
       - cargo-registry:/usr/local/cargo/registry
       - nargo-cache:/root/nargo
+      # Persist bb's downloaded CRS so it is fetched ONCE, not per `--rm` container —
+      # avoids re-downloading (slow) and a transient crs.aztec.network failure that
+      # otherwise crashes `bb prove` mid-run.
+      - bb-crs:/root/.bb-crs
     environment:
       - CARGO_TERM_COLOR=always
     # Keep STDIN open so `run` / `exec` shells behave.
@@ -22,3 +26,4 @@ services:
 volumes:
   cargo-registry:
   nargo-cache:
+  bb-crs:

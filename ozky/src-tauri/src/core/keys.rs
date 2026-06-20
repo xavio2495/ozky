@@ -59,6 +59,11 @@ impl WalletKeys {
     pub fn stellar_secret(&self) -> &str {
         &self.stellar_secret
     }
+    /// Symmetric key for encrypting the local notes store at rest (domain-separated
+    /// off the seed; distinct from the spend/view keys).
+    pub fn notes_key(&self) -> [u8; 32] {
+        hmac32(b"ozky-notes-store-v1", &*self.seed)
+    }
     /// Derive the viewing + detection keys for a disclosure scope.
     pub fn scoped_view_key(&self, account: u32, asset_tag: u32, epoch: u32) -> ScopedViewKey {
         let a = child(&self.view_master, b"account", account);

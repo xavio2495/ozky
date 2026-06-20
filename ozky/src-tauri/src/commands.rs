@@ -51,19 +51,43 @@ pub fn balance() -> Result<u64, CoreError> {
     core::scan::scan(0).map(|notes| notes.iter().map(|n| n.value).sum())
 }
 
-/// Send `amount` privately to `recipient`. (A2/A3)
+/// Deposit `amount` of the configured asset into the shielded pool from the wallet's
+/// Stellar account (the public on-ramp: fund [`funding_address`] from any wallet, then
+/// deposit to shield it). Returns the tx hash. (A3)
 #[tauri::command]
-pub fn send(recipient: String, amount: u64) -> Result<String, CoreError> {
-    let _ = core::proving::prove_transfer(&recipient, amount)?;
-    Err(CoreError::not_implemented("send (A3)"))
+pub fn deposit(amount: u64) -> Result<String, CoreError> {
+    core::deposit::deposit(amount)
 }
 
-/// The Stellar account address for this wallet (the public edge address for
-/// funding/deposits). The shielded payment code is added with note encryption (A2).
+/// Send `amount` privately to `recipient` (a shielded payment code). Builds + proves
+/// the transfer against live pool state and submits it; returns the tx hash. (A3)
 #[tauri::command]
-pub fn receive_address() -> Result<String, CoreError> {
+pub fn send(recipient: String, amount: u64) -> Result<String, CoreError> {
+    core::send::send(&recipient, amount)
+}
+
+/// Withdraw `amount` out of the shielded pool to a public Stellar `dest` address (the
+/// off-ramp). Returns the tx hash. (A3)
+#[tauri::command]
+pub fn withdraw(dest: String, amount: u64) -> Result<String, CoreError> {
+    core::withdraw::withdraw(&dest, amount)
+}
+
+/// This wallet's **public Stellar funding address** (`G…`). Give this to any wallet or
+/// exchange to receive funds publicly; then [`deposit`] shields them into the pool.
+/// This is a normal Stellar account — usable from non-ozky wallets. (A3)
+#[tauri::command]
+pub fn funding_address() -> Result<String, CoreError> {
     let keys = core::keys::current_wallet()?;
     Ok(keys.stellar_address().to_string())
+}
+
+/// This wallet's **shielded receive address** (an `ozky…` payment code). Give this to
+/// another ozky wallet to receive a PRIVATE transfer. Not usable from non-ozky wallets —
+/// for external/public funding use [`funding_address`]. (A3)
+#[tauri::command]
+pub fn receive_address() -> Result<String, CoreError> {
+    core::send::receive_code()
 }
 
 /// Export a scoped disclosure for an auditor (account / asset / epoch). (A2/A3)

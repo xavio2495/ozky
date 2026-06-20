@@ -13,7 +13,10 @@ pub fn run() {
             commands::create_wallet,
             commands::restore_wallet,
             commands::balance,
+            commands::deposit,
             commands::send,
+            commands::withdraw,
+            commands::funding_address,
             commands::receive_address,
             commands::share_with_auditor,
         ])

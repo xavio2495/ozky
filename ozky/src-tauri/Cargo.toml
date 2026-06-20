@@ -35,4 +35,19 @@ stellar-strkey = "0.0.13"
 num-bigint = "0.4"
 zeroize = "1"
 hex = "0.4"
+# A2 — note encryption: X25519 ECDH -> HKDF-SHA256 -> key-committing AEAD.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# A2/A3 — chain client: Stellar RPC (getEvents/getLatestLedger) + ScVal XDR decode,
+# so the wallet reconstructs any pool's commitments/nullifiers from raw chain data
+# (the indexer is only an optional accelerator; raw RPC is the correctness path).
+ureq = { version = "2", features = ["json"] }
+stellar-xdr = { version = "23", features = ["std", "base64", "curr"] }
+# A2 — circuit-matching Poseidon2 (BN254). Reuse the EXACT host-function wrapper the
+# contract/indexer use (proven parity) so witnesses are byte-for-byte acceptable to
+# the verifier. Pulls soroban-sdk (heavy) — accepted: parity is the foundational risk.
+soroban-sdk = { version = "26", features = ["testutils"] }
+soroban-poseidon = "26.0.0"
 

@@ -20,12 +20,19 @@
 #![allow(dead_code)]
 
 pub mod chain;
+pub mod config;
+pub mod deposit;
 pub mod encrypt;
 pub mod keychain;
 pub mod keys;
+pub mod notes;
+pub mod poseidon;
 pub mod proving;
 pub mod scan;
+pub mod send;
 pub mod sign;
+pub mod withdraw;
+pub mod witness;
 
 use serde::Serialize;
 use std::fmt;
@@ -40,6 +47,12 @@ pub enum CoreError {
     Keychain(String),
     /// No wallet has been created/restored yet.
     NoWallet,
+    /// Chain / indexer access failed (network, decode).
+    Chain(String),
+    /// Cryptographic operation failed (encryption, decryption, key agreement).
+    Crypto(String),
+    /// Proof generation failed (witness solve, prover, verify).
+    Proving(String),
 }
 
 impl CoreError {
@@ -54,6 +67,9 @@ impl fmt::Display for CoreError {
             CoreError::NotImplemented(w) => write!(f, "not implemented yet: {w}"),
             CoreError::Keychain(e) => write!(f, "keychain error: {e}"),
             CoreError::NoWallet => write!(f, "no wallet initialized"),
+            CoreError::Chain(e) => write!(f, "chain/indexer error: {e}"),
+            CoreError::Crypto(e) => write!(f, "crypto error: {e}"),
+            CoreError::Proving(e) => write!(f, "proving error: {e}"),
         }
     }
 }

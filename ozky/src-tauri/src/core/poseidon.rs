@@ -20,9 +20,9 @@ use soroban_sdk::{crypto::BnScalar, Bytes, Env, Vec as SVec, U256};
 pub const DOMAIN_OWNER: u64 = 0x6f7a6b795f6f776e;
 
 /// Domain tag for the withdraw destination binding (`dest_bind = Poseidon(DOMAIN_DEST,
-/// dest)`, ASCII "ozky_dst"). NOTE: the on-chain binding of `dest_bind` to the actual
-/// destination is not yet enforced (the pool only checks `dest_bind != 0` — a Z4 debt),
-/// so this tag is forward-compat; any non-zero `dest_bind` is currently accepted.
+/// dest_ed25519_pubkey)`, ASCII "ozky_dst"). The pool recomputes this from the actual
+/// `dest` and requires it to equal the proof's `dest_bind` public input (G13), so a
+/// valid withdraw proof can't be redirected. MUST match the pool's `DOMAIN_DEST`.
 pub const DOMAIN_DEST: u64 = 0x6f7a6b795f647374;
 
 /// Circuit selectors for `domain_sep` (pool `domain.rs`).

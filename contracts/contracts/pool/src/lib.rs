@@ -27,6 +27,10 @@ use soroban_sdk::{
 /// Epoch length in ledgers (FROZEN, handoff): `epoch = ledger_seq / 110_000`.
 const LEDGER_PER_EPOCH: u64 = 110_000;
 
+/// Domain tag for the withdraw destination binding: `dest_bind = Poseidon(DOMAIN_DEST,
+/// dest_ed25519_pubkey)` (ASCII "ozky_dst"). MUST match the client's `DOMAIN_DEST`.
+const DOMAIN_DEST: u64 = 0x6f7a6b795f647374;
+
 #[contracterror]
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -53,7 +57,8 @@ pub enum Error {
     AmountMismatch = 10,
     /// Constructor already ran.
     AlreadyInitialized = 11,
-    /// `withdraw` destination binding (`dest_bind`) was zero.
+    /// `dest_bind` public input did not equal `Poseidon(DOMAIN_DEST, dest)` recomputed
+    /// from the actual withdraw destination (or `dest` is not a classic account). (G13)
     BadDestBind = 12,
     /// `from` is not on the policy contract's deposit allow-list.
     DepositNotAllowed = 13,
@@ -227,10 +232,10 @@ impl Pool {
         require_recent_root(&env, &f.get(3).unwrap())?;
         require_asp_root(&cfg, &f.get(9).unwrap())?;
         require_amount(&env, &f.get(10).unwrap(), amount)?;
-        // dest_bind binds the destination so a valid proof can't be redirected.
-        // Z4: enforce non-zero; recomputing Poseidon(DOMAIN_DEST, dest) from `dest`
-        // is a follow-up (needs the Address→field encoding to match the circuit).
-        if f.get(11).unwrap() == U256::from_u32(&env, 0) {
+        // dest_bind binds the destination so a valid proof can't be redirected (G13):
+        // recompute Poseidon(DOMAIN_DEST, dest's ed25519 key) from the real `dest` and
+        // require it to equal the proof's `dest_bind` public input. (Closes the Z4 debt.)
+        if f.get(11).unwrap() != compute_dest_bind(&env, &dest)? {
             return Err(Error::BadDestBind);
         }
         require_nullifier_base(&env, &f.get(4).unwrap())?;
@@ -268,6 +273,23 @@ impl Pool {
 
 fn current_epoch(env: &Env) -> u64 {
     env.ledger().sequence() as u64 / LEDGER_PER_EPOCH
+}
+
+/// Recompute `dest_bind = Poseidon(DOMAIN_DEST, dest_ed25519_pubkey)` from the actual
+/// withdraw destination (G13). `dest` must be a classic account (`G…`); its master-key
+/// ed25519 bytes are the field preimage, matching the client's `Fr(pk.0)` (big-endian).
+/// A contract destination (`C…`, no ed25519 key) is rejected.
+fn compute_dest_bind(env: &Env, dest: &Address) -> Result<U256, Error> {
+    use soroban_sdk::address_payload::AddressPayload;
+    let key = match dest.to_payload().ok_or(Error::BadDestBind)? {
+        AddressPayload::AccountIdPublicKeyEd25519(k) => k,
+        AddressPayload::ContractIdHash(_) => return Err(Error::BadDestBind),
+    };
+    let dest_field = U256::from_be_bytes(env, &Bytes::from_array(env, &key.to_array()));
+    let mut inputs = Vec::new(env);
+    inputs.push_back(U256::from_u128(env, DOMAIN_DEST as u128));
+    inputs.push_back(dest_field);
+    Ok(poseidon::hash(env, &inputs))
 }
 
 /// Cross-contract read of the policy contract's deposit allow-list.
@@ -610,5 +632,109 @@ mod entrypoint_tests {
             .deposit(&stranger, &f.asset_tag, &1000, &pi, &proof, &enc, &eph, &0);
         assert_eq!(leaf, 0);
         let _ = &f.admin; // admin retained for fixture completeness
+    }
+
+    /// Build valid `withdraw` public inputs for a fresh pool (recent commitment root +
+    /// the stored nullifier base root), parameterized by `amount` and `dest_bind`.
+    fn withdraw_inputs(f: &Fixture, amount: u128, dest_bind: U256) -> Bytes {
+        let env = &f.env;
+        let domain_sep =
+            domain::compute_domain_sep(env, &f.pool_id, &f.network_id, domain::SELECTOR_WITHDRAW);
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0),       // epoch 0
+                f.pool().commitment_root(),   // recent
+                f.pool().nullifier_root(),    // == stored accumulator base
+                U256::from_u32(env, 0xbeef),  // new nullifier root (any)
+                U256::from_u32(env, 0xa),     // nf0
+                U256::from_u32(env, 0xb),     // nf1
+                U256::from_u32(env, 0xc0ffee), // change_commitment
+                U256::from_u32(env, 0),       // asp_root (matches cfg)
+                U256::from_u128(env, amount), // amount
+                dest_bind,
+            ],
+        )
+    }
+
+    /// Deposit once so the commitment-tree root window is non-empty (a fresh pool has no
+    /// "recent" root, which `require_recent_root` checks before the dest_bind check).
+    fn prime_recent_root(f: &Fixture) {
+        let env = &f.env;
+        let pi = deposit_inputs(f, 1000, 0xc0ffee);
+        f.pool().deposit(
+            &f.from,
+            &f.asset_tag,
+            &1000,
+            &pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0,
+        );
+    }
+
+    #[test]
+    fn withdraw_rejects_dest_bind_not_matching_destination() {
+        use soroban_sdk::address_payload::AddressPayload;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+
+        // A classic account destination (G…). A proof whose `dest_bind` does NOT equal
+        // Poseidon(DOMAIN_DEST, this dest) is REJECTED — a valid withdraw proof can't be
+        // redirected to another address (G13). (`0xdead` is not the real binding.)
+        let key = BytesN::from_array(env, &[0x22u8; 32]);
+        let dest = AddressPayload::AccountIdPublicKeyEd25519(key).to_address(env);
+        let pi_bad = withdraw_inputs(&f, 400, U256::from_u32(env, 0xdead));
+        let res = f
+            .pool()
+            .try_withdraw(&dest, &f.asset_tag, &400, &pi_bad, &Bytes::new(env));
+        assert_eq!(res, Err(Ok(Error::BadDestBind)));
+        // Sanity: the correct binding for this dest is some specific non-`0xdead` value
+        // (so the rejection above was a genuine mismatch, not a zero/degenerate check).
+        assert_ne!(compute_dest_bind(env, &dest).unwrap(), U256::from_u32(env, 0xdead));
+        // (End-to-end ACCEPTANCE — a matching dest_bind releasing real tokens to a
+        // trustlined dest — is proven by the live testnet lifecycle in the Rust core,
+        // which now fails if the client's dest_bind formula disagrees with this contract.)
+    }
+
+    #[test]
+    fn compute_dest_bind_matches_independent_poseidon() {
+        // The contract's dest_bind == Poseidon(DOMAIN_DEST, dest's ed25519 key), the SAME
+        // formula the client (withdraw.rs) builds the proof's public input from. Computed
+        // two ways here; both use the frozen-parity `poseidon::hash`.
+        use soroban_sdk::address_payload::AddressPayload;
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let key = [0x22u8; 32];
+        let dest =
+            AddressPayload::AccountIdPublicKeyEd25519(BytesN::from_array(&env, &key)).to_address(&env);
+
+        let got = compute_dest_bind(&env, &dest).unwrap();
+
+        let mut inputs = Vec::new(&env);
+        inputs.push_back(U256::from_u128(&env, DOMAIN_DEST as u128));
+        inputs.push_back(U256::from_be_bytes(&env, &Bytes::from_array(&env, &key)));
+        assert_eq!(got, poseidon::hash(&env, &inputs));
+        assert_ne!(got, U256::from_u32(&env, 0), "a real binding is non-zero");
+    }
+
+    #[test]
+    fn withdraw_rejects_contract_destination() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        StellarAssetClient::new(env, &f.sac).mint(&f.pool_addr, &1000);
+        // A contract address (C…) has no ed25519 master key, so it can't be a withdraw
+        // destination under the dest_bind scheme.
+        let dest = Address::generate(env);
+        let pi = withdraw_inputs(&f, 400, U256::from_u32(env, 1));
+        let res = f
+            .pool()
+            .try_withdraw(&dest, &f.asset_tag, &400, &pi, &Bytes::new(env));
+        assert_eq!(res, Err(Ok(Error::BadDestBind)));
     }
 }

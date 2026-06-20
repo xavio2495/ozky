@@ -9,11 +9,13 @@ crate-type = ["lib", "cdylib"]
 doctest = false
 
 [dependencies]
-soroban-sdk = { workspace = true, features = ["alloc"] }
+# `hazmat-address`: exposes `Address::to_payload()` to extract a withdraw dest's
+# ed25519 key in-contract, so `withdraw` can recompute + enforce `dest_bind` (G13).
+soroban-sdk = { workspace = true, features = ["alloc", "hazmat-address"] }
 soroban-poseidon = "26.0.0"
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils", "alloc"] }
+soroban-sdk = { workspace = true, features = ["testutils", "alloc", "hazmat-address"] }
 # Register the real vendored verifier in-VM to test the cross-contract verify call.
 rs-soroban-ultrahonk = { path = "../rs-soroban-ultrahonk" }
 # Register the real policy contract in-VM to test the deposit allow-list gate.

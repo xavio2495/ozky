@@ -67,8 +67,9 @@ pub fn withdraw_with(
         ));
     }
 
-    // dest_bind = Poseidon(DOMAIN_DEST, dest_pubkey). NOTE: the pool only checks this
-    // is non-zero today (Z4 debt), so the on-chain dest binding is not yet enforced.
+    // dest_bind = Poseidon(DOMAIN_DEST, dest_pubkey). The pool recomputes this from the
+    // real `dest` and requires equality (G13), so the proof is cryptographically bound
+    // to this destination and can't be redirected.
     let dest_field = dest_to_field(dest)?;
     let dest_bind = h.hash(&[Fr::from_u64(DOMAIN_DEST), dest_field]);
 

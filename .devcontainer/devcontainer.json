@@ -1,0 +1,11 @@
+{
+  "name": "ozky-zk",
+  "build": { "dockerfile": "Dockerfile" },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "noir-lang.vscode-noir"]
+    }
+  }
+}

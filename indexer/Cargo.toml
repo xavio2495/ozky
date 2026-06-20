@@ -1,0 +1,29 @@
+[package]
+name = "ozky-indexer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Off-chain speed/availability layer (Z6). Watches the pool contract's events on
+# Stellar RPC and serves clients: a commitment+view-tag scan stream, Merkle paths,
+# and nullifier non-membership witnesses. NEVER on the correctness/liveness path —
+# everything it serves is re-derivable from raw chain data (see README).
+
+[[bin]]
+name = "ozky-indexer"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+stellar-xdr = { version = "23", features = ["std", "base64", "curr"] }
+# Reuse the EXACT Poseidon2 the contract/circuit use (proven parity) so served
+# Merkle paths/witnesses are byte-for-byte acceptable to the verifier, and the
+# rebuilt root can be self-checked against the contract's published `roots` event.
+soroban-sdk = { version = "26", features = ["testutils"] }
+soroban-poseidon = "26.0.0"
+
+[profile.release]
+opt-level = 2

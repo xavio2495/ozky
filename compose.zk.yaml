@@ -1,0 +1,24 @@
+# ZK toolchain runner. Build once, then exec commands against the mounted repo:
+#   docker compose -f compose.zk.yaml build
+#   docker compose -f compose.zk.yaml run --rm zk nargo --version
+#   docker compose -f compose.zk.yaml run --rm zk bash
+services:
+  zk:
+    build:
+      context: .devcontainer
+      dockerfile: Dockerfile
+    image: ozky-zk:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - nargo-cache:/root/nargo
+    environment:
+      - CARGO_TERM_COLOR=always
+    # Keep STDIN open so `run` / `exec` shells behave.
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  nargo-cache:

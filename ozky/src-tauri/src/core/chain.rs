@@ -11,8 +11,14 @@ use super::{notes, CoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Command;
-use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
+use stellar_xdr::curr::{
+    AccountId, BytesM, ContractId, DecoratedSignature, Hash, HostFunction, Int128Parts,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits,
+    Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress,
+    ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber, SorobanAuthorizationEntry,
+    SorobanTransactionData, Transaction, TransactionEnvelope, TransactionExt,
+    TransactionV1Envelope, UInt256Parts, Uint256, VecM, WriteXdr,
+};
 
 /// Ledgers per epoch (FROZEN, matches the pool contract's `LEDGER_PER_EPOCH`).
 pub const LEDGER_PER_EPOCH: u64 = 110_000;
@@ -437,13 +443,16 @@ pub fn approved_set(cfg: &PoolConfig) -> Result<Vec<Fr>, CoreError> {
     Ok(members.into_iter().map(|(_, pk)| pk).collect())
 }
 
-// ----------------------------- on-chain submission -----------------------------
+// ----------------------------- on-chain submission (native, G14) -----------------------------
 //
-// Each entrypoint (deposit / transfer / withdraw) is invoked via the stellar CLI in
-// the ZK container (a Docker-free native submitter is a later packaging task). The
-// proof + public_inputs are referenced by their in-container paths (`/workspace/...`,
-// written there by `proving`). The source secret is forwarded as `$OZKY_SOURCE_SECRET`
-// (an env var, never argv). The `*_invoke_script` builders are pure + unit-tested.
+// Each entrypoint (deposit / transfer / withdraw / enroll / disclose) is built, signed,
+// and submitted NATIVELY here — no stellar CLI, no Docker, and the source secret never
+// leaves this process. The flow per op (the standard Soroban path): build the
+// `InvokeHostFunction` transaction (proof + public_inputs passed as `Bytes` straight
+// from the in-memory [`super::proving::ProofBundle`]) → `simulateTransaction` for the
+// resource fee + footprint + auth → assemble + Ed25519-sign ([`super::sign`]) →
+// `sendTransaction` → poll `getTransaction`. (Proving still runs in the ZK container;
+// a Docker-free prover is a separate packaging task.)
 
 /// The encrypted output payloads to publish with a transfer (one per output note).
 pub struct OutputPayload {
@@ -452,142 +461,377 @@ pub struct OutputPayload {
     pub view_tag: u32,
 }
 
-fn hex_array(items: impl Iterator<Item = String>) -> String {
-    let quoted: Vec<String> = items.map(|h| format!("\"{h}\"")).collect();
-    format!("[{}]", quoted.join(","))
+// --- ScVal argument builders (contract param types) ---
+
+/// A BN254 field element / `U256` from 32 big-endian bytes.
+fn sc_u256_be(bytes: &[u8; 32]) -> ScVal {
+    ScVal::U256(UInt256Parts {
+        hi_hi: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+        hi_lo: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+        lo_hi: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+        lo_lo: u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
+    })
 }
 
-/// The `set -e` + `stellar network add` prelude shared by every invoke script.
-fn prelude(cfg: &PoolConfig) -> String {
-    format!(
-        "set -e; \
-         stellar network add {net} --rpc-url {rpc} --network-passphrase '{pass}' 2>/dev/null || true; ",
-        net = cfg.network,
-        rpc = cfg.rpc_url,
-        pass = cfg.network_passphrase,
-    )
+fn sc_u256_fr(fr: &Fr) -> ScVal {
+    sc_u256_be(&fr.0)
 }
 
-/// `stellar contract invoke --id <pool> --source $OZKY_SOURCE_SECRET --network <net> --send yes --`
-fn invoke_head(cfg: &PoolConfig) -> String {
-    format!(
-        "stellar contract invoke --id {pool} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- ",
-        pool = cfg.pool_contract,
-        net = cfg.network,
-    )
+/// A `U256` from a decimal string (e.g. an `owner_pk` / `asset_tag` decimal).
+fn sc_u256_decimal(dec: &str) -> Result<ScVal, CoreError> {
+    let n = num_bigint::BigUint::parse_bytes(dec.as_bytes(), 10)
+        .ok_or_else(|| CoreError::Chain(format!("bad U256 decimal: {dec}")))?;
+    let be = n.to_bytes_be();
+    if be.len() > 32 {
+        return Err(CoreError::Chain(format!("U256 overflow: {dec}")));
+    }
+    let mut b = [0u8; 32];
+    b[32 - be.len()..].copy_from_slice(&be);
+    Ok(sc_u256_be(&b))
 }
 
-/// `deposit` invoke: lock `amount` of the asset from `from` into the vault, mint the
-/// proven note, and publish its encrypted payload (so the wallet can rescan it).
-pub fn deposit_invoke_script(
+/// An `i128` from a non-negative `u64` token amount (hi = 0).
+fn sc_i128(amount: u64) -> ScVal {
+    ScVal::I128(Int128Parts { hi: 0, lo: amount })
+}
+
+/// `Bytes` / `BytesN<N>` from a byte slice.
+fn sc_bytes(b: &[u8]) -> Result<ScVal, CoreError> {
+    let bm: BytesM = b
+        .to_vec()
+        .try_into()
+        .map_err(|_| CoreError::Chain("bytes argument too long".into()))?;
+    Ok(ScVal::Bytes(ScBytes(bm)))
+}
+
+/// A classic-account `Address` (`G…`) argument.
+fn sc_account(g: &str) -> Result<ScVal, CoreError> {
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(g)
+        .map_err(|e| CoreError::Chain(format!("bad address {g}: {e}")))?;
+    Ok(ScVal::Address(ScAddress::Account(AccountId(
+        PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)),
+    ))))
+}
+
+fn sc_symbol_str(s: &str) -> Result<ScSymbol, CoreError> {
+    Ok(ScSymbol(
+        s.try_into()
+            .map_err(|_| CoreError::Chain(format!("bad symbol: {s}")))?,
+    ))
+}
+
+fn sc_symbol_val(s: &str) -> Result<ScVal, CoreError> {
+    Ok(ScVal::Symbol(sc_symbol_str(s)?))
+}
+
+fn sc_vec(items: Vec<ScVal>) -> Result<ScVal, CoreError> {
+    let v: VecM<ScVal> = items
+        .try_into()
+        .map_err(|_| CoreError::Chain("vec argument too long".into()))?;
+    Ok(ScVal::Vec(Some(ScVec(v))))
+}
+
+/// A `ViewScope { account: u32, asset_tag: U256, epoch: u32 }` struct, encoded as the
+/// Soroban map form (entries ordered by symbol key: account < asset_tag < epoch).
+fn sc_view_scope(account: u32, asset_tag_dec: &str, epoch: u32) -> Result<ScVal, CoreError> {
+    let entries = vec![
+        ScMapEntry { key: sc_symbol_val("account")?, val: ScVal::U32(account) },
+        ScMapEntry { key: sc_symbol_val("asset_tag")?, val: sc_u256_decimal(asset_tag_dec)? },
+        ScMapEntry { key: sc_symbol_val("epoch")?, val: ScVal::U32(epoch) },
+    ];
+    let m: VecM<ScMapEntry> = entries
+        .try_into()
+        .map_err(|_| CoreError::Chain("scope map".into()))?;
+    Ok(ScVal::Map(Some(ScMap(m))))
+}
+
+/// A contract `Address` (`C…`) for the invoke target.
+fn contract_address(c: &str) -> Result<ScAddress, CoreError> {
+    let id = stellar_strkey::Contract::from_string(c)
+        .map_err(|e| CoreError::Chain(format!("bad contract id {c}: {e}")))?;
+    Ok(ScAddress::Contract(ContractId(Hash(id.0))))
+}
+
+// --- native build / simulate / sign / submit ---
+
+/// Base inclusion fee per operation (stroops); the resource fee from simulation is
+/// added on top.
+const BASE_FEE: u32 = 100;
+
+/// The source account's current sequence number (via `getLedgerEntries`).
+fn account_seq(rpc_url: &str, account: &AccountId) -> Result<i64, CoreError> {
+    let key = LedgerKey::Account(LedgerKeyAccount { account_id: account.clone() });
+    let kb64 = key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr ledger key: {e}")))?;
+    let r = rpc_call(rpc_url, "getLedgerEntries", json!({ "keys": [kb64] })).map_err(CoreError::Chain)?;
+    let xdr = r
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("xdr"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::Chain("source account not found on-chain (unfunded?)".into()))?;
+    match LedgerEntryData::from_xdr_base64(xdr, Limits::none())
+        .map_err(|e| CoreError::Chain(format!("decode account entry: {e}")))?
+    {
+        LedgerEntryData::Account(a) => Ok(a.seq_num.0),
+        _ => Err(CoreError::Chain("ledger entry is not an account".into())),
+    }
+}
+
+/// A single-op `InvokeHostFunction` transaction.
+fn build_tx(
+    source: &MuxedAccount,
+    seq: i64,
+    fee: u32,
+    host_function: HostFunction,
+    auth: VecM<SorobanAuthorizationEntry>,
+    ext: TransactionExt,
+) -> Result<Transaction, CoreError> {
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp { host_function, auth }),
+    };
+    let operations: VecM<Operation, 100> = vec![op]
+        .try_into()
+        .map_err(|_| CoreError::Chain("operations".into()))?;
+    Ok(Transaction {
+        source_account: source.clone(),
+        fee,
+        seq_num: SequenceNumber(seq),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations,
+        ext,
+    })
+}
+
+/// Decode the auth entries simulation says the op needs (empty for our permissionless
+/// transfer/withdraw; source-account credentials — covered by the tx signature — for the
+/// deposit/enroll/disclose flows where the required address IS the source account).
+fn parse_sim_auth(sim: &Value) -> Result<VecM<SorobanAuthorizationEntry>, CoreError> {
+    let mut entries: Vec<SorobanAuthorizationEntry> = Vec::new();
+    if let Some(auths) = sim
+        .get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("auth"))
+        .and_then(|v| v.as_array())
+    {
+        for a in auths {
+            if let Some(s) = a.as_str() {
+                entries.push(
+                    SorobanAuthorizationEntry::from_xdr_base64(s, Limits::none())
+                        .map_err(|e| CoreError::Chain(format!("decode auth entry: {e}")))?,
+                );
+            }
+        }
+    }
+    entries
+        .try_into()
+        .map_err(|_| CoreError::Chain("auth entries".into()))
+}
+
+/// Build → simulate → sign → submit → poll an `InvokeHostFunction` against `contract_id`.
+/// `source_secret` (wallet or relayer `S…`) is signed natively and never leaves this
+/// process. Returns the confirmed transaction hash.
+fn invoke_contract(
     cfg: &PoolConfig,
+    source_secret: &str,
+    contract_id: &str,
+    fn_name: &str,
+    args: Vec<ScVal>,
+) -> Result<String, CoreError> {
+    let signer = super::sign::Signer::from_secret(source_secret)?;
+    let source = signer.muxed();
+    let seq = account_seq(&cfg.rpc_url, &signer.account_id())? + 1;
+
+    let call_args: VecM<ScVal> = args
+        .try_into()
+        .map_err(|_| CoreError::Chain("too many call args".into()))?;
+    let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address(contract_id)?,
+        function_name: sc_symbol_str(fn_name)?,
+        args: call_args,
+    });
+
+    // 1. Simulate (placeholder fee, empty auth, V0 ext) → resource fee + footprint + auth.
+    let sim_tx = build_tx(&source, seq, BASE_FEE, host_function.clone(), VecM::default(), TransactionExt::V0)?;
+    let sim_env = TransactionEnvelope::Tx(TransactionV1Envelope { tx: sim_tx, signatures: VecM::default() });
+    let sim_b64 = sim_env
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr sim envelope: {e}")))?;
+    let sim = rpc_call(&cfg.rpc_url, "simulateTransaction", json!({ "transaction": sim_b64 }))
+        .map_err(CoreError::Chain)?;
+    if let Some(err) = sim.get("error").and_then(|v| v.as_str()) {
+        return Err(CoreError::Chain(format!("{fn_name} simulate failed: {err}")));
+    }
+    if sim.get("restorePreamble").map(|v| !v.is_null()).unwrap_or(false) {
+        return Err(CoreError::Chain(format!(
+            "{fn_name}: contract state needs restore (archived entries)"
+        )));
+    }
+    let soroban_data = sim
+        .get("transactionData")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::Chain(format!("{fn_name} simulate: no transactionData")))?;
+    let soroban_data = SorobanTransactionData::from_xdr_base64(soroban_data, Limits::none())
+        .map_err(|e| CoreError::Chain(format!("decode soroban data: {e}")))?;
+    let min_resource_fee: u64 = sim
+        .get("minResourceFee")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| CoreError::Chain(format!("{fn_name} simulate: no minResourceFee")))?;
+    let auth = parse_sim_auth(&sim)?;
+
+    // 2. Assemble the final tx: fee = base + resource fee, V1 (soroban) ext, op auth.
+    let fee = BASE_FEE.saturating_add(u32::try_from(min_resource_fee).unwrap_or(u32::MAX));
+    let tx = build_tx(&source, seq, fee, host_function, auth, TransactionExt::V1(soroban_data))?;
+
+    // 3. Sign natively + envelope.
+    let sig = super::sign::sign_transaction(&signer, &cfg.network_passphrase, &tx)?;
+    let signatures: VecM<DecoratedSignature, 20> = vec![sig]
+        .try_into()
+        .map_err(|_| CoreError::Chain("signatures".into()))?;
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures });
+    let env_b64 = env
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr envelope: {e}")))?;
+
+    // 4. Submit + poll for confirmation.
+    submit_and_poll(&cfg.rpc_url, fn_name, &env_b64)
+}
+
+/// `sendTransaction` then poll `getTransaction` to SUCCESS/FAILED. Returns the hash.
+fn submit_and_poll(rpc_url: &str, what: &str, env_b64: &str) -> Result<String, CoreError> {
+    let send = rpc_call(rpc_url, "sendTransaction", json!({ "transaction": env_b64 }))
+        .map_err(CoreError::Chain)?;
+    let hash = send.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match send.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+        "PENDING" | "DUPLICATE" => {}
+        "ERROR" => {
+            let detail = send.get("errorResultXdr").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(CoreError::Chain(format!("{what} send ERROR: {detail}")));
+        }
+        "TRY_AGAIN_LATER" => {
+            return Err(CoreError::Chain(format!("{what} send: try again later (seq/rate)")))
+        }
+        other => return Err(CoreError::Chain(format!("{what} send: unexpected status {other}"))),
+    }
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let r = rpc_call(rpc_url, "getTransaction", json!({ "hash": hash })).map_err(CoreError::Chain)?;
+        match r.get("status").and_then(|v| v.as_str()).unwrap_or("NOT_FOUND") {
+            "SUCCESS" => return Ok(hash),
+            "FAILED" => {
+                let rx = r.get("resultXdr").and_then(|v| v.as_str()).unwrap_or("");
+                return Err(CoreError::Chain(format!("{what} FAILED on-chain: {rx}")));
+            }
+            _ => continue, // NOT_FOUND → keep polling
+        }
+    }
+    Err(CoreError::Chain(format!("{what}: timed out awaiting confirmation (hash {hash})")))
+}
+
+/// Submit a `deposit` to the pool. Returns the transaction hash.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_deposit(
+    cfg: &PoolConfig,
+    source_secret: &str,
     from: &str,
     amount: u64,
-    public_inputs_path: &str,
-    proof_path: &str,
+    public_inputs: &[u8],
+    proof: &[u8],
     out: &OutputPayload,
-) -> String {
-    format!(
-        "{prelude}{head}deposit --from {from} --asset_tag {asset} --amount {amount} \
-           --public_inputs-file-path {pi} --proof-file-path {pf} \
-           --enc_note {enc} --ephemeral_pub {eph} --view_tag {vt}",
-        prelude = prelude(cfg),
-        head = invoke_head(cfg),
-        from = from,
-        asset = cfg.asset_tag_decimal(),
-        amount = amount,
-        pi = public_inputs_path,
-        pf = proof_path,
-        enc = hex::encode(&out.enc_note),
-        eph = hex::encode(out.ephemeral_pub),
-        vt = out.view_tag,
-    )
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_account(from)?,
+        sc_u256_fr(&cfg.asset_tag),
+        sc_i128(amount),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&out.enc_note)?,
+        sc_bytes(&out.ephemeral_pub)?,
+        ScVal::U32(out.view_tag),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "deposit", args)
 }
 
-/// `transfer` invoke: 2-in/2-out private transfer; publishes both output payloads.
-pub fn transfer_invoke_script(
+/// Submit a `transfer` to the pool. Returns the transaction hash.
+pub fn submit_transfer(
     cfg: &PoolConfig,
-    public_inputs_path: &str,
-    proof_path: &str,
+    source_secret: &str,
+    public_inputs: &[u8],
+    proof: &[u8],
     outputs: &[OutputPayload],
-) -> String {
-    let enc_notes = hex_array(outputs.iter().map(|o| hex::encode(&o.enc_note)));
-    let ephemeral_pubs = hex_array(outputs.iter().map(|o| hex::encode(o.ephemeral_pub)));
-    let view_tags = format!(
-        "[{}]",
-        outputs.iter().map(|o| o.view_tag.to_string()).collect::<Vec<_>>().join(",")
-    );
-    format!(
-        "{prelude}{head}transfer --asset_tag {asset} \
-           --public_inputs-file-path {pi} --proof-file-path {pf} \
-           --enc_notes '{enc}' --ephemeral_pubs '{eph}' --view_tags '{vt}'",
-        prelude = prelude(cfg),
-        head = invoke_head(cfg),
-        asset = cfg.asset_tag_decimal(),
-        pi = public_inputs_path,
-        pf = proof_path,
-        enc = enc_notes,
-        eph = ephemeral_pubs,
-        vt = view_tags,
-    )
+) -> Result<String, CoreError> {
+    let enc_notes = sc_vec(
+        outputs
+            .iter()
+            .map(|o| sc_bytes(&o.enc_note))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let ephemeral_pubs = sc_vec(
+        outputs
+            .iter()
+            .map(|o| sc_bytes(&o.ephemeral_pub))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let view_tags = sc_vec(outputs.iter().map(|o| ScVal::U32(o.view_tag)).collect())?;
+    let args = vec![
+        sc_u256_fr(&cfg.asset_tag),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        enc_notes,
+        ephemeral_pubs,
+        view_tags,
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "transfer", args)
 }
 
-/// `withdraw` invoke: release `amount` of the asset to the public `dest`, re-commit
-/// the shielded change. (The contract publishes no ciphertext for the change note.)
-pub fn withdraw_invoke_script(
+/// Submit a `withdraw` to the pool. Returns the transaction hash.
+pub fn submit_withdraw(
     cfg: &PoolConfig,
+    source_secret: &str,
     dest: &str,
     amount: u64,
-    public_inputs_path: &str,
-    proof_path: &str,
-) -> String {
-    format!(
-        "{prelude}{head}withdraw --dest {dest} --asset_tag {asset} --amount {amount} \
-           --public_inputs-file-path {pi} --proof-file-path {pf}",
-        prelude = prelude(cfg),
-        head = invoke_head(cfg),
-        dest = dest,
-        asset = cfg.asset_tag_decimal(),
-        amount = amount,
-        pi = public_inputs_path,
-        pf = proof_path,
-    )
+    public_inputs: &[u8],
+    proof: &[u8],
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_account(dest)?,
+        sc_u256_fr(&cfg.asset_tag),
+        sc_i128(amount),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "withdraw", args)
 }
 
-/// `enroll` invoke (admin path): approve the wallet's `owner_pk` into the policy's ASP
-/// set AND allow-list its funding address, then `sync_asp_root` on the pool so the
-/// cached root tracks the new set. `owner_pk_dec` is the decimal `U256`.
-pub fn enroll_invoke_script(cfg: &PoolConfig, owner_pk_dec: &str, who: &str) -> String {
-    format!(
-        "{prelude}\
-         stellar contract invoke --id {policy} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
-           enroll --owner_pk {pk} --who {who}; \
-         stellar contract invoke --id {pool} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
-           sync_asp_root",
-        prelude = prelude(cfg),
-        policy = cfg.policy_contract,
-        pool = cfg.pool_contract,
-        net = cfg.network,
-        pk = owner_pk_dec,
-        who = who,
-    )
-}
-
-/// Enroll a wallet (admin path) + sync the pool's cached root. Returns the tx hash.
+/// Enroll a wallet (admin path): `policy.enroll(owner_pk, who)` then `pool.sync_asp_root`
+/// (two transactions — a Soroban tx carries exactly one host-function op). `owner_pk_dec`
+/// is the decimal `U256`. Returns the enroll transaction hash.
 pub fn submit_enroll(
     cfg: &PoolConfig,
     admin_secret: &str,
     owner_pk_dec: &str,
     who: &str,
 ) -> Result<String, CoreError> {
-    let script = enroll_invoke_script(cfg, owner_pk_dec, who);
-    run_invoke(admin_secret, "enroll", &script)
+    let enroll_hash = invoke_contract(
+        cfg,
+        admin_secret,
+        &cfg.policy_contract,
+        "enroll",
+        vec![sc_u256_decimal(owner_pk_dec)?, sc_account(who)?],
+    )?;
+    invoke_contract(cfg, admin_secret, &cfg.pool_contract, "sync_asp_root", vec![])?;
+    Ok(enroll_hash)
 }
 
 /// Record a disclosure grant on the viewkeys contract: `register_view_key` (publish the
-/// scope's PUBLIC key halves) then `disclose` (the auditable, revocable grant). Both
-/// require the owner's auth, so they are submitted by the wallet. `viewing_pub`/
-/// `detection_pub` are 32-byte hex (no `0x`); the `ViewScope` struct is passed as JSON.
+/// scope's PUBLIC key halves) then `disclose` (the auditable, revocable grant) — two
+/// transactions, both owner-signed. `viewing_pub`/`detection_pub` are 32-byte hex.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_disclosure(
     cfg: &PoolConfig,
@@ -601,100 +845,27 @@ pub fn submit_disclosure(
     viewing_pub: &str,
     detection_pub: &str,
 ) -> Result<String, CoreError> {
-    // ViewScope { account: u32, asset_tag: U256, epoch: u32 } as the CLI's JSON form.
-    let scope = format!(
-        "{{\"account\":{account},\"asset_tag\":\"{asset_tag_dec}\",\"epoch\":{epoch}}}"
-    );
-    let script = format!(
-        "{prelude}\
-         stellar contract invoke --id {vk} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
-           register_view_key --owner {owner} --scope '{scope}' --viewing_pub {vp} --detection_pub {dp}; \
-         stellar contract invoke --id {vk} --source \"$OZKY_SOURCE_SECRET\" --network {net} --send yes -- \
-           disclose --owner {owner} --auditor {auditor} --scope '{scope}'",
-        prelude = prelude(cfg),
-        vk = viewkeys,
-        net = cfg.network,
-        owner = owner_addr,
-        auditor = auditor_addr,
-        scope = scope,
-        vp = viewing_pub,
-        dp = detection_pub,
-    );
-    run_invoke(owner_secret, "disclose", &script)
-}
-
-fn repo_root() -> PathBuf {
-    if let Ok(p) = std::env::var("OZKY_REPO_ROOT") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
-}
-
-/// Run an invoke script in the ZK container; return the tx hash (parsed from the CLI
-/// logs) or a `Chain` error with the stderr tail. `what` names the op for errors.
-fn run_invoke(source_secret: &str, what: &str, script: &str) -> Result<String, CoreError> {
-    let compose = repo_root().join("compose.zk.yaml");
-    let out = Command::new("docker")
-        .env("OZKY_SOURCE_SECRET", source_secret)
-        .args(["compose", "-f"])
-        .arg(&compose)
-        .args(["run", "--rm", "-e", "OZKY_SOURCE_SECRET", "zk", "bash", "-c", script])
-        .output()
-        .map_err(|e| CoreError::Chain(format!("spawn docker: {e}")))?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
-        let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(CoreError::Chain(format!("{what} submit failed:\n{tail}")));
-    }
-    // The CLI logs the tx hash to stderr ("Transaction hash is <hash>").
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let hash = stderr
-        .lines()
-        .find_map(|l| l.split("hash is ").nth(1))
-        .map(|h| h.trim().to_string())
-        .unwrap_or_else(|| "submitted".to_string());
-    Ok(hash)
-}
-
-/// Submit a `deposit` to the pool. Returns the transaction hash.
-pub fn submit_deposit(
-    cfg: &PoolConfig,
-    source_secret: &str,
-    from: &str,
-    amount: u64,
-    public_inputs_path: &str,
-    proof_path: &str,
-    out: &OutputPayload,
-) -> Result<String, CoreError> {
-    let script = deposit_invoke_script(cfg, from, amount, public_inputs_path, proof_path, out);
-    run_invoke(source_secret, "deposit", &script)
-}
-
-/// Submit a `transfer` to the pool. Returns the transaction hash.
-pub fn submit_transfer(
-    cfg: &PoolConfig,
-    source_secret: &str,
-    public_inputs_path: &str,
-    proof_path: &str,
-    outputs: &[OutputPayload],
-) -> Result<String, CoreError> {
-    let script = transfer_invoke_script(cfg, public_inputs_path, proof_path, outputs);
-    run_invoke(source_secret, "transfer", &script)
-}
-
-/// Submit a `withdraw` to the pool. Returns the transaction hash.
-pub fn submit_withdraw(
-    cfg: &PoolConfig,
-    source_secret: &str,
-    dest: &str,
-    amount: u64,
-    public_inputs_path: &str,
-    proof_path: &str,
-) -> Result<String, CoreError> {
-    let script = withdraw_invoke_script(cfg, dest, amount, public_inputs_path, proof_path);
-    run_invoke(source_secret, "withdraw", &script)
+    let scope = sc_view_scope(account, asset_tag_dec, epoch)?;
+    let viewing = sc_bytes(
+        &hex::decode(viewing_pub).map_err(|e| CoreError::Chain(format!("viewing_pub hex: {e}")))?,
+    )?;
+    let detection = sc_bytes(
+        &hex::decode(detection_pub).map_err(|e| CoreError::Chain(format!("detection_pub hex: {e}")))?,
+    )?;
+    invoke_contract(
+        cfg,
+        owner_secret,
+        viewkeys,
+        "register_view_key",
+        vec![sc_account(owner_addr)?, scope.clone(), viewing, detection],
+    )?;
+    invoke_contract(
+        cfg,
+        owner_secret,
+        viewkeys,
+        "disclose",
+        vec![sc_account(owner_addr)?, sc_account(auditor_addr)?, scope],
+    )
 }
 
 #[cfg(test)]
@@ -737,5 +908,96 @@ mod tests {
         let c = load_cache("CNONEXISTENTPOOLIDFORTEST______________________________");
         assert_eq!(c.cursor_ledger, 0);
         assert!(c.commits.is_empty());
+    }
+
+    // --- native invoke argument builders (G14) ---
+
+    #[test]
+    fn fr_to_scval_u256_roundtrips_via_xdr() {
+        // A field element → ScVal::U256 must serialize and decode back to the same 32 BE
+        // bytes the contract reads as the U256 arg (asset_tag / owner_pk, etc.).
+        let fr = Fr::from_hex("0x0123456789abcdeffedcba98765432100011223344556677889900aabbccddee")
+            .unwrap();
+        let sv = sc_u256_fr(&fr);
+        let b64 = sv.to_xdr_base64(Limits::none()).unwrap();
+        let back = ScVal::from_xdr_base64(&b64, Limits::none()).unwrap();
+        match back {
+            ScVal::U256(p) => {
+                let mut b = [0u8; 32];
+                b[0..8].copy_from_slice(&p.hi_hi.to_be_bytes());
+                b[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+                b[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+                b[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+                assert_eq!(b, fr.0);
+            }
+            other => panic!("expected U256, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u256_decimal_matches_fr_decimal() {
+        // sc_u256_decimal (used for owner_pk/asset_tag decimals) agrees with the Fr path.
+        let fr = Fr::from_u64(123_456_789);
+        let a = sc_u256_decimal(&fr.to_decimal()).unwrap();
+        assert_eq!(a, sc_u256_fr(&fr));
+        assert!(sc_u256_decimal("not-a-number").is_err());
+    }
+
+    #[test]
+    fn sc_account_decodes_strkey_into_account_address() {
+        // A G-address arg → ScAddress::Account holding the same ed25519 bytes strkey decodes.
+        let g = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
+        let want = stellar_strkey::ed25519::PublicKey::from_string(g).unwrap().0;
+        match sc_account(g).unwrap() {
+            ScVal::Address(ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                Uint256(b),
+            )))) => assert_eq!(b, want),
+            other => panic!("expected account address, got {other:?}"),
+        }
+        assert!(sc_account("not-an-address").is_err());
+    }
+
+    #[test]
+    fn i128_amount_is_nonnegative_lo() {
+        match sc_i128(400) {
+            ScVal::I128(Int128Parts { hi, lo }) => {
+                assert_eq!(hi, 0);
+                assert_eq!(lo, 400);
+            }
+            other => panic!("expected I128, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_scope_map_is_key_ordered() {
+        // The ViewScope struct encodes as a map whose entries MUST be sorted by symbol
+        // key (account < asset_tag < epoch) or the host rejects the map.
+        match sc_view_scope(0, "1", 28).unwrap() {
+            ScVal::Map(Some(ScMap(m))) => {
+                let keys: Vec<String> = m
+                    .iter()
+                    .map(|e| match &e.key {
+                        ScVal::Symbol(s) => s.0.to_string(),
+                        _ => panic!("non-symbol map key"),
+                    })
+                    .collect();
+                assert_eq!(keys, ["account", "asset_tag", "epoch"]);
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_address_roundtrips_strkey() {
+        // Encode 32 known bytes as a valid C-strkey, then ensure contract_address decodes
+        // them back into the ScAddress::Contract hash.
+        let raw = [0x11u8; 32];
+        let c = stellar_strkey::Contract(raw).to_string();
+        match contract_address(&c) {
+            Ok(ScAddress::Contract(ContractId(Hash(b)))) => assert_eq!(b, raw),
+            Ok(other) => panic!("expected contract address, got {other:?}"),
+            Err(e) => panic!("valid C-strkey should decode: {e}"),
+        }
+        assert!(contract_address("CNOTVALID").is_err());
     }
 }

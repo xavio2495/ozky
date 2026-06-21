@@ -3,7 +3,7 @@
 //! config + live epoch ([`super::config`]/[`super::chain`]), note selection
 //! ([`super::scan`]), the stateful witness generator ([`super::witness`]),
 //! client-side proving ([`super::proving`]), note encryption ([`super::encrypt`]) —
-//! and submits via the stellar CLI ([`super::chain::submit_transfer`]).
+//! and submits via the native Rust submitter ([`super::chain::submit_transfer`], G14).
 //!
 //! v1 spends ONE owned note covering `amount` (2-in/2-out with a dummy second input):
 //! output 0 = `amount` to the recipient, output 1 = change back to the sender.
@@ -14,11 +14,6 @@ use super::poseidon::{Fr, Hasher, SELECTOR_TRANSFER};
 use super::scan::{self, OwnedNote, WalletIdentity};
 use super::witness::{TransferInputs, TransferWitness};
 use super::{chain, keys, notes, proving, CoreError};
-
-/// In-container paths where [`proving`] leaves the transfer proof artifacts (the repo
-/// is mounted at `/workspace`); the CLI submission references these by path.
-const PROOF_PATH: &str = "/workspace/circuits/transfer/target/proof";
-const PUBLIC_INPUTS_PATH: &str = "/workspace/circuits/transfer/target/public_inputs";
 
 // ----------------------------- payment code -----------------------------
 
@@ -254,9 +249,9 @@ pub fn send_prepared(
         &rnd,
     )?;
 
-    // Prove (writes proof + public_inputs to circuits/transfer/target; verifies it
-    // against the frozen VK before returning).
-    proving::prove_transfer_witness(&witness)?;
+    // Prove (verifies against the frozen VK before returning); the proof + public_inputs
+    // bytes are submitted natively from memory (no in-container file paths — G14).
+    let bundle = proving::prove_transfer_witness(&witness)?;
 
     let outputs = output_payloads(
         cfg,
@@ -273,8 +268,8 @@ pub fn send_prepared(
     chain::submit_transfer(
         cfg,
         cfg.submit_source(wallet.stellar_secret()),
-        PUBLIC_INPUTS_PATH,
-        PROOF_PATH,
+        &bundle.public_inputs,
+        &bundle.proof,
         &outputs,
     )
 }
@@ -460,23 +455,6 @@ mod tests {
         let note = NotePlaintext::deserialize(&pt).unwrap();
         assert_eq!(note.value, 400);
         assert_eq!(note.epoch, 28);
-    }
-
-    #[test]
-    fn invoke_script_has_expected_args() {
-        let cfg = test_cfg();
-        let outputs = vec![
-            chain::OutputPayload { enc_note: vec![0xde, 0xad], ephemeral_pub: [1u8; 32], view_tag: 7 },
-            chain::OutputPayload { enc_note: vec![0xbe, 0xef], ephemeral_pub: [2u8; 32], view_tag: 9 },
-        ];
-        let script =
-            chain::transfer_invoke_script(&cfg, PUBLIC_INPUTS_PATH, PROOF_PATH, &outputs);
-        assert!(script.contains("--id CTEST"));
-        assert!(script.contains("transfer --asset_tag 1"));
-        assert!(script.contains("--public_inputs-file-path /workspace/circuits/transfer/target/public_inputs"));
-        assert!(script.contains("--enc_notes '[\"dead\",\"beef\"]'"));
-        assert!(script.contains("--view_tags '[7,9]'"));
-        assert!(script.contains("--source \"$OZKY_SOURCE_SECRET\""));
     }
 
     // ---------------------------------------------------------------------------

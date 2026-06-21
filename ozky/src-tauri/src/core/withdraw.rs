@@ -4,7 +4,8 @@
 //! change back to the spender.
 //!
 //! Builds the withdraw proof against live pool state (scan-selected note + raw-RPC
-//! commitment/nullifier sets, like the send flow) and submits via the stellar CLI.
+//! commitment/nullifier sets, like the send flow) and submits via the native Rust
+//! submitter ([`super::chain::submit_withdraw`], G14).
 //!
 //! Change-note caveat: the pool's `withdraw` entrypoint publishes NO ciphertext for
 //! the change commitment, so [`super::scan`] cannot rediscover it from chain alone.
@@ -16,9 +17,6 @@ use super::encrypt::NotePlaintext;
 use super::poseidon::{Fr, Hasher, DOMAIN_DEST, SELECTOR_WITHDRAW};
 use super::witness::{WithdrawInputs, WithdrawWitness};
 use super::{chain, keys, notes, proving, scan, CoreError};
-
-const PROOF_PATH: &str = "/workspace/circuits/withdraw/target/proof";
-const PUBLIC_INPUTS_PATH: &str = "/workspace/circuits/withdraw/target/public_inputs";
 
 /// The result of a withdraw: the tx hash, plus the shielded change-note opening (which
 /// the caller must persist — the contract publishes no ciphertext for it).
@@ -98,8 +96,8 @@ pub fn withdraw_with(
         },
     );
 
-    // Prove (writes proof + public_inputs to circuits/withdraw/target; verifies vs VK).
-    proving::prove_withdraw_witness(&witness)?;
+    // Prove (verifies vs the frozen VK); proof bytes are submitted natively from memory.
+    let bundle = proving::prove_withdraw_witness(&witness)?;
 
     // Relayer-submitted if configured (fee abstraction; withdraw is permissionless).
     let tx_hash = chain::submit_withdraw(
@@ -107,8 +105,8 @@ pub fn withdraw_with(
         cfg.submit_source(wallet.stellar_secret()),
         dest,
         amount,
-        PUBLIC_INPUTS_PATH,
-        PROOF_PATH,
+        &bundle.public_inputs,
+        &bundle.proof,
     )?;
 
     // Persist the shielded change opening: the pool publishes NO ciphertext for it, so

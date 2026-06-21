@@ -6,16 +6,13 @@
 //! The minted note is encrypted to the wallet's OWN transmission key and published
 //! on-chain, so a later [`super::scan`] rediscovers it as spendable (proven by the
 //! live lifecycle). Builds the deposit proof with [`super::proving`], submits via the
-//! stellar CLI ([`super::chain::submit_deposit`]).
+//! native Rust submitter ([`super::chain::submit_deposit`], G14).
 
 use super::config::PoolConfig;
 use super::encrypt::{self, NotePlaintext};
 use super::poseidon::{Fr, Hasher, SELECTOR_DEPOSIT};
 use super::witness::DepositWitness;
 use super::{chain, keys, proving, scan, CoreError};
-
-const PROOF_PATH: &str = "/workspace/circuits/deposit/target/proof";
-const PUBLIC_INPUTS_PATH: &str = "/workspace/circuits/deposit/target/public_inputs";
 
 /// Deposit `amount` of `asset` (a v1 code, e.g. "USDC") from the wallet's Stellar
 /// account into the shielded pool, using the wallet stored in the OS keychain. Returns
@@ -52,8 +49,8 @@ pub fn deposit_with(
         rho,
     );
 
-    // Prove (writes proof + public_inputs to circuits/deposit/target; verifies vs VK).
-    proving::prove_deposit_witness(&witness)?;
+    // Prove (verifies vs the frozen VK); proof bytes are submitted natively from memory.
+    let bundle = proving::prove_deposit_witness(&witness)?;
 
     // Encrypt the note to ourselves so scan rediscovers it as spendable.
     let plaintext = NotePlaintext {
@@ -75,8 +72,8 @@ pub fn deposit_with(
         wallet.stellar_secret(),
         wallet.stellar_address(),
         amount,
-        PUBLIC_INPUTS_PATH,
-        PROOF_PATH,
+        &bundle.public_inputs,
+        &bundle.proof,
         &payload,
     )
 }

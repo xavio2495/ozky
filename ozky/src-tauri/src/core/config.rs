@@ -138,11 +138,6 @@ impl PoolConfig {
         })
     }
 
-    /// `asset_tag` as the decimal string the stellar CLI expects for a `U256` arg.
-    pub fn asset_tag_decimal(&self) -> String {
-        self.asset_tag.to_decimal()
-    }
-
     /// Clone this config targeting a different asset (by its v1 code, e.g. "USDC").
     /// Only `asset_tag` changes — the same pool holds every registered asset, keyed by
     /// the note's `asset_tag` (the pool's `register_asset` registry maps tag → SAC).

@@ -1,0 +1,15 @@
+{
+  "name": "ozky-prover-sidecar",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Docker-free UltraHonk prover (bb.js WASM) — spike for the shippable prover",
+  "dependencies": {
+    "@aztec/bb.js": "0.87.0",
+    "@noir-lang/noir_js": "1.0.0-beta.9",
+    "smol-toml": "^1.6.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

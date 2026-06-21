@@ -29,6 +29,7 @@ pub const DOMAIN_DEST: u64 = 0x6f7a6b795f647374;
 pub const SELECTOR_DEPOSIT: u64 = 1;
 pub const SELECTOR_TRANSFER: u64 = 2;
 pub const SELECTOR_WITHDRAW: u64 = 3;
+pub const SELECTOR_SPLIT: u64 = 4;
 
 /// A BN254 Fr field element, 32-byte big-endian. The canonical wire form everywhere
 /// witnesses, commitments, nullifiers and roots are passed around in this core.

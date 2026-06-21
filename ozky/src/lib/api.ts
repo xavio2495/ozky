@@ -19,6 +19,35 @@ export const MAX_ACCOUNTS = 5;
 /** A public (unshielded) balance on the wallet's classic Stellar account. */
 export type PublicBalance = { code: string; balance: string; issuer: string | null };
 
+/** A payroll payee (shielded code + base-unit amount). */
+export type Payee = { code: string; amount: number };
+
+/** A payroll as returned by the backend (+ computed `due`). */
+export type Payroll = {
+	id: number;
+	label: string;
+	asset: string;
+	payees: Payee[];
+	cadence: string; // "weekly" | "monthly" | "days"
+	interval_days: number;
+	next_run_unix: number;
+	last_run_unix: number | null;
+	enabled: boolean;
+	due: boolean;
+	total: number;
+};
+
+/** Payroll create/update input. id=0 creates. */
+export type PayrollInput = {
+	id: number;
+	label: string;
+	asset: string;
+	payees: Payee[];
+	cadence: string;
+	interval_days: number;
+	start_unix: number;
+};
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -70,6 +99,15 @@ export const api = {
 	deposit: (asset: string, amount: number) => invoke<string>('deposit', { asset, amount }),
 	send: (asset: string, recipient: string, amount: number) =>
 		invoke<string>('send', { asset, recipient, amount }),
+	split: (asset: string, recipients: { recipient: string; amount: number }[]) =>
+		invoke<string>('split', { asset, recipients }),
+
+	listPayrolls: () => invoke<Payroll[]>('list_payrolls'),
+	savePayroll: (input: PayrollInput) => invoke<number>('save_payroll', { input }),
+	deletePayroll: (id: number) => invoke<void>('delete_payroll', { id }),
+	setPayrollEnabled: (id: number, enabled: boolean) =>
+		invoke<void>('set_payroll_enabled', { id, enabled }),
+	runPayroll: (id: number) => invoke<string[]>('run_payroll', { id }),
 	withdraw: (asset: string, dest: string, amount: number) =>
 		invoke<string>('withdraw', { asset, dest, amount }),
 

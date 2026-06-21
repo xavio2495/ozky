@@ -10,13 +10,14 @@ import {
 	type AccountInfo,
 	type AssetBalance,
 	type NewAccount,
+	type Payroll,
 	type PublicBalance,
 	type WalletStatus
 } from './api';
 
 export type Activity = {
 	id: number;
-	kind: 'deposit' | 'send' | 'withdraw' | 'enroll' | 'disclose';
+	kind: 'deposit' | 'send' | 'split' | 'payroll' | 'withdraw' | 'enroll' | 'disclose';
 	label: string;
 	detail?: string;
 	hash?: string;
@@ -28,6 +29,7 @@ class WalletStore {
 	balances = $state<AssetBalance[]>([]);
 	publicBalances = $state<PublicBalance[]>([]);
 	accounts = $state<AccountInfo[]>([]);
+	payrolls = $state<Payroll[]>([]);
 	activity = $state<Activity[]>([]);
 	loading = $state(false);
 	/** Set when the pool contracts aren't configured (dev without deployed IDs). */
@@ -36,6 +38,10 @@ class WalletStore {
 
 	get activeAccount(): AccountInfo | undefined {
 		return this.accounts.find((a) => a.active);
+	}
+
+	get dueCount(): number {
+		return this.payrolls.filter((p) => p.due).length;
 	}
 
 	get initialized() {
@@ -53,15 +59,48 @@ class WalletStore {
 		this.balances = [];
 		this.publicBalances = [];
 		this.accounts = [];
+		this.payrolls = [];
 		this.activity = [];
 		await this.refreshStatus();
 	}
 
-	/** Load after unlock — the accounts + shielded + public balances for the active one. */
+	/** Load after unlock — the accounts + shielded + public balances + payrolls. */
 	async loadSession() {
 		await this.refreshAccounts();
 		await this.refreshBalances();
 		await this.refreshPublicBalances();
+		await this.refreshPayrolls();
+	}
+
+	async refreshPayrolls() {
+		if (!this.unlocked) return;
+		try {
+			this.payrolls = await api.listPayrolls();
+		} catch (e) {
+			this.payrolls = [];
+			if (!isConfigError(e)) {
+				toast.error('Could not load payrolls', { description: errMessage(e) });
+			}
+		}
+	}
+
+	/** Run a payroll now (may be several split txs); logs activity + refreshes balances. */
+	async runPayroll(id: number) {
+		const p = this.payrolls.find((x) => x.id === id);
+		const hashes = await runAction(
+			`Running payroll${p ? ` "${p.label}"` : ''}`,
+			() => api.runPayroll(id),
+			{ success: (h) => `Payroll paid (${h.length} tx${h.length === 1 ? '' : 's'})` }
+		);
+		if (hashes && p) {
+			this.log({
+				kind: 'payroll',
+				label: `Payroll "${p.label}"`,
+				detail: `${p.payees.length} payees`,
+				hash: hashes[0]
+			});
+		}
+		await this.refreshPayrolls();
 	}
 
 	/** The active account's public (unshielded) Stellar balances — independent of the pool. */

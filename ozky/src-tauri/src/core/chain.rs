@@ -862,6 +862,39 @@ pub fn submit_transfer(
     invoke_contract(cfg, source_secret, &cfg.pool_contract, "transfer", args)
 }
 
+/// Submit a `split` (2-in / 8-out) to the pool. `outputs` must be the 8 output payloads
+/// (recipients, change, dummies) in the same order as the proof's out-commitments.
+pub fn submit_split(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    public_inputs: &[u8],
+    proof: &[u8],
+    outputs: &[OutputPayload],
+) -> Result<String, CoreError> {
+    let enc_notes = sc_vec(
+        outputs
+            .iter()
+            .map(|o| sc_bytes(&o.enc_note))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let ephemeral_pubs = sc_vec(
+        outputs
+            .iter()
+            .map(|o| sc_bytes(&o.ephemeral_pub))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let view_tags = sc_vec(outputs.iter().map(|o| ScVal::U32(o.view_tag)).collect())?;
+    let args = vec![
+        sc_u256_fr(&cfg.asset_tag),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        enc_notes,
+        ephemeral_pubs,
+        view_tags,
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "split", args)
+}
+
 /// Submit a `withdraw` to the pool. Returns the transaction hash.
 pub fn submit_withdraw(
     cfg: &PoolConfig,

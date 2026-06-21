@@ -9,6 +9,8 @@
 	import UploadIcon from '@lucide/svelte/icons/upload';
 	import ScaleIcon from '@lucide/svelte/icons/scale';
 	import SettingsIcon from '@lucide/svelte/icons/settings';
+	import SplitIcon from '@lucide/svelte/icons/split';
+	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import ReceiptIcon from '@lucide/svelte/icons/receipt';
 	import TrendingUpIcon from '@lucide/svelte/icons/trending-up';
 	import LockIcon from '@lucide/svelte/icons/lock';
@@ -29,6 +31,8 @@
 	const items = [
 		{ href: '/', label: 'Dashboard', icon: LayoutDashboardIcon },
 		{ href: '/send', label: 'Send', icon: ArrowUpRightIcon },
+		{ href: '/split', label: 'Split', icon: SplitIcon },
+		{ href: '/payroll', label: 'Payroll', icon: CalendarClockIcon, badge: true },
 		{ href: '/receive', label: 'Receive', icon: ArrowDownLeftIcon },
 		{ href: '/deposit', label: 'Deposit', icon: DownloadIcon },
 		{ href: '/withdraw', label: 'Withdraw', icon: UploadIcon },
@@ -67,6 +71,9 @@
 				<a href={item.href} class="nav-item" data-active={active}>
 					<item.icon class="size-[18px]" />
 					<span>{item.label}</span>
+					{#if item.badge && wallet.dueCount > 0}
+						<span class="due-dot" title="{wallet.dueCount} due">{wallet.dueCount}</span>
+					{/if}
 				</a>
 			</li>
 		{/each}
@@ -116,6 +123,19 @@
 	}
 	.nav-item[data-active='true'] {
 		color: var(--primary);
+	}
+	.due-dot {
+		margin-left: auto;
+		min-width: 18px;
+		height: 18px;
+		padding: 0 5px;
+		display: grid;
+		place-items: center;
+		border-radius: 999px;
+		background: var(--primary);
+		color: var(--primary-foreground);
+		font-size: 0.6875rem;
+		font-weight: 600;
 	}
 	.pill {
 		position: absolute;

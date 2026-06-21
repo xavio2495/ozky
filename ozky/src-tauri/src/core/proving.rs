@@ -12,7 +12,7 @@
 //! - **Docker fallback** (when `OZKY_PROVER_BIN` is unset): `nargo execute` + `bb prove`
 //!   + `bb verify` in the ZK container (the toolchain that froze the VKs).
 
-use super::witness::{DepositWitness, TransferWitness, WithdrawWitness};
+use super::witness::{DepositWitness, SplitWitness, TransferWitness, WithdrawWitness};
 use super::CoreError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +28,7 @@ pub enum Circuit {
     Deposit,
     Transfer,
     Withdraw,
+    Split,
 }
 
 impl Circuit {
@@ -36,6 +37,7 @@ impl Circuit {
             Circuit::Deposit => "deposit",
             Circuit::Transfer => "transfer",
             Circuit::Withdraw => "withdraw",
+            Circuit::Split => "split",
         }
     }
 }
@@ -147,6 +149,11 @@ pub fn prove_deposit_witness(w: &DepositWitness) -> Result<ProofBundle, CoreErro
 
 pub fn prove_withdraw_witness(w: &WithdrawWitness) -> Result<ProofBundle, CoreError> {
     prove(Circuit::Withdraw, &w.to_prover_toml())
+}
+
+/// Prove a split (2-in / 8-out) from a fully-built witness, verifying against the frozen VK.
+pub fn prove_split_witness(w: &SplitWitness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::Split, &w.to_prover_toml())
 }
 
 // --- Command-facing entrypoints -------------------------------------------------

@@ -312,6 +312,164 @@ pub fn send(asset: String, recipient: String, amount: u64) -> Result<String, Cor
     core::send::send(&asset, &recipient, amount)
 }
 
+/// One recipient of a split payment: a shielded payment code + base-unit amount.
+#[derive(serde::Deserialize)]
+pub struct SplitRecipientArg {
+    pub recipient: String,
+    pub amount: u64,
+}
+
+/// Split `asset` from one shielded note to up to 7 recipients in a single private
+/// transfer (recipients + change + dummy-padded to 8 outputs). Proves off the UI thread;
+/// returns the tx hash. (payment split)
+#[tauri::command]
+pub async fn split(asset: String, recipients: Vec<SplitRecipientArg>) -> Result<String, CoreError> {
+    blocking(move || {
+        let rs: Vec<core::send::SplitRecipient> = recipients
+            .into_iter()
+            .map(|r| core::send::SplitRecipient { code: r.recipient, amount: r.amount })
+            .collect();
+        core::send::split(&asset, &rs)
+    })
+    .await
+}
+
+/// A payee row for a payroll (shielded code + base-unit amount).
+#[derive(serde::Deserialize)]
+pub struct PayeeArg {
+    pub code: String,
+    pub amount: u64,
+}
+
+/// Payroll create/update input from the UI.
+#[derive(serde::Deserialize)]
+pub struct PayrollInput {
+    /// 0 to create; an existing id to update.
+    pub id: u64,
+    pub label: String,
+    pub asset: String,
+    pub payees: Vec<PayeeArg>,
+    /// "weekly" | "monthly" | "days".
+    pub cadence: String,
+    /// interval days when cadence == "days".
+    pub interval_days: u32,
+    /// Unix seconds for the first run (defaults to now if 0).
+    pub start_unix: i64,
+}
+
+/// A payroll as shown in the UI (+ a computed `due` flag).
+#[derive(Serialize)]
+pub struct PayrollView {
+    pub id: u64,
+    pub label: String,
+    pub asset: String,
+    pub payees: Vec<PayeeView>,
+    pub cadence: String,
+    pub interval_days: u32,
+    pub next_run_unix: i64,
+    pub last_run_unix: Option<i64>,
+    pub enabled: bool,
+    pub due: bool,
+    pub total: u64,
+}
+
+#[derive(Serialize)]
+pub struct PayeeView {
+    pub code: String,
+    pub amount: u64,
+}
+
+fn cadence_to_str(c: core::payroll::Cadence) -> (String, u32) {
+    match c {
+        core::payroll::Cadence::Weekly => ("weekly".into(), 0),
+        core::payroll::Cadence::Monthly => ("monthly".into(), 0),
+        core::payroll::Cadence::EveryDays(n) => ("days".into(), n),
+    }
+}
+
+fn cadence_from(cadence: &str, interval_days: u32) -> core::payroll::Cadence {
+    match cadence {
+        "monthly" => core::payroll::Cadence::Monthly,
+        "days" => core::payroll::Cadence::EveryDays(interval_days.max(1)),
+        _ => core::payroll::Cadence::Weekly,
+    }
+}
+
+fn view(p: core::payroll::Payroll, now: i64) -> PayrollView {
+    let (cadence, interval_days) = cadence_to_str(p.cadence);
+    PayrollView {
+        id: p.id,
+        label: p.label.clone(),
+        asset: p.asset.clone(),
+        payees: p.payees.iter().map(|x| PayeeView { code: x.code.clone(), amount: x.amount }).collect(),
+        cadence,
+        interval_days,
+        next_run_unix: p.next_run_unix,
+        last_run_unix: p.last_run_unix,
+        enabled: p.enabled,
+        due: p.is_due(now),
+        total: p.total(),
+    }
+}
+
+/// List this wallet's payrolls with a computed `due` flag. (recurring payroll)
+#[tauri::command]
+pub fn list_payrolls() -> Result<Vec<PayrollView>, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let now = core::payroll::now();
+    Ok(core::payroll::load(&wallet)?.into_iter().map(|p| view(p, now)).collect())
+}
+
+/// Create (id=0) or update a payroll. Returns its id. (recurring payroll)
+#[tauri::command]
+pub fn save_payroll(input: PayrollInput) -> Result<u64, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let cadence = cadence_from(&input.cadence, input.interval_days);
+    let start = if input.start_unix > 0 { input.start_unix } else { core::payroll::now() };
+    // Preserve last_run when updating an existing payroll.
+    let last_run_unix = core::payroll::load(&wallet)?
+        .into_iter()
+        .find(|p| p.id == input.id)
+        .and_then(|p| p.last_run_unix);
+    let p = core::payroll::Payroll {
+        id: input.id,
+        label: input.label,
+        asset: input.asset,
+        payees: input.payees.into_iter().map(|x| core::payroll::Payee { code: x.code, amount: x.amount }).collect(),
+        cadence,
+        next_run_unix: start,
+        last_run_unix,
+        enabled: true,
+    };
+    core::payroll::upsert(&wallet, p)
+}
+
+/// Delete a payroll. (recurring payroll)
+#[tauri::command]
+pub fn delete_payroll(id: u64) -> Result<(), CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::payroll::remove(&wallet, id)
+}
+
+/// Enable/disable a payroll (disabled payrolls are never "due"). (recurring payroll)
+#[tauri::command]
+pub fn set_payroll_enabled(id: u64, enabled: bool) -> Result<(), CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::payroll::set_enabled(&wallet, id, enabled)
+}
+
+/// Run a payroll now: pays all payees via ceil(N/5) split transactions, advances the
+/// schedule, returns the tx hashes. Off the UI thread (proves). (recurring payroll)
+#[tauri::command]
+pub async fn run_payroll(id: u64) -> Result<Vec<String>, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::payroll::run(&wallet, &cfg, id)
+    })
+    .await
+}
+
 /// Withdraw `amount` of `asset` out of the shielded pool to a public Stellar `dest`
 /// address (the off-ramp). Returns the tx hash. (A3/G6)
 #[tauri::command]

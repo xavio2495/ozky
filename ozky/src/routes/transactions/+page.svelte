@@ -13,11 +13,15 @@
 	import ScaleIcon from '@lucide/svelte/icons/scale';
 	import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
 	import ReceiptIcon from '@lucide/svelte/icons/receipt';
+	import SplitIcon from '@lucide/svelte/icons/split';
+	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import InfoIcon from '@lucide/svelte/icons/info';
 
 	const icons = {
 		deposit: DownloadIcon,
 		send: ArrowUpRightIcon,
+		split: SplitIcon,
+		payroll: CalendarClockIcon,
 		withdraw: UploadIcon,
 		enroll: ShieldCheckIcon,
 		disclose: ScaleIcon

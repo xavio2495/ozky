@@ -627,6 +627,155 @@ impl TransferWitness {
     }
 }
 
+// ----------------------------- Split (2-in / 8-out) -----------------------------
+
+/// Number of outputs in the split circuit (up to `N_SPLIT_OUTPUTS - 1` recipients + change).
+pub const N_SPLIT_OUTPUTS: usize = 6;
+
+pub struct SplitWitness {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub commitment_root: Fr,
+    pub nullifier_old_root: Fr,
+    pub nullifier_new_root: Fr,
+    pub nullifiers: [Fr; 2],
+    pub out_commitments: [Fr; N_SPLIT_OUTPUTS],
+    pub asp_root: Fr,
+    pub owner_sk: Fr,
+    pub inputs: [InputWitness; 2],
+    pub outputs: [OutputWitness; N_SPLIT_OUTPUTS],
+}
+
+impl SplitWitness {
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_tag = {}\n", q(&self.asset_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("commitment_root = {}\n", q(&self.commitment_root)));
+        s.push_str(&format!("nullifier_old_root = {}\n", q(&self.nullifier_old_root)));
+        s.push_str(&format!("nullifier_new_root = {}\n", q(&self.nullifier_new_root)));
+        s.push_str(&format!("nullifiers = {}\n", fr_array(&self.nullifiers)));
+        s.push_str(&format!("out_commitments = {}\n", fr_array(&self.out_commitments)));
+        s.push_str(&format!("asp_root = {}\n", q(&self.asp_root)));
+        s.push_str(&format!("owner_sk = {}\n", q(&self.owner_sk)));
+        s.push_str(&input_block(&self.inputs[0]));
+        s.push_str(&input_block(&self.inputs[1]));
+        for o in &self.outputs {
+            s.push_str(&output_block(o));
+        }
+        s
+    }
+}
+
+/// Per-output-slot data the send flow needs to encrypt a split output payload (value +
+/// the same blinding/rho the witness used for that slot).
+pub struct SplitOutMeta {
+    pub value: u64,
+    pub blinding: Fr,
+    pub rho: Fr,
+}
+
+/// A split's recipient outputs (each = recipient `owner_pk` + value), plus the blinding/
+/// rho randomness for every output slot (recipients, then change, then padding dummies).
+pub struct SplitInputs<'a> {
+    pub owner_sk: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub note_epoch: Fr,
+    pub domain_sep: Fr,
+    pub note_value: u64,
+    pub note_blinding: Fr,
+    pub note_rho: Fr,
+    pub note_leaf_index: usize,
+    pub commitment_leaves: &'a [Fr],
+    pub asp_leaves: &'a [Fr],
+    pub prior_nullifiers: &'a [Fr],
+    pub dummy_rho: Fr,
+    /// Recipient `(owner_pk, value)` pairs (1..=N_SPLIT_OUTPUTS-1). Change is automatic.
+    pub recipients: &'a [(Fr, u64)],
+    /// Per-output-slot (blinding, rho), length `N_SPLIT_OUTPUTS`, ordered:
+    /// recipients…, change, then padding dummies.
+    pub out_rand: &'a [(Fr, Fr); N_SPLIT_OUTPUTS],
+}
+
+impl SplitWitness {
+    /// Build a split witness against live state: spend one owned note, pay each recipient,
+    /// return change to the sender, and pad the remaining output slots with value-0 dummy
+    /// notes (owned by the sender) so the on-chain footprint is always 8 outputs.
+    pub fn build(h: &Hasher, p: SplitInputs) -> SplitWitness {
+        assert!(
+            !p.recipients.is_empty() && p.recipients.len() <= N_SPLIT_OUTPUTS - 1,
+            "1..=7 recipients"
+        );
+        let owner_pk = h.owner_pk(&p.owner_sk);
+        let nf0 = h.nullifier(&p.note_rho, &p.owner_sk);
+        let nf1 = h.nullifier(&p.dummy_rho, &p.owner_sk);
+        let (nf_old, nf_new, w0, w1) = build_two_insertions(h, p.prior_nullifiers, nf0, nf1);
+
+        let real_note = SpendNote {
+            value: p.note_value,
+            blinding: p.note_blinding,
+            epoch: p.note_epoch,
+            rho: p.note_rho,
+            leaf_index: p.note_leaf_index,
+        };
+        let real_in = real_input(h, &real_note, p.commitment_leaves, p.asp_leaves, owner_pk, w0);
+        let dummy_in = dummy_input(p.epoch, p.dummy_rho, w1);
+
+        let paid: u64 = p.recipients.iter().map(|(_, v)| *v).sum();
+        let change_value = p.note_value - paid; // caller validates paid <= note_value
+
+        // Build the 8 output slots: recipients, change, then value-0 dummies (to self).
+        let mut outputs: Vec<OutputWitness> = Vec::with_capacity(N_SPLIT_OUTPUTS);
+        for (i, (rpk, val)) in p.recipients.iter().enumerate() {
+            outputs.push(OutputWitness {
+                value: Fr::from_u64(*val),
+                owner_pk: *rpk,
+                blinding: p.out_rand[i].0,
+                rho: p.out_rand[i].1,
+            });
+        }
+        let change_slot = p.recipients.len();
+        outputs.push(OutputWitness {
+            value: Fr::from_u64(change_value),
+            owner_pk,
+            blinding: p.out_rand[change_slot].0,
+            rho: p.out_rand[change_slot].1,
+        });
+        for i in (change_slot + 1)..N_SPLIT_OUTPUTS {
+            outputs.push(OutputWitness {
+                value: Fr::ZERO,
+                owner_pk,
+                blinding: p.out_rand[i].0,
+                rho: p.out_rand[i].1,
+            });
+        }
+        let outputs: [OutputWitness; N_SPLIT_OUTPUTS] =
+            outputs.try_into().unwrap_or_else(|_| unreachable!("exactly 8 outputs"));
+
+        let out_commitments: [Fr; N_SPLIT_OUTPUTS] = std::array::from_fn(|j| {
+            outputs[j].commitment(h, &p.asset_tag, &p.epoch)
+        });
+
+        SplitWitness {
+            domain_sep: p.domain_sep,
+            asset_tag: p.asset_tag,
+            epoch: p.epoch,
+            commitment_root: real_in.cm.root,
+            nullifier_old_root: nf_old,
+            nullifier_new_root: nf_new,
+            nullifiers: [nf0, nf1],
+            out_commitments,
+            asp_root: real_in.asp.root,
+            owner_sk: p.owner_sk,
+            inputs: [real_in, dummy_in],
+            outputs,
+        }
+    }
+}
+
 /// Everything needed to build a real 1-real + 1-dummy `withdraw` against LIVE pool
 /// state: spend one owned note, release `amount` to a public dest (bound by
 /// `dest_bind`), keep `note_value - amount` as shielded change back to the spender.
@@ -810,5 +959,73 @@ mod tests {
         let b = commitment_path(&h, &[leaf], 0);
         assert_eq!(a.root, b.root);
         assert_eq!(a.siblings, b.siblings);
+    }
+
+    /// Build a split witness paying 3 recipients (250/250/250) from a 1000-note, change
+    /// 250, padded to 8 outputs.
+    fn split_demo(h: &Hasher) -> SplitWitness {
+        let owner_sk = Fr::from_u64(12345);
+        let owner_pk = h.owner_pk(&owner_sk);
+        let asset_tag = Fr::from_u64(1);
+        let epoch = Fr::from_u64(28);
+        let in_cm = h.commitment(&Fr::from_u64(1000), &asset_tag, &owner_pk, &Fr::from_u64(777), &epoch, &Fr::from_u64(111));
+        let recips = [
+            (h.owner_pk(&Fr::from_u64(91)), 250u64),
+            (h.owner_pk(&Fr::from_u64(92)), 250),
+            (h.owner_pk(&Fr::from_u64(93)), 250),
+        ];
+        let out_rand: [(Fr, Fr); N_SPLIT_OUTPUTS] =
+            std::array::from_fn(|i| (Fr::from_u64(100 + i as u64), Fr::from_u64(200 + i as u64)));
+        SplitWitness::build(
+            h,
+            SplitInputs {
+                owner_sk,
+                asset_tag,
+                epoch,
+                note_epoch: epoch,
+                domain_sep: Fr::from_hex(DOMAIN_SEP_28).unwrap(),
+                note_value: 1000,
+                note_blinding: Fr::from_u64(777),
+                note_rho: Fr::from_u64(111),
+                note_leaf_index: 0,
+                commitment_leaves: &[in_cm],
+                asp_leaves: &[owner_pk],
+                prior_nullifiers: &[],
+                dummy_rho: Fr::from_u64(0xdead),
+                recipients: &recips,
+                out_rand: &out_rand,
+            },
+        )
+    }
+
+    #[test]
+    fn split_conserves_value_and_pads_to_eight() {
+        let h = Hasher::new();
+        let w = split_demo(&h);
+        // 8 outputs, all out-commitments populated.
+        assert_eq!(w.outputs.len(), N_SPLIT_OUTPUTS);
+        assert_eq!(w.out_commitments.len(), N_SPLIT_OUTPUTS);
+        // Conservation: 3*250 recipients + 250 change + 0*4 dummies == 1000.
+        let out_sum: u64 = w.outputs.iter().map(|o| o.value.to_decimal().parse::<u64>().unwrap()).sum();
+        assert_eq!(out_sum, 1000);
+        // slots: 3 recipients, slot 3 = change (250), slots 4..8 = 0 (dummy, to self).
+        assert_eq!(w.outputs[3].value.to_decimal(), "250");
+        assert_eq!(w.outputs[3].owner_pk, h.owner_pk(&Fr::from_u64(12345)));
+        for o in &w.outputs[4..] {
+            assert_eq!(o.value.to_decimal(), "0");
+        }
+        // commitments match the output notes.
+        for j in 0..N_SPLIT_OUTPUTS {
+            assert_eq!(w.out_commitments[j], w.outputs[j].commitment(&h, &w.asset_tag, &w.epoch));
+        }
+    }
+
+    #[test]
+    fn split_prover_toml_has_n_outputs() {
+        let h = Hasher::new();
+        let toml = split_demo(&h).to_prover_toml();
+        assert_eq!(toml.matches("[[outputs]]").count(), N_SPLIT_OUTPUTS);
+        assert!(toml.contains("owner_sk = \"0x3039\""));
+        assert!(toml.contains("[inputs.nf_low]"));
     }
 }

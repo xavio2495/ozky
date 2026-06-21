@@ -12,25 +12,22 @@ use super::poseidon::Fr;
 use super::CoreError;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
-/// Optional dev config file: a flat JSON map of `OZKY_*` → value, read once. Lets the app
-/// pick up deployed contract IDs (and the prover path) WITHOUT environment variables.
-/// Path: `$OZKY_CONFIG`, else `<repo>/ozky.config.json`. Missing/invalid → empty.
-fn file_config() -> &'static HashMap<String, String> {
-    static CFG: OnceLock<HashMap<String, String>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let path = std::env::var("OZKY_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("ozky.config.json")
-        });
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
-            .unwrap_or_default()
-    })
+/// Optional dev config file: a flat JSON map of `OZKY_*` → value. Lets the app pick up
+/// deployed contract IDs (and the prover path) WITHOUT environment variables. Path:
+/// `$OZKY_CONFIG`, else `<repo>/ozky.config.json`. Missing/invalid → empty. Read fresh
+/// per call (config load isn't hot; staying re-readable keeps it testable).
+fn file_config() -> HashMap<String, String> {
+    let path = std::env::var("OZKY_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("ozky.config.json")
+    });
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Resolve an `OZKY_*` setting: environment first, then the config file, else `None`.
@@ -193,10 +190,14 @@ mod tests {
 
     #[test]
     fn load_requires_pool_contract() {
-        // Without OZKY_POOL_CONTRACT set, load() errors (the test env doesn't set it).
-        // (Other tests don't set it either; this asserts the required-field behaviour.)
+        // With neither the env var NOR a config file providing it, load() errors. Point
+        // OZKY_CONFIG at a nonexistent path so the dev machine's ozky.config.json (which
+        // legitimately sets the contract) doesn't satisfy the requirement here.
         std::env::remove_var("OZKY_POOL_CONTRACT");
-        assert!(PoolConfig::load().is_err());
+        std::env::set_var("OZKY_CONFIG", "/nonexistent/ozky.config.json");
+        let r = PoolConfig::load();
+        std::env::remove_var("OZKY_CONFIG");
+        assert!(r.is_err());
     }
 
     #[test]

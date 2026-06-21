@@ -10,9 +10,9 @@
 
 use super::config::PoolConfig;
 use super::encrypt::{self, NotePlaintext};
-use super::poseidon::{Fr, Hasher, SELECTOR_TRANSFER};
+use super::poseidon::{Fr, Hasher, SELECTOR_SPLIT, SELECTOR_TRANSFER};
 use super::scan::{self, OwnedNote, WalletIdentity};
-use super::witness::{TransferInputs, TransferWitness};
+use super::witness::{self, TransferInputs, TransferWitness};
 use super::{chain, keys, notes, proving, CoreError};
 
 // ----------------------------- payment code -----------------------------
@@ -162,6 +162,186 @@ fn output_payloads(
         chain::OutputPayload { enc_note: e0.enc_note, ephemeral_pub: e0.ephemeral_pub, view_tag: e0.view_tag },
         chain::OutputPayload { enc_note: e1.enc_note, ephemeral_pub: e1.ephemeral_pub, view_tag: e1.view_tag },
     ])
+}
+
+// ----------------------------- split (1 payer -> N recipients) -----------------------------
+
+/// A split recipient: a shielded payment code + amount.
+pub struct SplitRecipient {
+    pub code: String,
+    pub amount: u64,
+}
+
+/// Build a split witness paying each recipient (1..=7) from one owned note, change to
+/// self, padding the remaining output slots with value-0 self-notes. Pure (no network).
+/// Returns the witness + the per-slot (recipient_transmission_pub, value) needed to
+/// encrypt the output payloads in the SAME slot order.
+fn build_split_witness(
+    h: &Hasher,
+    id: &WalletIdentity,
+    cfg: &PoolConfig,
+    epoch: u32,
+    note: &OwnedNote,
+    commitment_leaves: &[Fr],
+    prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
+    recipients: &[(Fr, [u8; 32], u64)], // (owner_pk, transmission_pub, amount)
+) -> Result<(witness::SplitWitness, Vec<(witness::SplitOutMeta, [u8; 32])>), CoreError> {
+    use witness::N_SPLIT_OUTPUTS;
+    if recipients.is_empty() || recipients.len() > N_SPLIT_OUTPUTS - 1 {
+        return Err(CoreError::Proving("split needs 1..=7 recipients".into()));
+    }
+    if note.asset_tag != cfg.asset_tag {
+        return Err(CoreError::Proving("note asset_tag != pool asset_tag".into()));
+    }
+    let paid: u64 = recipients.iter().map(|(_, _, v)| *v).sum();
+    if note.value < paid {
+        return Err(CoreError::Proving(format!(
+            "selected note ({}) does not cover split total ({paid})",
+            note.value
+        )));
+    }
+    if !asp_leaves.contains(&id.owner_pk) {
+        return Err(CoreError::Proving(
+            "wallet not enrolled in this pool's ASP approved set (cannot prove membership)".into(),
+        ));
+    }
+    let domain_sep = h.domain_sep(&cfg.pool_id, &cfg.network_id, SELECTOR_SPLIT);
+
+    // Fresh randomness per output slot (recipients, change, dummies).
+    let out_rand: [(Fr, Fr); N_SPLIT_OUTPUTS] =
+        std::array::from_fn(|_| (Fr::random(), Fr::random()));
+    let recip_pairs: Vec<(Fr, u64)> = recipients.iter().map(|(pk, _, v)| (*pk, *v)).collect();
+
+    let w = witness::SplitWitness::build(
+        h,
+        witness::SplitInputs {
+            owner_sk: id.owner_sk,
+            asset_tag: cfg.asset_tag,
+            epoch: Fr::from_u64(epoch as u64),
+            note_epoch: Fr::from_u64(note.epoch as u64),
+            domain_sep,
+            note_value: note.value,
+            note_blinding: note.blinding,
+            note_rho: note.rho,
+            note_leaf_index: note.leaf_index as usize,
+            commitment_leaves,
+            asp_leaves,
+            prior_nullifiers,
+            dummy_rho: Fr::random(),
+            recipients: &recip_pairs,
+            out_rand: &out_rand,
+        },
+    );
+
+    // Per-slot (value, blinding, rho, dest transmission pub) so we encrypt to the right
+    // party in the SAME order the witness built the outputs.
+    let change_value = note.value - paid;
+    let mut meta: Vec<(witness::SplitOutMeta, [u8; 32])> = Vec::with_capacity(N_SPLIT_OUTPUTS);
+    for (i, (_, tpub, v)) in recipients.iter().enumerate() {
+        meta.push((
+            witness::SplitOutMeta { value: *v, blinding: out_rand[i].0, rho: out_rand[i].1 },
+            *tpub,
+        ));
+    }
+    let change_slot = recipients.len();
+    meta.push((
+        witness::SplitOutMeta { value: change_value, blinding: out_rand[change_slot].0, rho: out_rand[change_slot].1 },
+        id.transmission_pub,
+    ));
+    for i in (change_slot + 1)..N_SPLIT_OUTPUTS {
+        meta.push((
+            witness::SplitOutMeta { value: 0, blinding: out_rand[i].0, rho: out_rand[i].1 },
+            id.transmission_pub,
+        ));
+    }
+    Ok((w, meta))
+}
+
+/// Encrypt the 8 split output notes, each to its slot's destination transmission key.
+fn split_output_payloads(
+    cfg: &PoolConfig,
+    epoch: u32,
+    meta: &[(witness::SplitOutMeta, [u8; 32])],
+) -> Result<Vec<chain::OutputPayload>, CoreError> {
+    let mut out = Vec::with_capacity(meta.len());
+    for (m, tpub) in meta {
+        let pt = NotePlaintext {
+            value: m.value,
+            asset_tag: cfg.asset_tag,
+            blinding: m.blinding,
+            epoch,
+            rho: m.rho,
+        };
+        let e = encrypt::encrypt_note(&pt.serialize(), tpub)?;
+        out.push(chain::OutputPayload {
+            enc_note: e.enc_note,
+            ephemeral_pub: e.ephemeral_pub,
+            view_tag: e.view_tag,
+        });
+    }
+    Ok(out)
+}
+
+/// Split `asset` from one owned note to multiple recipients via the keychain wallet.
+pub fn split(asset: &str, recipients: &[SplitRecipient]) -> Result<String, CoreError> {
+    let wallet = keys::current_wallet()?;
+    let cfg = PoolConfig::load()?.with_asset(asset)?;
+    split_with(&wallet, &cfg, recipients)
+}
+
+/// Split with an explicit wallet + config (keychain-independent). Reads live pool state,
+/// selects an owned note covering the split total, builds + proves the split, submits it.
+pub fn split_with(
+    wallet: &keys::WalletKeys,
+    cfg: &PoolConfig,
+    recipients: &[SplitRecipient],
+) -> Result<String, CoreError> {
+    let id = scan::wallet_identity(wallet)?;
+    let h = Hasher::new();
+    let epoch = chain::current_epoch(&cfg.rpc_url)?;
+    let state = chain::pool_state(cfg)?;
+    let commitment_leaves = chain::commitment_leaves_from(&state.commits)?;
+    let asp_leaves = chain::approved_set(cfg)?;
+    let local = notes::load(wallet)?;
+
+    // Parse recipient codes -> (owner_pk, transmission_pub, amount).
+    let parsed: Vec<(Fr, [u8; 32], u64)> = recipients
+        .iter()
+        .map(|r| {
+            let (pk, tpub) = parse_payment_code(&r.code)?;
+            Ok((pk, tpub, r.amount))
+        })
+        .collect::<Result<_, CoreError>>()?;
+    let total: u64 = parsed.iter().map(|(_, _, v)| *v).sum();
+
+    let note = scan::owned_notes(&id, &state, &local, 0)?
+        .into_iter()
+        .find(|n| n.value >= total && n.asset_tag == cfg.asset_tag)
+        .ok_or_else(|| CoreError::Proving(format!("no single owned note covers split total {total}")))?;
+
+    let (witness, meta) = build_split_witness(
+        &h,
+        &id,
+        cfg,
+        epoch,
+        &note,
+        &commitment_leaves,
+        &state.nullifiers,
+        &asp_leaves,
+        &parsed,
+    )?;
+
+    let bundle = proving::prove_split_witness(&witness)?;
+    let outputs = split_output_payloads(cfg, epoch, &meta)?;
+
+    chain::submit_split(
+        cfg,
+        cfg.submit_source(wallet.stellar_secret()),
+        &bundle.public_inputs,
+        &bundle.proof,
+        &outputs,
+    )
 }
 
 // ----------------------------- orchestration -----------------------------
@@ -602,6 +782,192 @@ mod tests {
         println!("OZKY_RELAYER_SECRET={relayer_secret}");
         println!("DEPOSITED_XLM={xlm}");
         println!("WALLET_ADDR={addr}");
+    }
+
+    /// One-off MIGRATION to a split-capable pool. Reads `$OZKY_DEPLOY_MNEMONIC`; the OLD
+    /// pool/policy/viewkeys from the current `ozky.config.json` (via `PoolConfig::load`).
+    /// Steps: (1) scan the old pool, withdraw each owned note back to the wallet's public
+    /// account; (2) deploy a NEW pool whose constructor includes the `split_verifier`
+    /// (4th verifier = frozen split VK), register XLM+USDC, enroll owner_pk(+decoys),
+    /// deploy viewkeys, create a relayer; (3) re-deposit the recovered amounts. Prints the
+    /// new IDs to put in `ozky.config.json`.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture deploy_split_pool
+    #[test]
+    #[ignore = "one-off split-pool migration; needs ZK container + network + $OZKY_DEPLOY_MNEMONIC + ozky.config.json"]
+    fn deploy_split_pool() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let h = Hasher::new();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let addr = wallet.stellar_address().to_string();
+        let secret = wallet.stellar_secret().to_string();
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
+
+        let notes_dir = std::env::temp_dir().join("ozky-split-migrate-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+
+        // --- 1. Withdraw owned notes from the OLD pool back to the public account. ---
+        // Old pool config comes from ozky.config.json; drop the relayer so the wallet
+        // sources its own withdraw fees (it holds ample public XLM).
+        let mut old_cfg = PoolConfig::load().expect("old pool config (ozky.config.json)");
+        old_cfg.relayer_secret = None;
+        let old_state = chain::pool_state(&old_cfg).unwrap();
+        let local = notes::load(&wallet).unwrap();
+        let owned = scan::owned_notes(&id, &old_state, &local, 0).unwrap();
+        // Sum recoverable value per asset tag (decimal).
+        let mut xlm_base: u64 = 0;
+        let mut usdc_base: u64 = 0;
+        let xlm_tag = Fr::from_u64(1).to_decimal();
+        let usdc_tag = Fr::from_u64(2).to_decimal();
+        for n in &owned {
+            if n.asset_tag.to_decimal() == xlm_tag {
+                xlm_base += n.value;
+            } else if n.asset_tag.to_decimal() == usdc_tag {
+                usdc_base += n.value;
+            }
+        }
+        eprintln!("OLD pool owned: {} XLM base, {} USDC base", xlm_base, usdc_base);
+        if xlm_base > 0 {
+            let c = old_cfg.clone().with_asset("XLM").unwrap();
+            withdraw::withdraw_with(&wallet, &c, &addr, xlm_base).expect("withdraw XLM from old pool");
+            eprintln!("withdrew {} XLM base from old pool", xlm_base);
+        }
+        if usdc_base > 0 {
+            let c = old_cfg.clone().with_asset("USDC").unwrap();
+            withdraw::withdraw_with(&wallet, &c, &addr, usdc_base).expect("withdraw USDC from old pool");
+            eprintln!("withdrew {} USDC base from old pool", usdc_base);
+        }
+
+        // --- 2. Deploy the NEW split-capable pool (4 verifiers incl. split). ---
+        let setup = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             T=/workspace/contracts/target/wasm32v1-none/release\n\
+             VK=/workspace/contracts/frozen_vks\n\
+             V=$T/rs_soroban_ultrahonk.wasm\n\
+             VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
+             VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
+             VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
+             VSPL=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/split/vk)\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
+             SAC=$(stellar contract id asset --asset native --network testnet)\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --split_verifier $VSPL --policy $POLICY --asp_root $ASP --admin {addr})\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
+        );
+        let out = run_zk(&secret, &setup);
+        let pool = kv(&out, "POOL");
+        let policy = kv(&out, "POLICY");
+        let viewkeys = kv(&out, "VIEWKEYS");
+        let relayer_secret = kv(&out, "RELAYER_SECRET");
+
+        std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        std::env::remove_var("OZKY_RELAYER_SECRET"); // deposit is user-sourced anyway
+        let new_cfg = PoolConfig::load().unwrap();
+
+        // --- 3. Re-deposit the recovered amounts into the NEW pool. ---
+        if xlm_base > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("XLM").unwrap(), xlm_base)
+                .expect("re-deposit XLM into new pool");
+        }
+        if usdc_base > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("USDC").unwrap(), usdc_base)
+                .expect("re-deposit USDC into new pool");
+        }
+
+        println!("=== SPLIT POOL DEPLOY DONE ===");
+        println!("OZKY_POOL_CONTRACT={pool}");
+        println!("OZKY_POLICY_CONTRACT={policy}");
+        println!("OZKY_VIEWKEYS_CONTRACT={viewkeys}");
+        println!("OZKY_RELAYER_SECRET={relayer_secret}");
+        println!("REDEPOSITED_XLM_BASE={xlm_base}");
+        println!("REDEPOSITED_USDC_BASE={usdc_base}");
+    }
+
+    /// One-off: perform a REAL split on the configured (split-capable) pool. Reads
+    /// `$OZKY_DEPLOY_MNEMONIC`, splits 30 XLM -> 3 self-codes (10 each) + change, then
+    /// rescans and asserts the 3 outputs + change landed and the input note is spent.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture split_lifecycle_on_testnet
+    #[test]
+    #[ignore = "live split lifecycle; needs network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn split_lifecycle_on_testnet() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        let notes_dir = std::env::temp_dir().join("ozky-split-test-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().unwrap().with_asset("XLM").unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let code = payment_code(&id);
+
+        // Balance before.
+        let before: u64 = {
+            let st = chain::pool_state(&cfg).unwrap();
+            scan::owned_notes(&id, &st, &[], 0).unwrap().iter()
+                .filter(|n| n.asset_tag == cfg.asset_tag).map(|n| n.value).sum()
+        };
+        eprintln!("XLM shielded before split: {} base", before);
+
+        // Split 30 XLM to 3 self-codes (10 each); change returns to self.
+        let ten = 10 * 10_000_000u64;
+        let recipients = vec![
+            SplitRecipient { code: code.clone(), amount: ten },
+            SplitRecipient { code: code.clone(), amount: ten },
+            SplitRecipient { code: code.clone(), amount: ten },
+        ];
+        let hash = split_with(&wallet, &cfg, &recipients).expect("split must succeed on-chain");
+        assert!(!hash.is_empty());
+        eprintln!("SPLIT OK tx {hash}");
+
+        // Rescan: the original note is spent; the 3 recipient outputs (to self) + change
+        // are now ours, so total XLM is conserved (minus nothing — interior transfer).
+        let st = chain::pool_state(&cfg).unwrap();
+        let notes = scan::owned_notes(&id, &st, &[], 0).unwrap();
+        let after: u64 = notes.iter().filter(|n| n.asset_tag == cfg.asset_tag).map(|n| n.value).sum();
+        eprintln!("XLM shielded after split: {} base across {} notes", after, notes.len());
+        assert_eq!(after, before, "interior split conserves total shielded value");
+        // At least 3 notes of exactly 10 XLM (the self-paid recipients) must exist now.
+        let tens = notes.iter().filter(|n| n.value == ten).count();
+        assert!(tens >= 3, "expected >=3 ten-XLM outputs, got {tens}");
+        println!("SPLIT LIFECYCLE OK");
     }
 
     #[test]

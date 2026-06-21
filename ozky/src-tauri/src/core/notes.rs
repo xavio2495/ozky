@@ -23,6 +23,12 @@ use std::path::PathBuf;
 
 const RECORD_LEN: usize = 108; // NotePlaintext serialized length.
 
+/// Shared lock serializing every test that mutates the process-global `OZKY_NOTES_DIR`
+/// (notes + payroll stores both key off `data_dir()`), so concurrent tests don't clobber
+/// each other's directory.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// App data directory. `OZKY_NOTES_DIR` overrides (set by the command layer to Tauri's
 /// app-data dir, or by tests to a temp dir); else a platform default. Shared by the
 /// encrypted notes store and the (plaintext) per-pool scan cache ([`super::chain`]).
@@ -120,7 +126,6 @@ mod tests {
     use crate::core::poseidon::Fr;
 
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
 
     const MNEMONIC: &str =
         "illness spike retreat truth genius clock brain pass fit cave bargain toe";
@@ -128,13 +133,12 @@ mod tests {
     // `OZKY_NOTES_DIR` is a process-global env var; serialize the notes tests (which
     // run as threads in one process) so they don't clobber each other's dir. Each test
     // also gets a unique dir, so even the serialized runs never share a store file.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// Hold the env lock for the test's lifetime + point `OZKY_NOTES_DIR` at a fresh
     /// unique dir. Returns the guard (kept alive by the caller).
     fn isolated_env() -> std::sync::MutexGuard<'static, ()> {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = super::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let d = std::env::temp_dir().join(format!("ozky-notes-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

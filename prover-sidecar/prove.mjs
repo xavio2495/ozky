@@ -22,7 +22,7 @@ import { UltraHonkBackend } from '@aztec/bb.js';
 import { Noir } from '@noir-lang/noir_js';
 import { parse as parseToml } from 'smol-toml';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { cpus } from 'node:os';
 
 async function main() {
@@ -36,7 +36,18 @@ async function main() {
   const target = join(circuitDir, 'target');
   const threads = process.env.BB_THREADS ? Number(process.env.BB_THREADS) : Math.max(1, cpus().length);
 
-  const assetsDir = process.env.OZKY_PROVER_ASSETS;
+  // In the SEA binary the WASM blobs ship beside the executable, so default to that
+  // dir; an explicit OZKY_PROVER_ASSETS overrides. In dev (plain `node`) both are
+  // unset and bb.js / noir_js load WASM from node_modules.
+  let assetsDir = process.env.OZKY_PROVER_ASSETS;
+  if (!assetsDir) {
+    try {
+      const sea = await import('node:sea');
+      if (sea.isSea?.()) assetsDir = dirname(process.execPath);
+    } catch {
+      /* node:sea unavailable (old node) — dev path */
+    }
+  }
   const wasmPath = assetsDir ? join(assetsDir, 'barretenberg-threads.wasm.gz') : undefined;
 
   const compiled = JSON.parse(readFileSync(join(target, `${name}.json`), 'utf8'));
@@ -80,9 +91,16 @@ async function main() {
   }
 
   report.selfVerify = await backend.verifyProof({ proof, publicInputs }, { keccak: true });
+  await backend.destroy?.();
+
+  // Fail closed: only emit a proof that verified, and (if a frozen VK was given) whose
+  // VK matches the on-chain one. Mirrors the docker path's `set -e; bb verify`.
+  if (!report.selfVerify || report.vkMatchesFrozen === false) {
+    console.error(JSON.stringify(report, null, 2));
+    process.exit(1);
+  }
 
   console.log(JSON.stringify(report, null, 2));
-  await backend.destroy?.();
   process.exit(0);
 }
 

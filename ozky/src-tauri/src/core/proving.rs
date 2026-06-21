@@ -1,20 +1,20 @@
 //! Client-side proving (Phase A2). Turns a natively-generated witness (see
 //! [`super::witness`]) into an UltraHonk proof the on-chain verifier accepts.
 //!
-//! Barretenberg (`bb`) and Noir (`nargo`) have no native Windows build — they run in
-//! the project's ZK Docker container (the same toolchain that froze the VKs). So
-//! proving here: (1) builds the witness in native Rust, (2) writes the circuit's
-//! `Prover.toml`, (3) shells to the container to `nargo execute` + `bb prove`
-//! (keccak oracle, the on-chain format) and `bb verify` against the FROZEN VK in one
-//! run, (4) reads back the `proof` + `public_inputs` bytes. A proof is only returned
-//! if it verified against the frozen key.
+//! Proving: (1) builds the witness in native Rust, (2) writes the circuit's
+//! `Prover.toml`, (3) runs the prover, (4) reads back the `proof` + `public_inputs`
+//! bytes. A proof is only returned if it verified against the FROZEN VK.
 //!
-//! Bundling a Docker-free prover (so the shipped app proves without the container) is
-//! a later packaging task; for the testnet milestone this is the proving path.
+//! Two prover backends, selected at step (3):
+//! - **Native sidecar** (`OZKY_PROVER_BIN` → the `ozky-prover` SEA binary): solves the
+//!   witness (noir_js) and proves (bb.js, keccak oracle) entirely in WASM, no Docker.
+//!   This is the shippable path — output is byte-identical to the container's `bb`.
+//! - **Docker fallback** (when `OZKY_PROVER_BIN` is unset): `nargo execute` + `bb prove`
+//!   + `bb verify` in the ZK container (the toolchain that froze the VKs).
 
 use super::witness::{DepositWitness, TransferWitness, WithdrawWitness};
 use super::CoreError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A proof + its public-input vector, ready to submit to the pool contract.
@@ -65,8 +65,52 @@ fn prove(circuit: Circuit, prover_toml: &str) -> Result<ProofBundle, CoreError> 
     std::fs::write(circuit_dir.join("Prover.toml"), prover_toml)
         .map_err(|e| CoreError::Proving(format!("write Prover.toml: {e}")))?;
 
-    // One container run: solve the witness, prove (keccak oracle = on-chain format),
-    // and verify against the frozen VK. `set -e` ⇒ a failed verify fails the run.
+    match sidecar_bin() {
+        Some(bin) => prove_via_sidecar(&bin, &circuit_dir, &root, name)?,
+        None => prove_via_docker(&root, name)?,
+    }
+
+    let target = circuit_dir.join("target");
+    let proof = std::fs::read(target.join("proof"))
+        .map_err(|e| CoreError::Proving(format!("read proof: {e}")))?;
+    let public_inputs = std::fs::read(target.join("public_inputs"))
+        .map_err(|e| CoreError::Proving(format!("read public_inputs: {e}")))?;
+    Ok(ProofBundle { proof, public_inputs })
+}
+
+/// The native prover sidecar binary, if configured. `OZKY_PROVER_BIN` points at the
+/// `ozky-prover` SEA executable (its WASM blobs ship beside it). Unset ⇒ Docker fallback.
+fn sidecar_bin() -> Option<PathBuf> {
+    std::env::var_os("OZKY_PROVER_BIN")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+/// Prove + verify via the native sidecar (no Docker). It reads `<circuit>/Prover.toml`
+/// and `target/<name>.json`, writes `target/{proof,public_inputs}`, and exits non-zero
+/// unless the proof verified AND its VK matches the frozen one.
+fn prove_via_sidecar(bin: &Path, circuit_dir: &Path, root: &Path, name: &str) -> Result<(), CoreError> {
+    let frozen_vk = root.join("contracts").join("frozen_vks").join(name).join("vk");
+    // The WASM blobs ship beside the binary; point the sidecar at them explicitly.
+    let assets_dir = bin.parent().unwrap_or_else(|| Path::new("."));
+    let out = Command::new(bin)
+        .arg(circuit_dir)
+        .arg(&frozen_vk)
+        .env("OZKY_PROVER_ASSETS", assets_dir)
+        .output()
+        .map_err(|e| CoreError::Proving(format!("spawn prover sidecar: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail: String = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(CoreError::Proving(format!("prover sidecar failed for {name}:\n{tail}")));
+    }
+    Ok(())
+}
+
+/// Prove + verify in the ZK Docker container. One run: solve the witness, prove (keccak
+/// oracle = on-chain format), verify against the frozen VK. `set -e` ⇒ a failed verify
+/// fails the run.
+fn prove_via_docker(root: &Path, name: &str) -> Result<(), CoreError> {
     let script = format!(
         "set -e; cd circuits/{name}; nargo compile; nargo execute; \
          bb prove --scheme ultra_honk --oracle_hash keccak \
@@ -89,13 +133,7 @@ fn prove(circuit: Circuit, prover_toml: &str) -> Result<ProofBundle, CoreError> 
         let tail: String = stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(CoreError::Proving(format!("prove/verify failed for {name}:\n{tail}")));
     }
-
-    let target = circuit_dir.join("target");
-    let proof = std::fs::read(target.join("proof"))
-        .map_err(|e| CoreError::Proving(format!("read proof: {e}")))?;
-    let public_inputs = std::fs::read(target.join("public_inputs"))
-        .map_err(|e| CoreError::Proving(format!("read public_inputs: {e}")))?;
-    Ok(ProofBundle { proof, public_inputs })
+    Ok(())
 }
 
 /// Prove a transfer from a fully-built witness, verifying against the frozen VK.

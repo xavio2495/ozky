@@ -116,7 +116,7 @@ pub struct WalletIdentity {
 /// Derive the wallet's scan/spend identity from its keys (the transmission key is the
 /// epoch-independent {account 0, asset 1} viewing key — a stable receive address).
 pub fn wallet_identity(w: &WalletKeys) -> Result<WalletIdentity, CoreError> {
-    let view = w.scoped_view_key(SCAN_ACCOUNT, SCAN_ASSET_TAG, TRANSMISSION_EPOCH);
+    let view = w.scoped_view_key(w.account(), SCAN_ASSET_TAG, TRANSMISSION_EPOCH);
     let owner_sk = Fr::from_hex(&w.owner_sk_hex())
         .ok_or_else(|| CoreError::Crypto("owner_sk hex".into()))?;
     let h = Hasher::new();

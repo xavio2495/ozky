@@ -10,6 +10,36 @@
 
 use super::poseidon::Fr;
 use super::CoreError;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Optional dev config file: a flat JSON map of `OZKY_*` → value, read once. Lets the app
+/// pick up deployed contract IDs (and the prover path) WITHOUT environment variables.
+/// Path: `$OZKY_CONFIG`, else `<repo>/ozky.config.json`. Missing/invalid → empty.
+fn file_config() -> &'static HashMap<String, String> {
+    static CFG: OnceLock<HashMap<String, String>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let path = std::env::var("OZKY_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("ozky.config.json")
+        });
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+            .unwrap_or_default()
+    })
+}
+
+/// Resolve an `OZKY_*` setting: environment first, then the config file, else `None`.
+pub fn cfg_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| file_config().get(key).cloned().filter(|s| !s.is_empty()))
+}
 
 /// A v1 asset the wallet can transact. `tag` is the in-circuit `asset_tag` (bound into
 /// every note commitment and matched against the pool's `register_asset` registry);
@@ -71,18 +101,18 @@ pub struct PoolConfig {
 }
 
 fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    cfg_var(key).unwrap_or_else(|| default.to_string())
 }
 
 /// `pool_id=7`, `network_id=42`, `asset_tag=1` — the values the frozen-VK round-trips
 /// used. Overridable via `OZKY_POOL_ID` / `OZKY_NETWORK_ID` / `OZKY_ASSET_TAG`.
 fn env_field(key: &str, default: u64) -> Result<Fr, CoreError> {
-    match std::env::var(key) {
-        Ok(v) => v
+    match cfg_var(key) {
+        Some(v) => v
             .parse::<u64>()
             .map(Fr::from_u64)
             .map_err(|_| CoreError::Chain(format!("{key} must be a u64: {v}"))),
-        Err(_) => Ok(Fr::from_u64(default)),
+        None => Ok(Fr::from_u64(default)),
     }
 }
 
@@ -90,12 +120,12 @@ impl PoolConfig {
     /// Resolve from the environment. `OZKY_POOL_CONTRACT` is required (the deployed
     /// pool's id); the rest fall back to testnet defaults.
     pub fn load() -> Result<PoolConfig, CoreError> {
-        let pool_contract = std::env::var("OZKY_POOL_CONTRACT").map_err(|_| {
+        let pool_contract = cfg_var("OZKY_POOL_CONTRACT").ok_or_else(|| {
             CoreError::Chain(
                 "OZKY_POOL_CONTRACT not set (the deployed pool contract id to send against)".into(),
             )
         })?;
-        let policy_contract = std::env::var("OZKY_POLICY_CONTRACT").map_err(|_| {
+        let policy_contract = cfg_var("OZKY_POLICY_CONTRACT").ok_or_else(|| {
             CoreError::Chain(
                 "OZKY_POLICY_CONTRACT not set (the deployed policy/ASP contract id)".into(),
             )
@@ -103,7 +133,7 @@ impl PoolConfig {
         Ok(PoolConfig {
             pool_contract,
             policy_contract,
-            viewkeys_contract: std::env::var("OZKY_VIEWKEYS_CONTRACT").ok().filter(|s| !s.is_empty()),
+            viewkeys_contract: cfg_var("OZKY_VIEWKEYS_CONTRACT"),
             pool_id: env_field("OZKY_POOL_ID", 7)?,
             network_id: env_field("OZKY_NETWORK_ID", 42)?,
             asset_tag: env_field("OZKY_ASSET_TAG", 1)?,
@@ -113,7 +143,7 @@ impl PoolConfig {
                 "OZKY_NETWORK_PASSPHRASE",
                 "Test SDF Network ; September 2015",
             ),
-            relayer_secret: std::env::var("OZKY_RELAYER_SECRET").ok().filter(|s| !s.is_empty()),
+            relayer_secret: cfg_var("OZKY_RELAYER_SECRET"),
         })
     }
 

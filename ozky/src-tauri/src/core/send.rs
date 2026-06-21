@@ -506,6 +506,104 @@ mod tests {
             .to_string()
     }
 
+    /// One-off **persistent** deploy + deposit for a real wallet, so the app shows a real
+    /// balance. Reads the mnemonic from `$OZKY_DEPLOY_MNEMONIC` (never committed). Deploys
+    /// verifiers/policy/pool/viewkeys, enrolls the wallet's `owner_pk` (+2 decoys) into the
+    /// ASP set, registers XLM+USDC, funds the wallet, creates a relayer, and DEPOSITS
+    /// `$OZKY_DEPLOY_XLM` (default 100) XLM. Prints the contract IDs to wire into the app.
+    ///   OZKY_DEPLOY_MNEMONIC="…" OZKY_PROVER_BIN=… cargo test --lib -- --ignored \
+    ///     --test-threads=1 --nocapture deploy_persistent_for_user
+    #[test]
+    #[ignore = "one-off persistent testnet deploy; needs ZK container + network + $OZKY_DEPLOY_MNEMONIC"]
+    fn deploy_persistent_for_user() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC to run the persistent deploy");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let h = Hasher::new();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let addr = wallet.stellar_address().to_string();
+        let secret = wallet.stellar_secret().to_string();
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
+
+        // Isolated notes dir for the deposit's self-scan (the app uses its own).
+        let notes_dir = std::env::temp_dir().join("ozky-deploy-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+        // Docker-free proving for the deposit (sidecar).
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var(
+                "OZKY_PROVER_BIN",
+                repo_root().join("prover-sidecar/dist/ozky-prover.exe"),
+            );
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+
+        // Persistent deploy (same proven flow as the lifecycle test, kept on-chain).
+        let setup = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             curl -s 'https://friendbot.stellar.org/?addr={addr}' >/dev/null || true\n\
+             T=/workspace/contracts/target/wasm32v1-none/release\n\
+             VK=/workspace/contracts/frozen_vks\n\
+             V=$T/rs_soroban_ultrahonk.wasm\n\
+             VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
+             VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
+             VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
+             SAC=$(stellar contract id asset --asset native --network testnet)\n\
+             stellar contract asset deploy --asset native --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --policy $POLICY --asp_root $ASP --admin {addr})\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset USDC:$USDC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
+        );
+        let out = run_zk(&secret, &setup);
+        let pool = kv(&out, "POOL");
+        let policy = kv(&out, "POLICY");
+        let viewkeys = kv(&out, "VIEWKEYS");
+        let relayer_secret = kv(&out, "RELAYER_SECRET");
+
+        std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        let cfg = PoolConfig::load().unwrap();
+
+        let xlm: u64 = std::env::var("OZKY_DEPLOY_XLM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let base = xlm * 10_000_000;
+        deposit::deposit_with(&wallet, &cfg, base).expect("deposit must succeed on-chain");
+
+        println!("=== PERSISTENT DEPLOY DONE ===");
+        println!("OZKY_POOL_CONTRACT={pool}");
+        println!("OZKY_POLICY_CONTRACT={policy}");
+        println!("OZKY_VIEWKEYS_CONTRACT={viewkeys}");
+        println!("OZKY_RELAYER_SECRET={relayer_secret}");
+        println!("DEPOSITED_XLM={xlm}");
+        println!("WALLET_ADDR={addr}");
+    }
+
     #[test]
     #[ignore = "live testnet lifecycle; needs ZK container + network. run with --ignored --test-threads=1"]
     fn send_lifecycle_on_testnet() {

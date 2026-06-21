@@ -29,9 +29,14 @@ const BN254_FR_MODULUS_DEC: &[u8] =
     b"21888242871839275222246405745257275088548364400416034343698204186575808495617";
 
 /// Derived key material for the wallet. Secret-bearing; never serialized to the UI.
+/// All fields are derived at a specific HD `account` index (SEP-0005 `account'`); the
+/// spend key and Stellar key vary by account, the view scope uses `account` as its top
+/// dimension — so each account is a fully separate shielded identity.
 pub struct WalletKeys {
     /// BIP39 seed (kept only in memory; the mnemonic is the keychain secret).
     seed: Zeroizing<[u8; 64]>,
+    /// HD account index this key set was derived at.
+    account: u32,
     /// Stellar Ed25519 account public address (G...).
     pub stellar_address: String,
     /// Stellar Ed25519 secret seed (S...). Backup/sign use only.
@@ -49,6 +54,10 @@ pub struct ScopedViewKey {
 }
 
 impl WalletKeys {
+    /// The HD account index these keys were derived at.
+    pub fn account(&self) -> u32 {
+        self.account
+    }
     pub fn stellar_address(&self) -> &str {
         &self.stellar_address
     }
@@ -83,27 +92,34 @@ pub fn generate_mnemonic() -> Result<String, CoreError> {
     Ok(m.to_string())
 }
 
-/// Derive all keys from a 12-word phrase (empty BIP39 passphrase, per SEP-0005).
+/// Derive the keys for HD account 0 from a 12-word phrase (back-compat shorthand).
 pub fn derive_from_mnemonic(phrase: &str) -> Result<WalletKeys, CoreError> {
+    derive_from_mnemonic_at(phrase, 0)
+}
+
+/// Derive all keys for HD `account` from a 12-word phrase (empty BIP39 passphrase, per
+/// SEP-0005). Account 0 reproduces the original single-account derivation exactly.
+pub fn derive_from_mnemonic_at(phrase: &str, account: u32) -> Result<WalletKeys, CoreError> {
     let mnemonic = Mnemonic::parse_normalized(phrase.trim())
         .map_err(|e| CoreError::Keychain(format!("invalid mnemonic: {e}")))?;
     let seed = Zeroizing::new(mnemonic.to_seed(""));
 
-    // --- Stellar Ed25519 (SEP-0005: SLIP-0010 ed25519, m/44'/148'/0') ---
-    let ed_seed = stellar_ed25519_seed(&seed, 0);
+    // --- Stellar Ed25519 (SEP-0005: SLIP-0010 ed25519, m/44'/148'/account') ---
+    let ed_seed = stellar_ed25519_seed(&seed, account);
     let signing = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
     let public = signing.verifying_key().to_bytes();
     let stellar_address = stellar_strkey::ed25519::PublicKey(public).to_string();
     let stellar_secret = Zeroizing::new(stellar_strkey::ed25519::PrivateKey(ed_seed).to_string());
 
-    // --- BN254 owner_sk (distinct domain off the SEED, reduced into Fr) ---
-    let owner_sk = derive_owner_sk(&seed);
+    // --- BN254 owner_sk (distinct domain off the SEED, scoped by account, into Fr) ---
+    let owner_sk = derive_owner_sk_at(&seed, account);
 
-    // --- Viewing-key hierarchy root ---
+    // --- Viewing-key hierarchy root (global; scoped by account at use site) ---
     let view_master = Zeroizing::new(hmac32(b"ozky-view-master-v1", &*seed));
 
     Ok(WalletKeys {
         seed,
+        account,
         stellar_address,
         stellar_secret,
         owner_sk: Zeroizing::new(owner_sk),
@@ -111,17 +127,30 @@ pub fn derive_from_mnemonic(phrase: &str) -> Result<WalletKeys, CoreError> {
     })
 }
 
-/// Load the stored mnemonic from the OS keychain and derive the wallet's keys.
+/// Derive the wallet's keys from the **unlocked session** mnemonic. Errors with
+/// [`CoreError::Locked`] if the wallet hasn't been unlocked (password + TOTP) this
+/// session — the seed lives encrypted in [`super::vault`] at rest, never in plaintext.
 pub fn current_wallet() -> Result<WalletKeys, CoreError> {
-    let phrase = super::keychain::load(SEED_ACCOUNT)?.ok_or(CoreError::NoWallet)?;
+    // Each account is its own independent seed (created or imported), so we derive at HD
+    // index 0 of the active account's mnemonic. Separation comes from the distinct seeds.
+    let phrase = super::session::mnemonic()?;
     derive_from_mnemonic(&phrase)
 }
 
 // ----------------------------- derivation internals -----------------------------
 
-/// `owner_sk = (HMAC-SHA512("ozky-bn254-spend-v1", seed)) mod r`, as 32-byte BE.
-fn derive_owner_sk(seed: &[u8; 64]) -> [u8; 32] {
-    let wide = hmac64(b"ozky-bn254-spend-v1", seed);
+/// `owner_sk` for an HD account, reduced into Fr (32-byte BE). Account 0 keeps the
+/// original `HMAC-SHA512("ozky-bn254-spend-v1", seed)` so existing notes stay spendable;
+/// accounts > 0 use a distinct, account-scoped domain so each is a separate spend identity.
+fn derive_owner_sk_at(seed: &[u8; 64], account: u32) -> [u8; 32] {
+    let wide = if account == 0 {
+        hmac64(b"ozky-bn254-spend-v1", seed)
+    } else {
+        let mut data = [0u8; 68];
+        data[..64].copy_from_slice(seed);
+        data[64..].copy_from_slice(&account.to_be_bytes());
+        hmac64(b"ozky-bn254-spend-acct-v1", &data)
+    };
     let r = BigUint::parse_bytes(BN254_FR_MODULUS_DEC, 10).expect("valid modulus");
     let reduced = BigUint::from_bytes_be(&wide) % &r;
     let mut out = [0u8; 32];

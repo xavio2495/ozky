@@ -19,6 +19,7 @@
 // that will call them in later phases. Allow that without warnings here.
 #![allow(dead_code)]
 
+pub mod accounts;
 pub mod chain;
 pub mod config;
 pub mod deposit;
@@ -29,10 +30,14 @@ pub mod keychain;
 pub mod keys;
 pub mod notes;
 pub mod poseidon;
+pub mod price;
 pub mod proving;
 pub mod scan;
 pub mod send;
+pub mod session;
 pub mod sign;
+pub mod totp;
+pub mod vault;
 pub mod withdraw;
 pub mod witness;
 
@@ -49,6 +54,8 @@ pub enum CoreError {
     Keychain(String),
     /// No wallet has been created/restored yet.
     NoWallet,
+    /// A wallet exists but is locked — unlock (password + TOTP) required first.
+    Locked,
     /// Chain / indexer access failed (network, decode).
     Chain(String),
     /// Cryptographic operation failed (encryption, decryption, key agreement).
@@ -69,6 +76,7 @@ impl fmt::Display for CoreError {
             CoreError::NotImplemented(w) => write!(f, "not implemented yet: {w}"),
             CoreError::Keychain(e) => write!(f, "keychain error: {e}"),
             CoreError::NoWallet => write!(f, "no wallet initialized"),
+            CoreError::Locked => write!(f, "wallet is locked"),
             CoreError::Chain(e) => write!(f, "chain/indexer error: {e}"),
             CoreError::Crypto(e) => write!(f, "crypto error: {e}"),
             CoreError::Proving(e) => write!(f, "proving error: {e}"),

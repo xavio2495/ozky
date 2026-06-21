@@ -43,7 +43,7 @@ impl Circuit {
 /// Repo root (holds `compose.zk.yaml`, `circuits/`, `contracts/`). Overridable via
 /// `OZKY_REPO_ROOT`; otherwise the compile-time location (`src-tauri/../..`).
 fn repo_root() -> PathBuf {
-    if let Ok(p) = std::env::var("OZKY_REPO_ROOT") {
+    if let Some(p) = super::config::cfg_var("OZKY_REPO_ROOT") {
         return PathBuf::from(p);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -81,7 +81,7 @@ fn prove(circuit: Circuit, prover_toml: &str) -> Result<ProofBundle, CoreError> 
 /// The native prover sidecar binary, if configured. `OZKY_PROVER_BIN` points at the
 /// `ozky-prover` SEA executable (its WASM blobs ship beside it). Unset ⇒ Docker fallback.
 fn sidecar_bin() -> Option<PathBuf> {
-    std::env::var_os("OZKY_PROVER_BIN")
+    super::config::cfg_var("OZKY_PROVER_BIN")
         .map(PathBuf::from)
         .filter(|p| p.exists())
 }

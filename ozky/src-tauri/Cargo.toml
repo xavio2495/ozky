@@ -40,6 +40,12 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Auth (local password lock + TOTP 2FA): Argon2id derives the vault key from the
+# password; the seed is encrypted at rest (ChaCha20-Poly1305, above). RFC-6238 TOTP
+# uses HMAC-SHA1 (authenticator-app default); base32 for the otpauth secret encoding.
+argon2 = "0.5"
+sha1 = "0.10"
+base32 = "0.5"
 # A2/A3 — chain client: Stellar RPC (getEvents/getLatestLedger) + ScVal XDR decode,
 # so the wallet reconstructs any pool's commitments/nullifiers from raw chain data
 # (the indexer is only an optional accelerator; raw RPC is the correctness path).

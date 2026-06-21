@@ -6,43 +6,232 @@
 use crate::core::{self, CoreError};
 use serde::Serialize;
 
-/// High-level wallet state for the UI shell.
+/// High-level wallet state for the UI shell. Drives the onboarding gate:
+/// `!initialized` → sign-up; `initialized && !unlocked` → sign-in; else → the app.
 #[derive(Serialize)]
 pub struct WalletStatus {
-    /// Whether a wallet seed exists in the OS keychain.
+    /// Whether an encrypted vault exists (a wallet has been created/restored).
     pub initialized: bool,
+    /// Whether the wallet is unlocked this session (password + TOTP passed).
+    pub unlocked: bool,
     /// Target network (testnet through Part 1/2).
     pub network: String,
 }
 
-/// Real (stub) core command: report whether a wallet exists. Exercises the
-/// UI -> command -> core -> OS keychain path end-to-end (A0 smoke test).
+/// What a fresh sign-up / restore hands back to the UI: the recovery phrase to back up
+/// (shown once) and the TOTP secret to add to an authenticator app.
+#[derive(Serialize)]
+pub struct WalletSetup {
+    /// The 12-word recovery phrase (only returned on create; empty on restore).
+    pub mnemonic: String,
+    /// TOTP shared secret, base32 — for manual authenticator entry.
+    pub totp_secret: String,
+    /// `otpauth://` provisioning URI — rendered as a QR for the authenticator app.
+    pub totp_uri: String,
+}
+
+/// Report whether a wallet exists and whether it's unlocked this session.
 #[tauri::command]
 pub fn wallet_status() -> Result<WalletStatus, CoreError> {
-    let initialized = core::keychain::exists(core::keys::SEED_ACCOUNT)?;
     Ok(WalletStatus {
-        initialized,
+        initialized: core::vault::exists()?,
+        unlocked: core::session::is_unlocked(),
         network: core::chain::DEFAULT_NETWORK.to_string(),
     })
 }
 
-/// Create a new wallet: generate a 12-word phrase, validate it derives, store it in
-/// the OS keychain, and return the phrase ONCE so the user can back it up. (A1)
+/// Create a new wallet (its first account): generate a 12-word phrase + a TOTP secret,
+/// encrypt them at rest under `password` (Argon2id + ChaCha20-Poly1305), and open the
+/// session. Returns the phrase (back it up) + TOTP provisioning. `async` + `spawn_blocking`
+/// so the heavy Argon2 KDF runs off the UI thread (otherwise the window freezes). (auth)
 #[tauri::command]
-pub fn create_wallet() -> Result<String, CoreError> {
-    let phrase = core::keys::generate_mnemonic()?;
-    // Validate it derives cleanly before persisting.
-    core::keys::derive_from_mnemonic(&phrase)?;
-    core::keychain::store(core::keys::SEED_ACCOUNT, &phrase)?;
-    Ok(phrase)
+pub async fn create_wallet(password: String) -> Result<WalletSetup, CoreError> {
+    blocking(move || {
+        let phrase = core::keys::generate_mnemonic()?;
+        let keys = core::keys::derive_from_mnemonic(&phrase)?; // validate + label
+        setup_vault_and_session(&password, &phrase, keys.stellar_address(), phrase.clone())
+    })
+    .await
 }
 
-/// Restore a wallet from a 12-word phrase: validate it derives, then store it in the
-/// OS keychain. (Chain re-scan to re-discover notes is A2.)
+/// Restore a wallet from a 12-word phrase: validate it, set a new `password`, provision a
+/// fresh TOTP secret, encrypt at rest, and open the session. Off-thread (Argon2). (auth)
 #[tauri::command]
-pub fn restore_wallet(phrase: String) -> Result<(), CoreError> {
+pub async fn restore_wallet(phrase: String, password: String) -> Result<WalletSetup, CoreError> {
+    blocking(move || {
+        let phrase = phrase.trim().to_string();
+        let keys = core::keys::derive_from_mnemonic(&phrase)?; // validates the phrase
+        setup_vault_and_session(&password, &phrase, keys.stellar_address(), String::new())
+    })
+    .await
+}
+
+/// Shared create/restore tail: provision TOTP, write the encrypted vault (one account),
+/// open the session, and return the setup payload.
+fn setup_vault_and_session(
+    password: &str,
+    phrase: &str,
+    account_label: &str,
+    mnemonic_out: String,
+) -> Result<WalletSetup, CoreError> {
+    let totp_secret = core::totp::generate_secret();
+    let content = core::vault::VaultContent {
+        totp_secret,
+        accounts: vec![zeroize::Zeroizing::new(phrase.to_string())],
+    };
+    let key = core::vault::create(password, &content)?;
+    core::accounts::reset()?; // fresh wallet starts with a single account
+    core::session::set(content, key, 0);
+    Ok(WalletSetup {
+        mnemonic: mnemonic_out,
+        totp_secret: core::totp::secret_base32(&totp_secret),
+        totp_uri: core::totp::provisioning_uri(&totp_secret, account_label, "ozky"),
+    })
+}
+
+/// Unlock the wallet for this session: decrypt the vault with `password` (first factor)
+/// and verify the TOTP `code` (second factor). Off-thread (Argon2). (auth)
+#[tauri::command]
+pub async fn unlock(password: String, code: String) -> Result<(), CoreError> {
+    blocking(move || {
+        let (content, key) = core::vault::unlock(&password)?;
+        if !core::totp::verify(&content.totp_secret, &code, core::totp::now()) {
+            return Err(CoreError::Crypto("invalid 2FA code".into()));
+        }
+        let meta = core::accounts::load()?;
+        core::session::set(content, key, meta.active);
+        Ok(())
+    })
+    .await
+}
+
+/// Lock the wallet (clear the in-memory session). The vault stays encrypted at rest.
+#[tauri::command]
+pub fn lock() -> Result<(), CoreError> {
+    core::session::clear();
+    Ok(())
+}
+
+/// Verify a TOTP code against the unlocked session (the sign-up 2FA-confirm step). (auth)
+#[tauri::command]
+pub fn verify_totp(code: String) -> Result<bool, CoreError> {
+    core::totp::verify_session(&code)
+}
+
+/// One account in the wallet (each is an independent seed; create or import).
+#[derive(Serialize)]
+pub struct AccountInfo {
+    pub index: u32,
+    pub label: String,
+    /// The account's public Stellar funding address (`G…`).
+    pub address: String,
+    pub active: bool,
+}
+
+/// Result of creating a fresh account: its index + the new recovery phrase to back up.
+#[derive(Serialize)]
+pub struct NewAccount {
+    pub index: u32,
+    pub mnemonic: String,
+}
+
+/// List the wallet's accounts (derives each one's Stellar address). Requires unlock.
+#[tauri::command]
+pub fn list_accounts() -> Result<Vec<AccountInfo>, CoreError> {
+    let count = core::session::account_count();
+    let active = core::session::active_account();
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let phrase = core::session::mnemonic_at(index)?;
+        let keys = core::keys::derive_from_mnemonic(&phrase)?;
+        out.push(AccountInfo {
+            index,
+            label: core::accounts::label(index)?,
+            address: keys.stellar_address().to_string(),
+            active: index == active,
+        });
+    }
+    Ok(out)
+}
+
+/// Create a brand-new account (its own fresh seed; max 5) and switch to it. Returns the
+/// new index + recovery phrase — the UI must show it once for backup.
+#[tauri::command]
+pub fn create_account(label: Option<String>) -> Result<NewAccount, CoreError> {
+    core::session::mnemonic()?; // must be unlocked
+    if core::session::account_count() >= core::accounts::MAX_ACCOUNTS {
+        return Err(CoreError::Crypto(format!(
+            "account limit reached ({})",
+            core::accounts::MAX_ACCOUNTS
+        )));
+    }
+    let phrase = core::keys::generate_mnemonic()?;
+    core::keys::derive_from_mnemonic(&phrase)?; // validate before storing
+    let index = core::session::add_account(phrase.clone())?;
+    core::accounts::add(label)?;
+    Ok(NewAccount { index, mnemonic: phrase })
+}
+
+/// Import an existing wallet by its 12-word recovery phrase (max 5) and switch to it. (auth)
+#[tauri::command]
+pub fn import_account(phrase: String, label: Option<String>) -> Result<u32, CoreError> {
+    core::session::mnemonic()?; // must be unlocked
+    if core::session::account_count() >= core::accounts::MAX_ACCOUNTS {
+        return Err(CoreError::Crypto(format!(
+            "account limit reached ({})",
+            core::accounts::MAX_ACCOUNTS
+        )));
+    }
+    let phrase = phrase.trim().to_string();
     core::keys::derive_from_mnemonic(&phrase)?; // validates the phrase
-    core::keychain::store(core::keys::SEED_ACCOUNT, phrase.trim())
+    let index = core::session::add_account(phrase)?;
+    core::accounts::add(label)?;
+    Ok(index)
+}
+
+/// Switch the active account; subsequent balance/send/etc. use it. (auth)
+#[tauri::command]
+pub fn switch_account(index: u32) -> Result<(), CoreError> {
+    core::session::mnemonic()?; // must be unlocked
+    core::accounts::set_active(index)?;
+    core::session::set_active_account(index);
+    Ok(())
+}
+
+/// The active account's PUBLIC (unshielded) Stellar balances — XLM + any trustline assets.
+/// Read from Horizon; off the UI thread. (deriving keys + network)
+#[tauri::command]
+pub async fn public_balances() -> Result<Vec<core::chain::PublicBalance>, CoreError> {
+    blocking(|| {
+        let wallet = core::keys::current_wallet()?;
+        core::chain::public_balances(wallet.stellar_address())
+    })
+    .await
+}
+
+/// Current USD spot prices (+ 24h change) for the wallet's assets. Public market data;
+/// needs no wallet. Network I/O runs off the UI thread.
+#[tauri::command]
+pub async fn asset_prices() -> Result<Vec<core::price::Spot>, CoreError> {
+    let codes: Vec<String> = core::config::ASSETS.iter().map(|a| a.code.to_string()).collect();
+    blocking(move || core::price::spot(&codes)).await
+}
+
+/// USD price history for one asset over `days` (for the price chart).
+#[tauri::command]
+pub async fn price_history(code: String, days: u32) -> Result<Vec<core::price::Point>, CoreError> {
+    blocking(move || core::price::history(&code, days)).await
+}
+
+/// Run a blocking (CPU-heavy or network) closure off the UI thread.
+async fn blocking<T, F>(f: F) -> Result<T, CoreError>
+where
+    F: FnOnce() -> Result<T, CoreError> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| CoreError::Crypto(format!("task join: {e}")))?
 }
 
 /// Spendable balance of one asset the wallet holds shielded notes in.

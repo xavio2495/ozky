@@ -26,6 +26,55 @@ pub const LEDGER_PER_EPOCH: u64 = 110_000;
 /// The target network. Testnet throughout Part 1/2; mainnet only after audit.
 pub const DEFAULT_NETWORK: &str = "testnet";
 pub const DEFAULT_RPC_URL: &str = "https://soroban-testnet.stellar.org";
+/// Horizon (classic) endpoint — for reading the wallet's PUBLIC account balances
+/// (the unshielded side). Overridable via `OZKY_HORIZON_URL`.
+pub const DEFAULT_HORIZON_URL: &str = "https://horizon-testnet.stellar.org";
+
+/// A public (unshielded) balance on the wallet's classic Stellar account.
+#[derive(serde::Serialize)]
+pub struct PublicBalance {
+    /// "XLM" for the native asset, else the asset code (e.g. "USDC").
+    pub code: String,
+    /// Human-readable amount (Horizon returns it already scaled).
+    pub balance: String,
+    /// Classic issuer (`G…`) for non-native assets.
+    pub issuer: Option<String>,
+}
+
+/// Read the PUBLIC (unshielded) balances of a classic Stellar account from Horizon.
+/// An unfunded account (404) returns an empty list rather than an error.
+pub fn public_balances(addr: &str) -> Result<Vec<PublicBalance>, CoreError> {
+    let url = format!(
+        "{}/accounts/{}",
+        super::config::cfg_var("OZKY_HORIZON_URL").unwrap_or_else(|| DEFAULT_HORIZON_URL.into()),
+        addr
+    );
+    let resp = match ureq::get(&url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => return Ok(vec![]), // account not yet funded
+        Err(e) => return Err(CoreError::Chain(format!("horizon: {e}"))),
+    };
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| CoreError::Chain(format!("horizon decode: {e}")))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("balances").and_then(|b| b.as_array()) {
+        for b in arr {
+            let asset_type = b.get("asset_type").and_then(|x| x.as_str()).unwrap_or("");
+            let balance = b.get("balance").and_then(|x| x.as_str()).unwrap_or("0").to_string();
+            if asset_type == "native" {
+                out.push(PublicBalance { code: "XLM".into(), balance, issuer: None });
+            } else {
+                out.push(PublicBalance {
+                    code: b.get("asset_code").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                    balance,
+                    issuer: b.get("asset_issuer").and_then(|x| x.as_str()).map(String::from),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// How far back (ledgers) to scan a pool's events; testnet RPC retains ~120k.
 const SCAN_LOOKBACK: u32 = 120_000;
@@ -607,6 +656,29 @@ fn build_tx(
     })
 }
 
+/// Turn a raw simulate diagnostic (often a multi-KB XDR/event dump) into a short,
+/// actionable message. Recognizes the common asset-funding failures; otherwise keeps
+/// just the head of the diagnostic.
+fn friendly_sim_error(fn_name: &str, err: &str) -> String {
+    if err.contains("trustline entry is missing") {
+        return format!(
+            "{fn_name}: your account has no trustline for this asset — add a trustline and \
+             fund it with the asset before depositing."
+        );
+    }
+    if err.contains("insufficient") || err.contains("balance is not sufficient") {
+        return format!("{fn_name}: insufficient balance of this asset in your account.");
+    }
+    if err.contains("#13") {
+        return format!(
+            "{fn_name}: the deposit token transfer failed (no trustline or insufficient \
+             balance for this asset)."
+        );
+    }
+    let head: String = err.chars().take(180).collect();
+    format!("{fn_name} simulate failed: {head}")
+}
+
 /// Decode the auth entries simulation says the op needs (empty for our permissionless
 /// transfer/withdraw; source-account credentials — covered by the tx signature — for the
 /// deposit/enroll/disclose flows where the required address IS the source account).
@@ -665,7 +737,7 @@ fn invoke_contract(
     let sim = rpc_call(&cfg.rpc_url, "simulateTransaction", json!({ "transaction": sim_b64 }))
         .map_err(CoreError::Chain)?;
     if let Some(err) = sim.get("error").and_then(|v| v.as_str()) {
-        return Err(CoreError::Chain(format!("{fn_name} simulate failed: {err}")));
+        return Err(CoreError::Chain(friendly_sim_error(fn_name, err)));
     }
     if sim.get("restorePreamble").map(|v| !v.is_null()).unwrap_or(false) {
         return Err(CoreError::Chain(format!(

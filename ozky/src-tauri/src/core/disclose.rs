@@ -21,7 +21,7 @@
 
 use super::config::PoolConfig;
 use super::poseidon::{Fr, Hasher};
-use super::scan::{self, OwnedNote, SCAN_ACCOUNT, SCAN_ASSET_TAG};
+use super::scan::{self, OwnedNote, SCAN_ASSET_TAG};
 use super::{chain, keys, CoreError};
 use serde::Serialize;
 use x25519_dalek::StaticSecret;
@@ -90,12 +90,12 @@ pub fn build_package(
 ) -> Result<DisclosurePackage, CoreError> {
     let id = scan::wallet_identity(wallet)?;
     // The transmission/viewing secret for the scope (same derivation scan uses).
-    let view = wallet.scoped_view_key(SCAN_ACCOUNT, SCAN_ASSET_TAG, 0);
+    let view = wallet.scoped_view_key(wallet.account(), SCAN_ASSET_TAG, 0);
     Ok(DisclosurePackage {
         owner_stellar: wallet.stellar_address().to_string(),
         viewing_secret: format!("0x{}", hex::encode(view.viewing)),
         owner_pk: id.owner_pk.to_hex(),
-        account: SCAN_ACCOUNT,
+        account: wallet.account(),
         asset_tag: cfg.asset_tag.to_decimal(),
         epoch,
         pool_contract: cfg.pool_contract.clone(),
@@ -174,7 +174,7 @@ fn record_grant(
         CoreError::Chain("OZKY_VIEWKEYS_CONTRACT not set (needed to record the disclosure grant)".into())
     })?;
     let id = scan::wallet_identity(wallet)?;
-    let view = wallet.scoped_view_key(SCAN_ACCOUNT, SCAN_ASSET_TAG, 0);
+    let view = wallet.scoped_view_key(wallet.account(), SCAN_ASSET_TAG, 0);
     // The PUBLIC halves go on-chain (secrets stay off-chain): viewing_pub = the
     // transmission pubkey; detection_pub = the detection key (public scanning hint).
     let viewing_pub = hex::encode(id.transmission_pub);
@@ -185,7 +185,7 @@ fn record_grant(
         wallet.stellar_secret(),
         wallet.stellar_address(),
         auditor,
-        SCAN_ACCOUNT,
+        wallet.account(),
         &cfg.asset_tag.to_decimal(),
         epoch,
         &viewing_pub,
@@ -226,7 +226,7 @@ mod tests {
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(!json.contains(sk_hex.trim_start_matches("0x")), "must not leak owner_sk");
         assert_eq!(pkg.epoch, 28);
-        assert_eq!(pkg.account, SCAN_ACCOUNT);
+        assert_eq!(pkg.account, scan::SCAN_ACCOUNT);
     }
 
     #[test]
@@ -236,7 +236,7 @@ mod tests {
         let h = Hasher::new();
         let wallet = keys::derive_from_mnemonic(MNEMONIC).unwrap();
         let id = scan::wallet_identity(&wallet).unwrap();
-        let view = wallet.scoped_view_key(SCAN_ACCOUNT, SCAN_ASSET_TAG, 0);
+        let view = wallet.scoped_view_key(scan::SCAN_ACCOUNT, SCAN_ASSET_TAG, 0);
         let transmission_sk = encrypt::transmission_secret(&view.viewing);
 
         let mk_entry = |owner_pk: &Fr, tpub: &[u8; 32], leaf: u32, value: u64| {

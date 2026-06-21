@@ -1,108 +1,130 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { Button } from "$lib/components/ui/button";
-  import { Textarea } from "$lib/components/ui/textarea";
-  import * as Card from "$lib/components/ui/card";
+	import Workspace from '$lib/components/layout/Workspace.svelte';
+	import BalanceStat from '$lib/components/shared/BalanceStat.svelte';
+	import { Button } from '$lib/components/ui/button';
+	import { Skeleton } from '$lib/components/ui/skeleton';
+	import * as Empty from '$lib/components/ui/empty';
+	import * as Alert from '$lib/components/ui/alert';
+	import PlugZapIcon from '@lucide/svelte/icons/plug-zap';
+	import { wallet } from '$lib/wallet.svelte';
+	import { truncate, prettyAmount } from '$lib/format';
+	import { assetByCode } from '$lib/assets';
+	import ArrowUpRightIcon from '@lucide/svelte/icons/arrow-up-right';
+	import ArrowDownLeftIcon from '@lucide/svelte/icons/arrow-down-left';
+	import DownloadIcon from '@lucide/svelte/icons/download';
+	import UploadIcon from '@lucide/svelte/icons/upload';
+	import ActivityIcon from '@lucide/svelte/icons/activity';
 
-  type WalletStatus = { initialized: boolean; network: string };
+	const actions = [
+		{ href: '/send', label: 'Send', icon: ArrowUpRightIcon },
+		{ href: '/receive', label: 'Receive', icon: ArrowDownLeftIcon },
+		{ href: '/deposit', label: 'Deposit', icon: DownloadIcon },
+		{ href: '/withdraw', label: 'Withdraw', icon: UploadIcon }
+	];
 
-  let status = $state<WalletStatus | null>(null);
-  let address = $state<string | null>(null);
-  let newMnemonic = $state<string | null>(null);
-  let restorePhrase = $state("");
-  let error = $state<string | null>(null);
-  let busy = $state(false);
-
-  async function run<T>(fn: () => Promise<T>): Promise<T | undefined> {
-    busy = true;
-    error = null;
-    try {
-      return await fn();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function refresh() {
-    status = (await run(() => invoke<WalletStatus>("wallet_status"))) ?? status;
-    if (status?.initialized) {
-      address = (await run(() => invoke<string>("receive_address"))) ?? null;
-    }
-  }
-
-  async function createWallet() {
-    const phrase = await run(() => invoke<string>("create_wallet"));
-    if (phrase) {
-      newMnemonic = phrase;
-      await refresh();
-    }
-  }
-
-  async function restoreWallet() {
-    const ok = await run(() => invoke("restore_wallet", { phrase: restorePhrase }));
-    if (ok !== undefined) {
-      restorePhrase = "";
-      newMnemonic = null;
-      await refresh();
-    }
-  }
-
-  $effect(() => {
-    refresh();
-  });
+	const rel = (ts: number) => {
+		const s = Math.round((Date.now() - ts) / 1000);
+		if (s < 60) return `${s}s ago`;
+		if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+		return `${Math.floor(s / 3600)}h ago`;
+	};
 </script>
 
-<main class="flex min-h-screen items-center justify-center p-6">
-  <Card.Root class="w-full max-w-md">
-    <Card.Header>
-      <Card.Title class="font-heading text-2xl">ozky</Card.Title>
-      <Card.Description>
-        Shielded stablecoin wallet
-        {#if status}· {status.network}{/if}
-      </Card.Description>
-    </Card.Header>
+<Workspace title="Dashboard" subtitle="Your shielded balances on {wallet.network}">
+	{#snippet main()}
+		<div class="flex flex-col gap-7">
+			<section>
+				<h2 class="mb-3 text-sm font-medium text-muted-foreground">Shielded balances</h2>
+				{#if wallet.loading && wallet.balances.length === 0}
+					<div class="grid grid-cols-2 gap-4">
+						{#each Array(4) as _}
+							<Skeleton class="h-[92px] rounded-lg" />
+						{/each}
+					</div>
+				{:else if wallet.notConfigured}
+					<Alert.Root>
+						<PlugZapIcon />
+						<Alert.Title>Not connected to a pool</Alert.Title>
+						<Alert.Description>
+							Balances are unavailable until the shielded pool is configured (testnet contract
+							IDs). Set <code class="font-mono text-xs">OZKY_POOL_CONTRACT</code> /
+							<code class="font-mono text-xs">OZKY_POLICY_CONTRACT</code> for this build.
+						</Alert.Description>
+					</Alert.Root>
+				{:else}
+					<div class="grid grid-cols-2 gap-4">
+						{#each wallet.balances as b (b.code)}
+							<BalanceStat code={b.code} display={b.display} />
+						{/each}
+					</div>
+				{/if}
+			</section>
 
-    <Card.Content class="flex flex-col gap-4">
-      {#if newMnemonic}
-        <div class="flex flex-col gap-2 rounded-md border border-border bg-muted p-3">
-          <p class="text-sm font-medium">Recovery phrase — write this down</p>
-          <p class="font-mono text-sm">{newMnemonic}</p>
-          <p class="text-xs text-muted-foreground">
-            This is shown once. Anyone with it controls the wallet.
-          </p>
-        </div>
-      {/if}
+			<section>
+				<div class="mb-3 flex items-center justify-between">
+					<h2 class="text-sm font-medium text-muted-foreground">Public balance (unshielded)</h2>
+					<span class="text-xs text-muted-foreground">on {wallet.activeAccount?.address ? truncate(wallet.activeAccount.address, 5, 5) : '…'}</span>
+				</div>
+				{#if wallet.publicBalances.length === 0}
+					<div class="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+						No public funds yet. Fund this account from a faucet or exchange, then Deposit to shield.
+					</div>
+				{:else}
+					<div class="flex flex-col divide-y divide-border overflow-hidden rounded-lg border border-border bg-card/40">
+						{#each wallet.publicBalances as p (p.code + (p.issuer ?? ''))}
+							<div class="flex items-center justify-between px-4 py-3">
+								<span class="flex items-center gap-2 text-sm font-medium">
+									<span class="size-2 rounded-full" style="background:{assetByCode(p.code)?.accent ?? 'var(--muted-foreground)'}"></span>
+									{p.code}
+								</span>
+								<span class="font-mono text-sm tabular-nums">{prettyAmount(p.balance)}</span>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</section>
 
-      {#if status?.initialized}
-        <div class="flex flex-col gap-1 text-sm">
-          <span class="text-muted-foreground">Receive address</span>
-          <span class="font-mono break-all">{address ?? "…"}</span>
-        </div>
-      {:else}
-        <p class="text-sm text-muted-foreground">No wallet yet. Create one, or restore from a phrase.</p>
-        <Textarea
-          bind:value={restorePhrase}
-          placeholder="Enter your 12-word recovery phrase to restore…"
-          rows={2}
-        />
-      {/if}
+			<section>
+				<h2 class="mb-3 text-sm font-medium text-muted-foreground">Quick actions</h2>
+				<div class="grid grid-cols-4 gap-3">
+					{#each actions as a (a.href)}
+						<Button href={a.href} variant="outline" class="h-auto flex-col gap-2 py-5">
+							<a.icon class="size-5 text-primary" />
+							{a.label}
+						</Button>
+					{/each}
+				</div>
+			</section>
+		</div>
+	{/snippet}
 
-      {#if error}
-        <p class="text-sm text-destructive">{error}</p>
-      {/if}
-    </Card.Content>
-
-    <Card.Footer class="flex gap-2">
-      {#if status?.initialized}
-        <Button variant="outline" onclick={refresh} disabled={busy}>Refresh</Button>
-      {:else}
-        <Button onclick={createWallet} disabled={busy}>Create wallet</Button>
-        <Button variant="outline" onclick={restoreWallet} disabled={busy || !restorePhrase.trim()}>
-          Restore
-        </Button>
-      {/if}
-    </Card.Footer>
-  </Card.Root>
-</main>
+	{#snippet aside()}
+		<div class="flex h-full flex-col">
+			<h2 class="mb-3 flex items-center gap-2 text-sm font-medium text-muted-foreground">
+				<ActivityIcon class="size-4" /> Activity
+			</h2>
+			{#if wallet.activity.length === 0}
+				<Empty.Root class="rounded-lg border border-dashed py-10">
+					<Empty.Content>
+						<Empty.Description>No activity yet this session.</Empty.Description>
+					</Empty.Content>
+				</Empty.Root>
+			{:else}
+				<ul class="flex flex-col gap-2">
+					{#each wallet.activity as a (a.id)}
+						<li class="rounded-lg border border-border bg-card/50 p-3">
+							<div class="flex items-center justify-between">
+								<span class="text-sm font-medium capitalize">{a.label}</span>
+								<span class="text-xs text-muted-foreground">{rel(a.ts)}</span>
+							</div>
+							{#if a.detail}<p class="mt-0.5 text-xs text-muted-foreground">{a.detail}</p>{/if}
+							{#if a.hash}
+								<p class="mt-1 font-mono text-xs text-primary">{truncate(a.hash, 10, 8)}</p>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</div>
+	{/snippet}
+</Workspace>

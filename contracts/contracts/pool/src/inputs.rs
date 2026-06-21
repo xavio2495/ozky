@@ -11,6 +11,8 @@ use soroban_sdk::{Bytes, Env, Vec, U256};
 pub const DEPOSIT_N: u32 = 5;
 pub const TRANSFER_N: u32 = 11;
 pub const WITHDRAW_N: u32 = 12;
+/// split = transfer with 6 outputs: 6 base + 2 nullifiers + 6 out_cm + asp_root.
+pub const SPLIT_N: u32 = 15;
 
 /// Parse exactly `n` field elements (n*32 bytes, big-endian) from `pi`.
 pub fn read_fields(env: &Env, pi: &Bytes, n: u32) -> Result<Vec<U256>, Error> {

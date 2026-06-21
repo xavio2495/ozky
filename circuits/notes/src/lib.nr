@@ -9,6 +9,7 @@ use poseidon::poseidon2::Poseidon2;
 pub mod merkle;
 pub mod accumulator;
 pub mod transfer;
+pub mod split;
 pub mod deposit;
 pub mod withdraw;
 

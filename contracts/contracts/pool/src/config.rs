@@ -19,6 +19,7 @@ pub struct Config {
     pub deposit_verifier: Address,
     pub transfer_verifier: Address,
     pub withdraw_verifier: Address,
+    pub split_verifier: Address,
     pub policy: Address,
     pub asp_root: U256,
     pub admin: Address,

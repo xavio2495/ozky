@@ -78,6 +78,7 @@ impl Pool {
         deposit_verifier: Address,
         transfer_verifier: Address,
         withdraw_verifier: Address,
+        split_verifier: Address,
         policy: Address,
         asp_root: U256,
         admin: Address,
@@ -93,6 +94,7 @@ impl Pool {
                 deposit_verifier,
                 transfer_verifier,
                 withdraw_verifier,
+                split_verifier,
                 policy,
                 asp_root,
                 admin,
@@ -210,6 +212,62 @@ impl Pool {
         append_and_emit(&env, &f.get(9).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 1)?;
         emit_roots(&env);
         Ok(())
+    }
+
+    /// Private interior split: 2-in / 6-out (up to 5 recipients + change), no token
+    /// movement. Same shape as `transfer` with its own selector + verifier; unused
+    /// outputs are dummy (value 0) so the recipient count is hidden.
+    /// Public inputs: [domain_sep, asset_tag, epoch, commitment_root, nullifier_old_root,
+    /// nullifier_new_root, nf0, nf1, out_cm0..out_cm5, asp_root] (15 fields).
+    pub fn split(
+        env: Env,
+        asset_tag: U256,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_notes: Vec<Bytes>,
+        ephemeral_pubs: Vec<BytesN<32>>,
+        view_tags: Vec<u32>,
+    ) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        let f = inputs::read_fields(&env, &public_inputs, inputs::SPLIT_N)?;
+
+        check_common(&env, &cfg, &f, domain::SELECTOR_SPLIT, &asset_tag)?;
+        require_recent_root(&env, &f.get(3).unwrap())?;
+        require_asp_root(&cfg, &f.get(14).unwrap())?;
+        require_nullifier_base(&env, &f.get(4).unwrap())?;
+
+        verifier::verify(&env, &cfg.split_verifier, public_inputs, proof)?;
+
+        nullifier::set_root(&env, &f.get(5).unwrap());
+        emit_nullifiers(&env, &f.get(6).unwrap(), &f.get(7).unwrap());
+        // Batch-append all 6 output commitments (root window + index written once, to
+        // stay within the per-tx CPU budget), then emit each leaf's note event.
+        let mut commits = Vec::new(&env);
+        for k in 0..6u32 {
+            commits.push_back(f.get(8 + k).unwrap());
+        }
+        let leaves = tree::append_many(&env, &commits)?;
+        for k in 0..6u32 {
+            let leaf = leaves.get(k).unwrap();
+            env.events().publish(
+                (symbol_short!("commit"), leaf),
+                (
+                    commits.get(k).unwrap(),
+                    enc_notes.get(k),
+                    ephemeral_pubs.get(k),
+                    view_tags.get(k),
+                ),
+            );
+        }
+        emit_roots(&env);
+        Ok(())
+    }
+
+    /// Admin: upgrade the contract wasm in place (future features without redeploy).
+    /// Testnet: dev-controlled; -> governance/multisig before mainnet (handoff §8).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        config::get(&env).admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     /// Public withdraw: spend shielded note(s), release `amount` of `asset_tag` to
@@ -487,6 +545,7 @@ mod entrypoint_tests {
             (
                 pool_id.clone(),
                 network_id.clone(),
+                verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),

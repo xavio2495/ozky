@@ -121,6 +121,59 @@ pub fn append(env: &Env, commitment: &U256) -> Result<u32, Error> {
     Ok(next)
 }
 
+/// Append several commitments at once, returning each one's leaf index (in order).
+/// Equivalent to calling [`append`] per leaf, but writes the rolling-root window and
+/// `NextIndex` only ONCE (intermediate roots within a single transaction are never
+/// referenced by a spend — only the final root must be recent). This keeps a
+/// multi-output op (e.g. the 8-output split) within the per-transaction CPU budget.
+pub fn append_many(env: &Env, commitments: &Vec<U256>) -> Result<Vec<u32>, Error> {
+    let mut next: u32 = env
+        .storage()
+        .instance()
+        .get(&TreeKey::NextIndex)
+        .unwrap_or(0);
+    let z = zeroes(env);
+    let mut indices = Vec::new(env);
+    let mut last_root = current_root(env);
+
+    for commitment in commitments.iter() {
+        if (next as u64) >= MAX_LEAVES {
+            return Err(Error::TreeFull);
+        }
+        let mut cur = commitment.clone();
+        let mut level = 0u32;
+        while level < TREE_DEPTH {
+            let is_right = (next >> level) & 1 == 1;
+            if is_right {
+                let left: U256 = env
+                    .storage()
+                    .instance()
+                    .get(&TreeKey::Frontier(level))
+                    .unwrap_or_else(|| z.get(level).unwrap());
+                cur = hash_node(env, &left, &cur);
+            } else {
+                env.storage().instance().set(&TreeKey::Frontier(level), &cur);
+                cur = hash_node(env, &cur, &z.get(level).unwrap());
+            }
+            level += 1;
+        }
+        last_root = cur;
+        indices.push_back(next);
+        next += 1;
+    }
+
+    // Publish only the final root + the advanced index (one write each).
+    let mut rs = roots(env);
+    rs.push_back(last_root);
+    while rs.len() > ROOT_WINDOW {
+        rs.pop_front();
+    }
+    env.storage().instance().set(&TreeKey::Roots, &rs);
+    env.storage().instance().set(&TreeKey::NextIndex, &next);
+
+    Ok(indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

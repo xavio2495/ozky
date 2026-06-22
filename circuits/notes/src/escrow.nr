@@ -395,6 +395,40 @@ fn payout_rejects_wrong_recipient_bind() {
     w.run();
 }
 
+/// Pedersen parity reference vectors for the Rust client (E4). Grumpkin's base field IS the
+/// BN254 scalar field the core already uses, so the client reproduces `commit(v,r) = v*G0 + r*G1`
+/// with these exact generators. Printed via `nargo test --show-output`; the client's
+/// `pedersen` module is pinned against them.
+#[test]
+fn print_pedersen_parity_vectors() {
+    // Generators: G0 = commit(1, 0), G1 = commit(0, 1). (Noir format strings take only bare
+    // identifiers, so each field is bound to a local first.)
+    let g0 = commit(1, 0);
+    let g1 = commit(0, 1);
+    let g0x = g0.x;
+    let g0y = g0.y;
+    let g1x = g1.x;
+    let g1y = g1.y;
+    println(f"G0.x = {g0x}");
+    println(f"G0.y = {g0y}");
+    println(f"G1.x = {g1x}");
+    println(f"G1.y = {g1y}");
+    // Seed for an empty escrow (identity point hash) -> contract init_c_raised.
+    let empty = empty_raised_hash();
+    println(f"empty_raised_hash = {empty}");
+    // A sample commitment + its on-chain handle (the client must reproduce exactly).
+    let c = commit(700, 0xb11d);
+    let cx = c.x;
+    let cy = c.y;
+    let ch = point_hash(c);
+    println(f"commit_700_b11d.x = {cx}");
+    println(f"commit_700_b11d.y = {cy}");
+    println(f"point_hash_700_b11d = {ch}");
+    // A bind sample: bind(DOMAIN_ESCROW_REFUND, derive_owner_pk(12345), 0x5a17).
+    let rb = bind(DOMAIN_ESCROW_REFUND, derive_owner_pk(12345), 0x5a17);
+    println(f"refund_bind_sample = {rb}");
+}
+
 /// The two homomorphic folds compose: contributing v0 then v1 yields a running commitment whose
 /// hash equals Commit(v0+v1, r0+r1)'s hash (the payee can open the total).
 #[test]

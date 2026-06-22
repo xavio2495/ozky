@@ -5,7 +5,7 @@
 //! contract does NO elliptic-curve math — all value/threshold logic is in-circuit. State machine
 //! and public-input layouts: `claude-docs/escrow_interface.md`.
 
-use soroban_sdk::{contracttype, Env, U256};
+use soroban_sdk::{contracttype, Bytes, Env, U256};
 
 /// Release requires `raised >= target`; under target at the deadline, contributors refund.
 /// (`u32` not `u8` — Soroban contract types/params don't support `u8`.)
@@ -16,12 +16,17 @@ pub const MODE_KEEP_WHAT_YOU_RAISE: u32 = 1;
 pub const STATUS_OPEN: u32 = 0;
 pub const STATUS_RELEASED: u32 = 1;
 
-/// Seed for a fresh escrow's running commitment: the hash of the Pedersen identity point
-/// `Commit(0, 0)`. The circuit folds the first contribution onto this exact value, so its
-/// `c_raised_old` for the first contribute must equal this. PLACEHOLDER (0) until the circuit
-/// fixes the identity-point hash — finalized at E3 (VK freeze), like the Poseidon parity constants.
+/// Seed for a fresh escrow's running commitment: the hash of the Pedersen identity point.
+/// = `point_hash(EmbeddedCurvePoint::point_at_infinity())` from the Noir circuit's
+/// `escrow::empty_raised_hash` (E3 parity-pinned). The contribute circuit folds the first
+/// contribution onto this exact value, so its `c_raised_old` for the first contribute equals it.
 pub fn init_c_raised(env: &Env) -> U256 {
-    U256::from_u32(env, 0)
+    const EMPTY_RAISED_HASH: [u8; 32] = [
+        0x0b, 0x63, 0xa5, 0x37, 0x87, 0x02, 0x1a, 0x4a, 0x96, 0x2a, 0x45, 0x2c, 0x29, 0x21, 0xb3,
+        0x66, 0x3a, 0xff, 0x1f, 0xfd, 0x8d, 0x55, 0x10, 0x54, 0x0f, 0x8e, 0x65, 0x9e, 0x78, 0x29,
+        0x56, 0xf1,
+    ];
+    U256::from_be_bytes(env, &Bytes::from_array(env, &EMPTY_RAISED_HASH))
 }
 
 #[contracttype]

@@ -15,6 +15,10 @@ pub const SELECTOR_DEPOSIT: u32 = 1;
 pub const SELECTOR_TRANSFER: u32 = 2;
 pub const SELECTOR_WITHDRAW: u32 = 3;
 pub const SELECTOR_SPLIT: u32 = 4;
+pub const SELECTOR_ESCROW_CONTRIBUTE: u32 = 5;
+/// Shared by escrow release AND refund — the contract distinguishes them by the expected
+/// commitment_hash / floor / recipient_bind, so neither proof can replay as the other.
+pub const SELECTOR_ESCROW_PAYOUT: u32 = 6;
 
 /// `domain_sep = Poseidon(pool_id, network_id, selector)` — same construction the
 /// prover uses (Poseidon2 parity with the circuit's hash is already established).

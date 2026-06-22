@@ -20,6 +20,8 @@ pub struct Config {
     pub transfer_verifier: Address,
     pub withdraw_verifier: Address,
     pub split_verifier: Address,
+    pub escrow_contribute_verifier: Address,
+    pub escrow_payout_verifier: Address,
     pub policy: Address,
     pub asp_root: U256,
     pub admin: Address,

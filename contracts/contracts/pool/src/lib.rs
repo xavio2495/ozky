@@ -12,6 +12,7 @@
 mod assets;
 mod config;
 mod domain;
+mod escrow;
 mod inputs;
 mod nullifier;
 mod poseidon;
@@ -62,6 +63,28 @@ pub enum Error {
     BadDestBind = 12,
     /// `from` is not on the policy contract's deposit allow-list.
     DepositNotAllowed = 13,
+    /// No escrow exists for the given id.
+    NoSuchEscrow = 14,
+    /// Escrow is not Open (already released, or otherwise closed to this operation).
+    EscrowClosed = 15,
+    /// `c_raised_old` public input does not equal the escrow's stored running commitment.
+    BadRaisedRoot = 16,
+    /// `commitment_hash` public input does not equal the expected escrow/contribution commitment.
+    BadCommitmentHash = 17,
+    /// `floor` public input does not equal the expected threshold (target, or 0).
+    BadFloor = 18,
+    /// `recipient_bind` public input does not equal the escrow's payee/refund binding.
+    BadRecipientBind = 19,
+    /// The escrow deadline has not yet passed (required for this operation).
+    DeadlineNotPassed = 20,
+    /// No contribution exists at the given (escrow id, index).
+    NoSuchContribution = 21,
+    /// This contribution was already refunded.
+    AlreadyRefunded = 22,
+    /// Refund is not allowed for this escrow's mode (only AllOrNothing refunds).
+    RefundNotAllowed = 23,
+    /// `mode` passed to `open_escrow` is not a valid escrow mode.
+    BadMode = 24,
 }
 
 #[contract]
@@ -79,6 +102,8 @@ impl Pool {
         transfer_verifier: Address,
         withdraw_verifier: Address,
         split_verifier: Address,
+        escrow_contribute_verifier: Address,
+        escrow_payout_verifier: Address,
         policy: Address,
         asp_root: U256,
         admin: Address,
@@ -95,6 +120,8 @@ impl Pool {
                 transfer_verifier,
                 withdraw_verifier,
                 split_verifier,
+                escrow_contribute_verifier,
+                escrow_payout_verifier,
                 policy,
                 asp_root,
                 admin,
@@ -263,6 +290,198 @@ impl Pool {
         Ok(())
     }
 
+    /// Open a hidden-sum escrow (permissionless). Returns the new escrow id. `payee_bind` hides
+    /// the payee; the running commitment is seeded to the identity. (building block B)
+    pub fn open_escrow(
+        env: Env,
+        asset_tag: U256,
+        target: u64,
+        deadline: u64,
+        mode: u32,
+        payee_bind: U256,
+    ) -> Result<u64, Error> {
+        if mode != escrow::MODE_ALL_OR_NOTHING && mode != escrow::MODE_KEEP_WHAT_YOU_RAISE {
+            return Err(Error::BadMode);
+        }
+        // Asset must be registered (a payout can only land in a real vault asset).
+        assets::get(&env, &asset_tag).ok_or(Error::AssetMismatch)?;
+        let id = escrow::open(&env, asset_tag.clone(), target, deadline, mode, payee_bind.clone());
+        env.events().publish(
+            (symbol_short!("escopen"), id),
+            (asset_tag, target, deadline, mode, payee_bind),
+        );
+        Ok(id)
+    }
+
+    /// Contribute to an escrow: spend one owned pool note (HIDDEN amount), fold it into the
+    /// running commitment, record the refund claim. `payee_enc` carries (amount, r) encrypted to
+    /// the payee so only they can open the total. Returns the contribution index. (building block B)
+    /// Public inputs: [domain_sep, asset_tag, epoch, commitment_root, nullifier_old_root,
+    /// nullifier_new_root, nf0, nf1, change_commitment, asp_root, c_raised_old, c_raised_new,
+    /// c_contrib, refund_bind].
+    #[allow(clippy::too_many_arguments)]
+    pub fn escrow_contribute(
+        env: Env,
+        escrow_id: u64,
+        asset_tag: U256,
+        public_inputs: Bytes,
+        proof: Bytes,
+        change_enc: Bytes,
+        change_eph: BytesN<32>,
+        change_tag: u32,
+        payee_enc: Bytes,
+    ) -> Result<u32, Error> {
+        let cfg = config::get(&env);
+        let mut e = escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)?;
+        if e.status != escrow::STATUS_OPEN {
+            return Err(Error::EscrowClosed);
+        }
+        let f = inputs::read_fields(&env, &public_inputs, inputs::ESCROW_CONTRIBUTE_N)?;
+        check_common(&env, &cfg, &f, domain::SELECTOR_ESCROW_CONTRIBUTE, &asset_tag)?;
+        if asset_tag != e.asset_tag {
+            return Err(Error::AssetMismatch);
+        }
+        require_recent_root(&env, &f.get(3).unwrap())?;
+        require_asp_root(&cfg, &f.get(9).unwrap())?;
+        require_nullifier_base(&env, &f.get(4).unwrap())?;
+        // Running-commitment chaining (same old/new pattern as the nullifier accumulator).
+        if f.get(10).unwrap() != e.c_raised {
+            return Err(Error::BadRaisedRoot);
+        }
+
+        verifier::verify(&env, &cfg.escrow_contribute_verifier, public_inputs, proof)?;
+
+        nullifier::set_root(&env, &f.get(5).unwrap());
+        emit_nullifiers(&env, &f.get(6).unwrap(), &f.get(7).unwrap());
+        let leaf = tree::append(&env, &f.get(8).unwrap())?;
+        env.events().publish(
+            (symbol_short!("commit"), leaf),
+            (f.get(8).unwrap(), change_enc, change_eph, change_tag),
+        );
+
+        let idx = e.n_contrib;
+        e.c_raised = f.get(11).unwrap();
+        e.n_contrib += 1;
+        escrow::set(&env, escrow_id, &e);
+        escrow::set_contrib(
+            &env,
+            escrow_id,
+            idx,
+            &escrow::Contribution {
+                c_contrib: f.get(12).unwrap(),
+                refund_bind: f.get(13).unwrap(),
+                refunded: false,
+            },
+        );
+        // Emit the (amount,r)-to-payee blob so the payee can accumulate the true total.
+        env.events()
+            .publish((symbol_short!("escrcon"), escrow_id, idx), payee_enc);
+        emit_roots(&env);
+        Ok(idx)
+    }
+
+    /// Release the escrow to the payee. AllOrNothing: the proof must show raised >= target
+    /// (floor=target), allowed any time. KeepWhatYouRaise: requires the deadline passed (floor=0).
+    /// Mints one shielded payout note; marks the escrow Released. (building block B)
+    /// Public inputs: [domain_sep, asset_tag, epoch, commitment_hash, floor, out_commitment,
+    /// recipient_bind].
+    #[allow(clippy::too_many_arguments)]
+    pub fn escrow_release(
+        env: Env,
+        escrow_id: u64,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_note: Bytes,
+        ephemeral_pub: BytesN<32>,
+        view_tag: u32,
+    ) -> Result<u32, Error> {
+        let cfg = config::get(&env);
+        let mut e = escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)?;
+        if e.status != escrow::STATUS_OPEN {
+            return Err(Error::EscrowClosed);
+        }
+        let floor = if e.mode == escrow::MODE_KEEP_WHAT_YOU_RAISE {
+            if (env.ledger().sequence() as u64) <= e.deadline {
+                return Err(Error::DeadlineNotPassed);
+            }
+            U256::from_u32(&env, 0)
+        } else {
+            U256::from_u128(&env, e.target as u128)
+        };
+        let leaf = escrow_payout(
+            &env,
+            &cfg,
+            &e.asset_tag,
+            &public_inputs,
+            proof,
+            &e.c_raised,
+            &floor,
+            &e.payee_bind,
+            enc_note,
+            ephemeral_pub,
+            view_tag,
+        )?;
+        e.status = escrow::STATUS_RELEASED;
+        escrow::set(&env, escrow_id, &e);
+        emit_roots(&env);
+        Ok(leaf)
+    }
+
+    /// Refund one contribution (AllOrNothing fail path only): requires the deadline passed, the
+    /// escrow not released, and this contribution not already refunded. Mints the contribution's
+    /// amount back to the bound contributor. (building block B)
+    /// Public inputs: same payout layout as `escrow_release` (floor must be 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn escrow_refund(
+        env: Env,
+        escrow_id: u64,
+        contrib_index: u32,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_note: Bytes,
+        ephemeral_pub: BytesN<32>,
+        view_tag: u32,
+    ) -> Result<u32, Error> {
+        let cfg = config::get(&env);
+        let e = escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)?;
+        if e.mode != escrow::MODE_ALL_OR_NOTHING {
+            return Err(Error::RefundNotAllowed);
+        }
+        if e.status == escrow::STATUS_RELEASED {
+            return Err(Error::EscrowClosed);
+        }
+        if (env.ledger().sequence() as u64) <= e.deadline {
+            return Err(Error::DeadlineNotPassed);
+        }
+        let mut c =
+            escrow::get_contrib(&env, escrow_id, contrib_index).ok_or(Error::NoSuchContribution)?;
+        if c.refunded {
+            return Err(Error::AlreadyRefunded);
+        }
+        let leaf = escrow_payout(
+            &env,
+            &cfg,
+            &e.asset_tag,
+            &public_inputs,
+            proof,
+            &c.c_contrib,
+            &U256::from_u32(&env, 0),
+            &c.refund_bind,
+            enc_note,
+            ephemeral_pub,
+            view_tag,
+        )?;
+        c.refunded = true;
+        escrow::set_contrib(&env, escrow_id, contrib_index, &c);
+        emit_roots(&env);
+        Ok(leaf)
+    }
+
+    /// Public escrow state for the UI.
+    pub fn escrow(env: Env, escrow_id: u64) -> Result<escrow::Escrow, Error> {
+        escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)
+    }
+
     /// Admin: upgrade the contract wasm in place (future features without redeploy).
     /// Testnet: dev-controlled; -> governance/multisig before mainnet (handoff §8).
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
@@ -415,6 +634,44 @@ fn require_amount(env: &Env, amount_field: &U256, amount: i128) -> Result<(), Er
     }
 }
 
+/// Shared escrow payout (release & refund): validate the payout proof against the expected
+/// commitment_hash / floor / recipient_bind (so a refund proof can't pass as a release, and only
+/// the bound key-holder can mint), verify, then mint the payout note (value already vaulted — no
+/// token move). Returns the new leaf index. Callers enforce the per-mode/per-state guard first.
+#[allow(clippy::too_many_arguments)]
+fn escrow_payout(
+    env: &Env,
+    cfg: &Config,
+    asset_tag: &U256,
+    public_inputs: &Bytes,
+    proof: Bytes,
+    commitment_hash: &U256,
+    floor: &U256,
+    recipient_bind: &U256,
+    enc_note: Bytes,
+    ephemeral_pub: BytesN<32>,
+    view_tag: u32,
+) -> Result<u32, Error> {
+    let f = inputs::read_fields(env, public_inputs, inputs::ESCROW_PAYOUT_N)?;
+    check_common(env, cfg, &f, domain::SELECTOR_ESCROW_PAYOUT, asset_tag)?;
+    if &f.get(3).unwrap() != commitment_hash {
+        return Err(Error::BadCommitmentHash);
+    }
+    if &f.get(4).unwrap() != floor {
+        return Err(Error::BadFloor);
+    }
+    if &f.get(6).unwrap() != recipient_bind {
+        return Err(Error::BadRecipientBind);
+    }
+    verifier::verify(env, &cfg.escrow_payout_verifier, public_inputs.clone(), proof)?;
+    let leaf = tree::append(env, &f.get(5).unwrap())?;
+    env.events().publish(
+        (symbol_short!("commit"), leaf),
+        (f.get(5).unwrap(), enc_note, ephemeral_pub, view_tag),
+    );
+    Ok(leaf)
+}
+
 // ----------------------------- events (for the indexer) -----------------------------
 
 fn append_and_emit(
@@ -545,6 +802,8 @@ mod entrypoint_tests {
             (
                 pool_id.clone(),
                 network_id.clone(),
+                verifier.clone(),
+                verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
@@ -795,5 +1054,333 @@ mod entrypoint_tests {
             .pool()
             .try_withdraw(&dest, &f.asset_tag, &400, &pi, &Bytes::new(env));
         assert_eq!(res, Err(Ok(Error::BadDestBind)));
+    }
+
+    // ----------------------------- escrow (building block B) -----------------------------
+
+    fn open_basic(f: &Fixture, mode: u32, target: u64, deadline: u64, payee_bind: u32) -> u64 {
+        f.pool()
+            .open_escrow(&f.asset_tag, &target, &deadline, &mode, &U256::from_u32(&f.env, payee_bind))
+    }
+
+    /// 14-field escrow_contribute public inputs (recent commitment root + stored nullifier base).
+    fn contribute_inputs(
+        f: &Fixture,
+        c_raised_old: U256,
+        c_raised_new: U256,
+        c_contrib: U256,
+        refund_bind: U256,
+        change_commitment: u32,
+    ) -> Bytes {
+        let env = &f.env;
+        let domain_sep = domain::compute_domain_sep(
+            env,
+            &f.pool_id,
+            &f.network_id,
+            domain::SELECTOR_ESCROW_CONTRIBUTE,
+        );
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0),     // epoch 0
+                f.pool().commitment_root(), // recent
+                f.pool().nullifier_root(),  // == stored base
+                U256::from_u32(env, 0xbeef), // new nullifier root
+                U256::from_u32(env, 0xa),   // nf0
+                U256::from_u32(env, 0xb),   // nf1
+                U256::from_u32(env, change_commitment),
+                U256::from_u32(env, 0),     // asp_root matches cfg
+                c_raised_old,
+                c_raised_new,
+                c_contrib,
+                refund_bind,
+            ],
+        )
+    }
+
+    /// 7-field escrow_payout public inputs (release/refund).
+    fn payout_inputs(
+        f: &Fixture,
+        commitment_hash: U256,
+        floor: U256,
+        out_commitment: u32,
+        recipient_bind: U256,
+    ) -> Bytes {
+        let env = &f.env;
+        let domain_sep = domain::compute_domain_sep(
+            env,
+            &f.pool_id,
+            &f.network_id,
+            domain::SELECTOR_ESCROW_PAYOUT,
+        );
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0),
+                commitment_hash,
+                floor,
+                U256::from_u32(env, out_commitment),
+                recipient_bind,
+            ],
+        )
+    }
+
+    fn do_contribute(f: &Fixture, id: u64, pi: &Bytes) -> u32 {
+        let env = &f.env;
+        f.pool().escrow_contribute(
+            &id,
+            &f.asset_tag,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &Bytes::new(env),
+        )
+    }
+
+    fn release(f: &Fixture, id: u64, pi: &Bytes) -> u32 {
+        let env = &f.env;
+        f.pool().escrow_release(
+            &id,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        )
+    }
+
+    /// Flatten the `try_` result to `Result<u32, Error>` (Ok value / contract error), panicking
+    /// on the unexpected conversion/host-error arms — keeps the assertions readable.
+    fn try_release(f: &Fixture, id: u64, pi: &Bytes) -> Result<u32, Error> {
+        let env = &f.env;
+        match f.pool().try_escrow_release(
+            &id,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        ) {
+            Ok(Ok(v)) => Ok(v),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected try_escrow_release result: {other:?}"),
+        }
+    }
+
+    fn try_refund(f: &Fixture, id: u64, idx: u32, pi: &Bytes) -> Result<u32, Error> {
+        let env = &f.env;
+        match f.pool().try_escrow_refund(
+            &id,
+            &idx,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        ) {
+            Ok(Ok(v)) => Ok(v),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected try_escrow_refund result: {other:?}"),
+        }
+    }
+
+    fn refund(f: &Fixture, id: u64, idx: u32, pi: &Bytes) -> u32 {
+        let env = &f.env;
+        f.pool().escrow_refund(
+            &id,
+            &idx,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        )
+    }
+
+    #[test]
+    fn open_escrow_assigns_ids_and_seeds() {
+        let f = setup();
+        let id0 = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
+        let id1 = open_basic(&f, escrow::MODE_KEEP_WHAT_YOU_RAISE, 500, 100, 0x9002);
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        let e = f.pool().escrow(&id0);
+        assert_eq!(e.status, escrow::STATUS_OPEN);
+        assert_eq!(e.n_contrib, 0);
+        assert_eq!(e.target, 1000);
+        assert_eq!(e.c_raised, escrow::init_c_raised(&f.env));
+    }
+
+    #[test]
+    fn open_escrow_rejects_bad_mode() {
+        let f = setup();
+        let res = f
+            .pool()
+            .try_open_escrow(&f.asset_tag, &1000u64, &100u64, &7u32, &U256::from_u32(&f.env, 1));
+        assert_eq!(res, Err(Ok(Error::BadMode)));
+    }
+
+    #[test]
+    fn escrow_contribute_chains_and_records() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
+
+        let seed = escrow::init_c_raised(env);
+        let c1 = U256::from_u32(env, 0x1111);
+        let idx = do_contribute(
+            &f,
+            id,
+            &contribute_inputs(&f, seed.clone(), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0xbb01), 0xaa),
+        );
+        assert_eq!(idx, 0);
+        let e = f.pool().escrow(&id);
+        assert_eq!(e.c_raised, c1);
+        assert_eq!(e.n_contrib, 1);
+
+        // second contribution chains from c1 -> c2
+        let c2 = U256::from_u32(env, 0x2222);
+        let idx2 = do_contribute(
+            &f,
+            id,
+            &contribute_inputs(&f, c1.clone(), c2.clone(), U256::from_u32(env, 0xc2), U256::from_u32(env, 0xbb02), 0xbb),
+        );
+        assert_eq!(idx2, 1);
+        assert_eq!(f.pool().escrow(&id).c_raised, c2);
+
+        // a contribute with a STALE c_raised_old (reusing the seed) is rejected
+        let pi_bad =
+            contribute_inputs(&f, seed, U256::from_u32(env, 0x3333), U256::from_u32(env, 0xc3), U256::from_u32(env, 0xbb03), 0xcc);
+        let res = f.pool().try_escrow_contribute(
+            &id,
+            &f.asset_tag,
+            &pi_bad,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &Bytes::new(env),
+        );
+        assert_eq!(res, Err(Ok(Error::BadRaisedRoot)));
+    }
+
+    #[test]
+    fn escrow_release_all_or_nothing_validates_and_closes() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
+        let c1 = U256::from_u32(env, 0x1111);
+        do_contribute(
+            &f,
+            id,
+            &contribute_inputs(&f, escrow::init_c_raised(env), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0xbb01), 0xaa),
+        );
+        let payee_bind = U256::from_u32(env, 0x9001);
+        let target = U256::from_u128(env, 1000);
+
+        // wrong recipient_bind / floor / commitment_hash each rejected
+        assert_eq!(
+            try_release(&f, id, &payout_inputs(&f, c1.clone(), target.clone(), 0xfee1, U256::from_u32(env, 0xbad))),
+            Err(Error::BadRecipientBind)
+        );
+        assert_eq!(
+            try_release(&f, id, &payout_inputs(&f, c1.clone(), U256::from_u128(env, 999), 0xfee1, payee_bind.clone())),
+            Err(Error::BadFloor)
+        );
+        assert_eq!(
+            try_release(&f, id, &payout_inputs(&f, U256::from_u32(env, 0xdead), target.clone(), 0xfee1, payee_bind.clone())),
+            Err(Error::BadCommitmentHash)
+        );
+
+        // correct release succeeds and closes the escrow
+        let _leaf = release(&f, id, &payout_inputs(&f, c1.clone(), target.clone(), 0xfee1, payee_bind.clone()));
+        assert_eq!(f.pool().escrow(&id).status, escrow::STATUS_RELEASED);
+
+        // a second release is rejected (closed)
+        assert_eq!(
+            try_release(&f, id, &payout_inputs(&f, c1, target, 0xfee2, payee_bind)),
+            Err(Error::EscrowClosed)
+        );
+    }
+
+    #[test]
+    fn escrow_refund_after_deadline_once() {
+        use soroban_sdk::testutils::Ledger;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
+        let refund_bind = U256::from_u32(env, 0xbb01);
+        do_contribute(
+            &f,
+            id,
+            &contribute_inputs(&f, escrow::init_c_raised(env), U256::from_u32(env, 0x1111), U256::from_u32(env, 0xc1), refund_bind.clone(), 0xaa),
+        );
+
+        // before the deadline: refund rejected
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+        assert_eq!(
+            try_refund(&f, id, 0, &payout_inputs(&f, U256::from_u32(env, 0xc1), U256::from_u32(env, 0), 0xfee0, refund_bind.clone())),
+            Err(Error::DeadlineNotPassed)
+        );
+
+        // after the deadline: refund of contribution 0 succeeds, second is rejected
+        env.ledger().with_mut(|li| li.sequence_number = 200);
+        let _ = refund(&f, id, 0, &payout_inputs(&f, U256::from_u32(env, 0xc1), U256::from_u32(env, 0), 0xfee0, refund_bind.clone()));
+        assert_eq!(
+            try_refund(&f, id, 0, &payout_inputs(&f, U256::from_u32(env, 0xc1), U256::from_u32(env, 0), 0xfee5, refund_bind)),
+            Err(Error::AlreadyRefunded)
+        );
+    }
+
+    #[test]
+    fn escrow_refund_rejected_for_keep_what_you_raise() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let id = open_basic(&f, escrow::MODE_KEEP_WHAT_YOU_RAISE, 1000, 100, 0x9001);
+        let res = try_refund(
+            &f,
+            id,
+            0,
+            &payout_inputs(&f, U256::from_u32(env, 0xc1), U256::from_u32(env, 0), 0x1, U256::from_u32(env, 0x1)),
+        );
+        assert_eq!(res, Err(Error::RefundNotAllowed));
+    }
+
+    #[test]
+    fn escrow_release_keep_what_you_raise_needs_deadline() {
+        use soroban_sdk::testutils::Ledger;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let id = open_basic(&f, escrow::MODE_KEEP_WHAT_YOU_RAISE, 1000, 100, 0x9001);
+        let c1 = U256::from_u32(env, 0x1111);
+        do_contribute(
+            &f,
+            id,
+            &contribute_inputs(&f, escrow::init_c_raised(env), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0x1), 0xaa),
+        );
+        let payee_bind = U256::from_u32(env, 0x9001);
+
+        // before deadline: keep-what-you-raise release needs the deadline passed (floor=0)
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+        assert_eq!(
+            try_release(&f, id, &payout_inputs(&f, c1.clone(), U256::from_u32(env, 0), 0xfee1, payee_bind.clone())),
+            Err(Error::DeadlineNotPassed)
+        );
+
+        // after deadline: succeeds at floor=0 (any amount)
+        env.ledger().with_mut(|li| li.sequence_number = 200);
+        let _ = release(&f, id, &payout_inputs(&f, c1, U256::from_u32(env, 0), 0xfee1, payee_bind));
+        assert_eq!(f.pool().escrow(&id).status, escrow::STATUS_RELEASED);
     }
 }

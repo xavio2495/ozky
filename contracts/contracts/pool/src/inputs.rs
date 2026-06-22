@@ -13,6 +13,12 @@ pub const TRANSFER_N: u32 = 11;
 pub const WITHDRAW_N: u32 = 12;
 /// split = transfer with 6 outputs: 6 base + 2 nullifiers + 6 out_cm + asp_root.
 pub const SPLIT_N: u32 = 15;
+/// escrow contribute = withdraw-shaped spend (10 base through asp_root) + running-commitment
+/// fold (c_raised_old, c_raised_new, c_contrib) + refund_bind.
+pub const ESCROW_CONTRIBUTE_N: u32 = 14;
+/// escrow payout (release/refund) = domain_sep, asset_tag, epoch, commitment_hash, floor,
+/// out_commitment, recipient_bind.
+pub const ESCROW_PAYOUT_N: u32 = 7;
 
 /// Parse exactly `n` field elements (n*32 bytes, big-endian) from `pi`.
 pub fn read_fields(env: &Env, pi: &Bytes, n: u32) -> Result<Vec<U256>, Error> {

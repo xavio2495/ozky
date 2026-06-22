@@ -37,6 +37,7 @@ pub mod scan;
 pub mod send;
 pub mod session;
 pub mod sign;
+pub mod subscriptions;
 pub mod totp;
 pub mod vault;
 pub mod withdraw;

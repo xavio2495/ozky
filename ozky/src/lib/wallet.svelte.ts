@@ -12,12 +12,13 @@ import {
 	type NewAccount,
 	type Payroll,
 	type PublicBalance,
+	type Subscription,
 	type WalletStatus
 } from './api';
 
 export type Activity = {
 	id: number;
-	kind: 'deposit' | 'send' | 'split' | 'payroll' | 'withdraw' | 'enroll' | 'disclose';
+	kind: 'deposit' | 'send' | 'split' | 'payroll' | 'subscription' | 'withdraw' | 'enroll' | 'disclose';
 	label: string;
 	detail?: string;
 	hash?: string;
@@ -30,6 +31,7 @@ class WalletStore {
 	publicBalances = $state<PublicBalance[]>([]);
 	accounts = $state<AccountInfo[]>([]);
 	payrolls = $state<Payroll[]>([]);
+	subscriptions = $state<Subscription[]>([]);
 	activity = $state<Activity[]>([]);
 	loading = $state(false);
 	/** Set when the pool contracts aren't configured (dev without deployed IDs). */
@@ -42,6 +44,10 @@ class WalletStore {
 
 	get dueCount(): number {
 		return this.payrolls.filter((p) => p.due).length;
+	}
+
+	get subDueCount(): number {
+		return this.subscriptions.filter((s) => s.due).length;
 	}
 
 	get initialized() {
@@ -60,16 +66,18 @@ class WalletStore {
 		this.publicBalances = [];
 		this.accounts = [];
 		this.payrolls = [];
+		this.subscriptions = [];
 		this.activity = [];
 		await this.refreshStatus();
 	}
 
-	/** Load after unlock — the accounts + shielded + public balances + payrolls. */
+	/** Load after unlock — accounts + shielded + public balances + payrolls + subscriptions. */
 	async loadSession() {
 		await this.refreshAccounts();
 		await this.refreshBalances();
 		await this.refreshPublicBalances();
 		await this.refreshPayrolls();
+		await this.refreshSubscriptions();
 	}
 
 	async refreshPayrolls() {
@@ -101,6 +109,32 @@ class WalletStore {
 			});
 		}
 		await this.refreshPayrolls();
+	}
+
+	async refreshSubscriptions() {
+		if (!this.unlocked) return;
+		try {
+			this.subscriptions = await api.listSubscriptions();
+		} catch (e) {
+			this.subscriptions = [];
+			if (!isConfigError(e)) {
+				toast.error('Could not load subscriptions', { description: errMessage(e) });
+			}
+		}
+	}
+
+	/** Charge a subscription now (one shielded transfer); logs activity + refreshes. */
+	async runSubscription(id: number) {
+		const s = this.subscriptions.find((x) => x.id === id);
+		const hash = await runAction(
+			`Charging subscription${s ? ` "${s.label}"` : ''}`,
+			() => api.runSubscription(id),
+			{ success: () => 'Subscription paid' }
+		);
+		if (hash && s) {
+			this.log({ kind: 'subscription', label: `Subscription "${s.label}"`, hash });
+		}
+		await this.refreshSubscriptions();
 	}
 
 	/** The active account's public (unshielded) Stellar balances — independent of the pool. */

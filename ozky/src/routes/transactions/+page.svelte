@@ -15,6 +15,7 @@
 	import ReceiptIcon from '@lucide/svelte/icons/receipt';
 	import SplitIcon from '@lucide/svelte/icons/split';
 	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
+	import RepeatIcon from '@lucide/svelte/icons/repeat';
 	import InfoIcon from '@lucide/svelte/icons/info';
 
 	const icons = {
@@ -22,6 +23,7 @@
 		send: ArrowUpRightIcon,
 		split: SplitIcon,
 		payroll: CalendarClockIcon,
+		subscription: RepeatIcon,
 		withdraw: UploadIcon,
 		enroll: ShieldCheckIcon,
 		disclose: ScaleIcon

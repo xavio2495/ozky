@@ -48,6 +48,35 @@ export type PayrollInput = {
 	start_unix: number;
 };
 
+/** A push subscription as returned by the backend (+ computed `due`). */
+export type Subscription = {
+	id: number;
+	label: string;
+	asset: string;
+	code: string;
+	amount: number;
+	cadence: string; // "weekly" | "monthly" | "days"
+	interval_days: number;
+	next_run_unix: number;
+	last_run_unix: number | null;
+	end_unix: number | null;
+	enabled: boolean;
+	due: boolean;
+};
+
+/** Subscription create/update input. id=0 creates; end_unix=0 means no end. */
+export type SubscriptionInput = {
+	id: number;
+	label: string;
+	asset: string;
+	code: string;
+	amount: number;
+	cadence: string;
+	interval_days: number;
+	start_unix: number;
+	end_unix: number;
+};
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -108,6 +137,13 @@ export const api = {
 	setPayrollEnabled: (id: number, enabled: boolean) =>
 		invoke<void>('set_payroll_enabled', { id, enabled }),
 	runPayroll: (id: number) => invoke<string[]>('run_payroll', { id }),
+
+	listSubscriptions: () => invoke<Subscription[]>('list_subscriptions'),
+	saveSubscription: (input: SubscriptionInput) => invoke<number>('save_subscription', { input }),
+	deleteSubscription: (id: number) => invoke<void>('delete_subscription', { id }),
+	setSubscriptionEnabled: (id: number, enabled: boolean) =>
+		invoke<void>('set_subscription_enabled', { id, enabled }),
+	runSubscription: (id: number) => invoke<string>('run_subscription', { id }),
 	withdraw: (asset: string, dest: string, amount: number) =>
 		invoke<string>('withdraw', { asset, dest, amount }),
 

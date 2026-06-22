@@ -470,6 +470,120 @@ pub async fn run_payroll(id: u64) -> Result<Vec<String>, CoreError> {
     .await
 }
 
+/// Subscription create/update input from the UI. (push subscriptions)
+#[derive(serde::Deserialize)]
+pub struct SubscriptionInput {
+    /// 0 to create; an existing id to update.
+    pub id: u64,
+    pub label: String,
+    pub asset: String,
+    pub code: String,
+    pub amount: u64,
+    /// "weekly" | "monthly" | "days".
+    pub cadence: String,
+    /// interval days when cadence == "days".
+    pub interval_days: u32,
+    /// Unix seconds for the first charge (defaults to now if 0).
+    pub start_unix: i64,
+    /// Unix seconds to stop after (0 = no end).
+    pub end_unix: i64,
+}
+
+/// A subscription as shown in the UI (+ a computed `due` flag). (push subscriptions)
+#[derive(Serialize)]
+pub struct SubscriptionView {
+    pub id: u64,
+    pub label: String,
+    pub asset: String,
+    pub code: String,
+    pub amount: u64,
+    pub cadence: String,
+    pub interval_days: u32,
+    pub next_run_unix: i64,
+    pub last_run_unix: Option<i64>,
+    pub end_unix: Option<i64>,
+    pub enabled: bool,
+    pub due: bool,
+}
+
+fn sub_view(s: core::subscriptions::Subscription, now: i64) -> SubscriptionView {
+    let (cadence, interval_days) = cadence_to_str(s.cadence);
+    SubscriptionView {
+        id: s.id,
+        label: s.label.clone(),
+        asset: s.asset.clone(),
+        code: s.code.clone(),
+        amount: s.amount,
+        cadence,
+        interval_days,
+        next_run_unix: s.next_run_unix,
+        last_run_unix: s.last_run_unix,
+        end_unix: s.end_unix,
+        due: s.is_due(now),
+        enabled: s.enabled,
+    }
+}
+
+/// List this wallet's subscriptions with a computed `due` flag. (push subscriptions)
+#[tauri::command]
+pub fn list_subscriptions() -> Result<Vec<SubscriptionView>, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let now = core::payroll::now();
+    Ok(core::subscriptions::load(&wallet)?.into_iter().map(|s| sub_view(s, now)).collect())
+}
+
+/// Create (id=0) or update a subscription. Returns its id. (push subscriptions)
+#[tauri::command]
+pub fn save_subscription(input: SubscriptionInput) -> Result<u64, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let cadence = cadence_from(&input.cadence, input.interval_days);
+    let start = if input.start_unix > 0 { input.start_unix } else { core::payroll::now() };
+    // Preserve last_run when updating an existing subscription.
+    let last_run_unix = core::subscriptions::load(&wallet)?
+        .into_iter()
+        .find(|s| s.id == input.id)
+        .and_then(|s| s.last_run_unix);
+    let s = core::subscriptions::Subscription {
+        id: input.id,
+        label: input.label,
+        asset: input.asset,
+        code: input.code,
+        amount: input.amount,
+        cadence,
+        next_run_unix: start,
+        last_run_unix,
+        end_unix: if input.end_unix > 0 { Some(input.end_unix) } else { None },
+        enabled: true,
+    };
+    core::subscriptions::upsert(&wallet, s)
+}
+
+/// Delete a subscription. (push subscriptions)
+#[tauri::command]
+pub fn delete_subscription(id: u64) -> Result<(), CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::subscriptions::remove(&wallet, id)
+}
+
+/// Enable/disable a subscription (disabled ones are never "due"). (push subscriptions)
+#[tauri::command]
+pub fn set_subscription_enabled(id: u64, enabled: bool) -> Result<(), CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::subscriptions::set_enabled(&wallet, id, enabled)
+}
+
+/// Charge a subscription now: one shielded transfer, advances the schedule, returns the tx
+/// hash. Off the UI thread (proves). (push subscriptions)
+#[tauri::command]
+pub async fn run_subscription(id: u64) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::subscriptions::run(&wallet, &cfg, id)
+    })
+    .await
+}
+
 /// Withdraw `amount` of `asset` out of the shielded pool to a public Stellar `dest`
 /// address (the off-ramp). Returns the tx hash. (A3/G6)
 #[tauri::command]

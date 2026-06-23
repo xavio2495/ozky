@@ -26,6 +26,7 @@ pub mod deposit;
 pub mod disclose;
 pub mod encrypt;
 pub mod enroll;
+pub mod escrow;
 pub mod keychain;
 pub mod keys;
 pub mod notes;

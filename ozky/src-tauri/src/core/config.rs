@@ -177,6 +177,15 @@ impl PoolConfig {
         Ok(cfg)
     }
 
+    /// Clone this config targeting a different asset by its in-circuit `asset_tag` (e.g. the
+    /// tag read off an on-chain escrow). Like [`with_asset`] but keyed by tag rather than code,
+    /// so it accepts any registered tag without a code round-trip.
+    pub fn with_asset_tag(&self, tag: Fr) -> Result<PoolConfig, CoreError> {
+        let mut cfg = self.clone();
+        cfg.asset_tag = tag;
+        Ok(cfg)
+    }
+
     /// The source secret to submit + fee-pay an interior op (`transfer`/`withdraw`):
     /// the relayer if configured (fee abstraction), else the wallet's own key.
     pub fn submit_source<'a>(&'a self, wallet_secret: &'a str) -> &'a str {

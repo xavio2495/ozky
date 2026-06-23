@@ -127,6 +127,17 @@ pub fn current_epoch(rpc_url: &str) -> Result<u32, CoreError> {
     Ok((seq / LEDGER_PER_EPOCH) as u32)
 }
 
+/// The latest ledger sequence. Used to turn a user's escrow deadline (a wall-clock instant) into
+/// a ledger number for `open_escrow`, and to decide release/refund eligibility (guard: `ledger >
+/// deadline`). Ledgers close ~every 5s on testnet.
+pub fn latest_ledger(rpc_url: &str) -> Result<u32, CoreError> {
+    let r = rpc_call(rpc_url, "getLatestLedger", json!({})).map_err(CoreError::Chain)?;
+    r.get("sequence")
+        .and_then(|v| v.as_u64())
+        .map(|s| s as u32)
+        .ok_or_else(|| CoreError::Chain("getLatestLedger: no sequence".into()))
+}
+
 /// A raw contract event: ledger + base64-XDR topics and value.
 struct RawEvent {
     ledger: u32,
@@ -1020,6 +1031,74 @@ pub fn read_escrow(cfg: &PoolConfig, escrow_id: u64) -> Result<EscrowState, Core
         n_contrib: u32f("n_contrib")?,
         status: u32f("status")?,
     })
+}
+
+/// Drain this escrow's `escrcon` blobs (the `(amount, r)` payloads encrypted to the payee),
+/// returned in contribution-index order. The payee decrypts these to recover the running total
+/// `(S, R)` it must open at release ([`super::escrow::scan_total`]). No cache: contributions per
+/// escrow are few and this is only read at release time.
+pub fn escrow_contributions(cfg: &PoolConfig, escrow_id: u64) -> Result<Vec<Vec<u8>>, CoreError> {
+    let pool = &cfg.pool_contract;
+    let start = resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?;
+    let mut cursor: Option<String> = None;
+    let mut found: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut empty_run = 0u32;
+    let mut seen = 0usize;
+
+    for _ in 0..MAX_PAGES {
+        let (events, next) = get_events_page(
+            &cfg.rpc_url,
+            pool,
+            if cursor.is_none() { Some(start) } else { None },
+            cursor.as_deref(),
+        )
+        .map_err(CoreError::Chain)?;
+        let n = events.len();
+        seen += n;
+        for raw in &events {
+            if let Some((idx, blob)) = classify_escrow_contribution(raw, escrow_id) {
+                if !found.iter().any(|(i, _)| *i == idx) {
+                    found.push((idx, blob));
+                }
+            }
+        }
+        let advanced = next.is_some() && next != cursor;
+        if next.is_some() {
+            cursor = next;
+        }
+        if n == 0 {
+            empty_run += 1;
+            if !advanced || (seen > 0 && empty_run >= EMPTY_TOLERANCE) {
+                break;
+            }
+        } else {
+            empty_run = 0;
+        }
+    }
+    found.sort_by_key(|(i, _)| *i);
+    Ok(found.into_iter().map(|(_, b)| b).collect())
+}
+
+/// Decode an `escrcon` event for `escrow_id` → `(contrib_index, payee_enc blob)`. Topics are
+/// `(Symbol "escrcon", U64 escrow_id, U32 idx)`; value is the opaque `payee_enc` Bytes.
+fn classify_escrow_contribution(e: &RawEvent, escrow_id: u64) -> Option<(u32, Vec<u8>)> {
+    match scval(e.topics.first()?)? {
+        ScVal::Symbol(s) if s.0.as_slice() == b"escrcon" => {}
+        _ => return None,
+    };
+    match scval(e.topics.get(1)?)? {
+        ScVal::U64(n) if n == escrow_id => {}
+        _ => return None,
+    };
+    let idx = match scval(e.topics.get(2)?)? {
+        ScVal::U32(n) => n,
+        _ => return None,
+    };
+    let blob = match scval(&e.value)? {
+        ScVal::Bytes(b) => b.0.as_slice().to_vec(),
+        _ => return None,
+    };
+    Some((idx, blob))
 }
 
 /// Open an escrow: `open_escrow(asset_tag, target, deadline, mode, payee_bind)`. Returns the tx

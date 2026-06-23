@@ -145,6 +145,15 @@ pub fn add(a: &Point, b: &Point) -> Point {
     a.add(b, &modulus())
 }
 
+/// Field-sum a set of blindings mod the BN254 scalar modulus. The payee opens the running
+/// commitment `Commit(S, R)` at release, where `R = Σ rᵢ` (homomorphism: `Σ Commit(vᵢ, rᵢ) =
+/// Commit(Σvᵢ, Σrᵢ)`). The total value `S` is a plain `u64` sum; this is its blinding partner.
+pub fn sum_blindings(rs: &[Fr]) -> Fr {
+    let p = modulus();
+    let acc = rs.iter().fold(BigUint::ZERO, |acc, r| fadd(&acc, &fr_to_biguint(r), &p));
+    biguint_to_fr(&acc)
+}
+
 /// A point's `(x, y)` as `Fr` (big-endian), for Prover.toml `EmbeddedCurvePoint` serialization.
 /// The identity reads as `(0, 0)` (matching Noir's `point_at_infinity`).
 pub fn coords(pt: &Point) -> (Fr, Fr) {

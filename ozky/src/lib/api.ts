@@ -77,6 +77,27 @@ export type SubscriptionInput = {
 	end_unix: number;
 };
 
+/** One contribution this wallet made to an escrow (for the refund affordance). */
+export type EscrowContribution = { index: number; amount: number };
+
+/** A shielded escrow this wallet opened or contributed to (+ on-chain state & eligibility). */
+export type Escrow = {
+	id: number;
+	asset: string;
+	target: number;
+	mode: string; // "all_or_nothing" | "keep_what_you_raise"
+	n_contrib: number;
+	status: string; // "open" | "released"
+	deadline_unix: number;
+	deadline_passed: boolean;
+	is_payee: boolean;
+	my_contributions: EscrowContribution[];
+	/** Payee-only decrypted running total; null for contributors. */
+	raised: number | null;
+	releasable: boolean;
+	refundable: boolean;
+};
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -144,6 +165,16 @@ export const api = {
 	setSubscriptionEnabled: (id: number, enabled: boolean) =>
 		invoke<void>('set_subscription_enabled', { id, enabled }),
 	runSubscription: (id: number) => invoke<string>('run_subscription', { id }),
+
+	listEscrows: () => invoke<Escrow[]>('list_escrows'),
+	openEscrow: (asset: string, target: number, deadlineUnix: number, mode: string) =>
+		invoke<number>('open_escrow', { asset, target, deadlineUnix, mode }),
+	contributeEscrow: (escrowId: number, payeeCode: string, amount: number) =>
+		invoke<number>('contribute_escrow', { escrowId, payeeCode, amount }),
+	releaseEscrow: (escrowId: number) => invoke<string>('release_escrow', { escrowId }),
+	refundEscrow: (escrowId: number, contribIndex: number) =>
+		invoke<string>('refund_escrow', { escrowId, contribIndex }),
+
 	withdraw: (asset: string, dest: string, amount: number) =>
 		invoke<string>('withdraw', { asset, dest, amount }),
 

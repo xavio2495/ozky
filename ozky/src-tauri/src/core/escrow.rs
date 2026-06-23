@@ -118,14 +118,26 @@ fn serialize_payee_blob(amount: u64, r: &Fr) -> Vec<u8> {
     v
 }
 
-/// Decrypt a payee blob with the payee's transmission key, returning `(amount, r)`. The payee
-/// accumulates these across contributions to learn the total `(S, R_sum)` to open at release.
-pub fn decrypt_payee_blob(
-    id: &WalletIdentity,
-    enc_note: &[u8],
-    ephemeral_pub: &[u8; 32],
-) -> Option<(u64, Fr)> {
-    let pt = encrypt::decrypt_note(enc_note, ephemeral_pub, &id.transmission_sk).ok()?;
+/// The on-chain `payee_enc` blob: `ephemeral_pub(32) || enc_note`. The contract emits this opaquely
+/// (spec §5 `payee_enc: Bytes`), so the ephemeral key the payee needs to decrypt rides along inside
+/// the blob rather than as a separate event field.
+fn pack_payee_blob(ephemeral_pub: &[u8; 32], enc_note: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + enc_note.len());
+    v.extend_from_slice(ephemeral_pub);
+    v.extend_from_slice(enc_note);
+    v
+}
+
+/// Decrypt an on-chain `payee_enc` blob (`ephemeral_pub || enc_note`) with the payee's transmission
+/// key, returning `(amount, r)`. The payee accumulates these across contributions to learn the
+/// total `(S, R_sum)` to open at release (see [`scan_total`]).
+pub fn decrypt_payee_blob(id: &WalletIdentity, blob: &[u8]) -> Option<(u64, Fr)> {
+    if blob.len() < 32 {
+        return None;
+    }
+    let mut ephemeral_pub = [0u8; 32];
+    ephemeral_pub.copy_from_slice(&blob[0..32]);
+    let pt = encrypt::decrypt_note(&blob[32..], &ephemeral_pub, &id.transmission_sk).ok()?;
     if pt.len() != 40 {
         return None;
     }
@@ -133,6 +145,26 @@ pub fn decrypt_payee_blob(
     let mut r = [0u8; 32];
     r.copy_from_slice(&pt[8..40]);
     Some((amount, Fr(r)))
+}
+
+/// Scan an escrow's contribution blobs as the payee and accumulate the running total it must open
+/// at release: `S = Σ amountᵢ`, `R = Σ rᵢ` (field sum). Blobs that don't decrypt to this wallet are
+/// skipped (a non-payee scanning gets `(0, 0)`). The homomorphism `Σ Commit(vᵢ, rᵢ) = Commit(S, R)`
+/// is exactly what the payout circuit opens against the stored `c_raised`.
+pub fn scan_total(wallet: &WalletKeys, cfg: &PoolConfig, escrow_id: u64) -> Result<(u64, Fr), CoreError> {
+    let id = scan::wallet_identity(wallet)?;
+    let blobs = chain::escrow_contributions(cfg, escrow_id)?;
+    let mut total: u64 = 0;
+    let mut rs: Vec<Fr> = Vec::new();
+    for blob in &blobs {
+        if let Some((amount, r)) = decrypt_payee_blob(&id, blob) {
+            total = total
+                .checked_add(amount)
+                .ok_or_else(|| CoreError::Proving("escrow total overflow".into()))?;
+            rs.push(r);
+        }
+    }
+    Ok((total, pedersen::sum_blindings(&rs)))
 }
 
 // ----------------------------- flows -----------------------------
@@ -234,8 +266,10 @@ pub fn contribute(
     let change_enc = encrypt::encrypt_note(&change.serialize(), &id.transmission_pub)?;
     let change_payload = chain::OutputPayload { enc_note: change_enc.enc_note, ephemeral_pub: change_enc.ephemeral_pub, view_tag: change_enc.view_tag };
 
-    // Encrypt (amount, r) to the payee so only they can open the running total.
+    // Encrypt (amount, r) to the payee so only they can open the running total. The ephemeral key
+    // rides inside the published blob (ephemeral_pub || enc_note) so the payee can decrypt it.
     let payee_enc = encrypt::encrypt_note(&serialize_payee_blob(amount, &blinding_r), &payee_transmission_pub)?;
+    let payee_blob = pack_payee_blob(&payee_enc.ephemeral_pub, &payee_enc.enc_note);
 
     chain::submit_escrow_contribute(
         &cfg,
@@ -244,7 +278,7 @@ pub fn contribute(
         &bundle.public_inputs,
         &bundle.proof,
         &change_payload,
-        &payee_enc.enc_note,
+        &payee_blob,
         &raised_x,
         &raised_y,
     )?;
@@ -386,7 +420,8 @@ mod tests {
         let amount = 1234u64;
         let r = Fr::from_hex("0xb11d").unwrap();
         let enc = encrypt::encrypt_note(&serialize_payee_blob(amount, &r), &id.transmission_pub).unwrap();
-        let (got_amount, got_r) = decrypt_payee_blob(&id, &enc.enc_note, &enc.ephemeral_pub).unwrap();
+        let blob = pack_payee_blob(&enc.ephemeral_pub, &enc.enc_note);
+        let (got_amount, got_r) = decrypt_payee_blob(&id, &blob).unwrap();
         assert_eq!(got_amount, amount);
         assert_eq!(got_r, r);
     }

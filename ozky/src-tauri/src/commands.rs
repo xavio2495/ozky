@@ -584,6 +584,190 @@ pub async fn run_subscription(id: u64) -> Result<String, CoreError> {
     .await
 }
 
+// ----------------------------- shielded escrow (building block B) -----------------------------
+
+/// One contribution this wallet made to an escrow (for the refund affordance). (shielded escrow)
+#[derive(Serialize)]
+pub struct EscrowContribution {
+    pub index: u32,
+    pub amount: u64,
+}
+
+/// An escrow this wallet is involved in (opened as payee and/or contributed to), merged with its
+/// public on-chain state. Amounts stay hidden on-chain; `raised` is the payee's own decrypted
+/// total (None for contributors). (shielded escrow)
+#[derive(Serialize)]
+pub struct EscrowView {
+    pub id: u64,
+    pub asset: String,
+    pub target: u64,
+    pub mode: String, // "all_or_nothing" | "keep_what_you_raise"
+    pub n_contrib: u32,
+    pub status: String, // "open" | "released"
+    pub deadline_unix: i64,
+    pub deadline_passed: bool,
+    pub is_payee: bool,
+    pub my_contributions: Vec<EscrowContribution>,
+    /// Payee-only: this wallet's decrypted running total `S`. None for contributors / on scan error.
+    pub raised: Option<u64>,
+    pub releasable: bool,
+    pub refundable: bool,
+}
+
+fn mode_to_str(mode: u32) -> String {
+    if mode == core::escrow::MODE_KEEP_WHAT_YOU_RAISE { "keep_what_you_raise" } else { "all_or_nothing" }
+        .to_string()
+}
+
+fn mode_from(mode: &str) -> u32 {
+    if mode == "keep_what_you_raise" {
+        core::escrow::MODE_KEEP_WHAT_YOU_RAISE
+    } else {
+        core::escrow::MODE_ALL_OR_NOTHING
+    }
+}
+
+/// List the escrows this wallet opened or contributed to, with on-chain state + eligibility flags.
+/// Network-heavy (reads each escrow + scans the payee's contribution blobs), so it runs off the UI
+/// thread. (shielded escrow)
+#[tauri::command]
+pub async fn list_escrows() -> Result<Vec<EscrowView>, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        let now = core::payroll::now();
+        let latest = core::chain::latest_ledger(&cfg.rpc_url)? as u64;
+
+        let opened = core::escrow::list_opened(&wallet)?;
+        let contributions = core::escrow::list_contributions(&wallet)?;
+
+        // Distinct escrow ids this wallet touches, payee-opened first.
+        let mut ids: Vec<u64> = Vec::new();
+        for o in &opened {
+            if !ids.contains(&o.escrow_id) {
+                ids.push(o.escrow_id);
+            }
+        }
+        for c in &contributions {
+            if !ids.contains(&c.escrow_id) {
+                ids.push(c.escrow_id);
+            }
+        }
+
+        let mut views = Vec::new();
+        for id in ids {
+            // A stale local record (escrow gone) shouldn't break the whole list.
+            let st = match core::chain::read_escrow(&cfg, id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let is_payee = opened.iter().any(|o| o.escrow_id == id);
+            let mine: Vec<EscrowContribution> = contributions
+                .iter()
+                .filter(|c| c.escrow_id == id)
+                .map(|c| EscrowContribution { index: c.contrib_index, amount: c.amount })
+                .collect();
+
+            let asset = core::config::asset_by_tag(&st.asset_tag)
+                .map(|a| a.code.to_string())
+                .unwrap_or_else(|| st.asset_tag.to_decimal());
+            let deadline_passed = latest > st.deadline;
+            // Ledgers close ~5s apart; estimate the deadline as a wall-clock instant for display.
+            let deadline_unix = now + (st.deadline as i64 - latest as i64) * 5;
+            let is_open = st.status == 0;
+
+            // Only the payee can decrypt the running total; skip (None) on any scan error.
+            let raised = if is_payee {
+                core::escrow::scan_total(&wallet, &cfg, id).ok().map(|(s, _)| s)
+            } else {
+                None
+            };
+
+            let releasable = is_payee
+                && is_open
+                && if st.mode == core::escrow::MODE_KEEP_WHAT_YOU_RAISE {
+                    deadline_passed
+                } else {
+                    raised.map(|s| s >= st.target).unwrap_or(false)
+                };
+            let refundable = !mine.is_empty()
+                && st.mode == core::escrow::MODE_ALL_OR_NOTHING
+                && is_open
+                && deadline_passed;
+
+            views.push(EscrowView {
+                id,
+                asset,
+                target: st.target,
+                mode: mode_to_str(st.mode),
+                n_contrib: st.n_contrib,
+                status: if is_open { "open".into() } else { "released".into() },
+                deadline_unix,
+                deadline_passed,
+                is_payee,
+                my_contributions: mine,
+                raised,
+                releasable,
+                refundable,
+            });
+        }
+        Ok(views)
+    })
+    .await
+}
+
+/// Open a hidden-sum escrow as the payee. `target`/`amount` are base units; `deadline_unix` is the
+/// wall-clock deadline (converted to a ledger number ~5s/ledger). Returns the escrow id. (escrow)
+#[tauri::command]
+pub async fn open_escrow(asset: String, target: u64, deadline_unix: i64, mode: String) -> Result<u64, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?.with_asset(&asset)?;
+        let now = core::payroll::now();
+        let latest = core::chain::latest_ledger(&cfg.rpc_url)? as i64;
+        let deadline_ledger = (latest + (deadline_unix - now).max(0) / 5).max(latest + 1) as u64;
+        core::escrow::open(&wallet, &cfg, target, deadline_ledger, mode_from(&mode))
+    })
+    .await
+}
+
+/// Contribute `amount` (base units) to an escrow, hidden. `payee_code` is the payee's shielded
+/// code (the `(amount, r)` opener is encrypted to them). Returns the contribution index. (escrow)
+#[tauri::command]
+pub async fn contribute_escrow(escrow_id: u64, payee_code: String, amount: u64) -> Result<u32, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::escrow::contribute(&wallet, &cfg, escrow_id, &payee_code, amount)
+    })
+    .await
+}
+
+/// Release an escrow to the payee (this wallet): scans the contribution blobs to recover the total
+/// `(S, R)`, then mints a shielded note of `S`. Returns the tx hash. (escrow)
+#[tauri::command]
+pub async fn release_escrow(escrow_id: u64) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        let (total_value, total_r) = core::escrow::scan_total(&wallet, &cfg, escrow_id)?;
+        core::escrow::release(&wallet, &cfg, escrow_id, total_value, total_r)
+    })
+    .await
+}
+
+/// Refund this wallet's contribution `contrib_index` to a failed all-or-nothing escrow. Mints the
+/// contribution amount back to this wallet. Returns the tx hash. (escrow)
+#[tauri::command]
+pub async fn refund_escrow(escrow_id: u64, contrib_index: u32) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::escrow::refund(&wallet, &cfg, escrow_id, contrib_index)
+    })
+    .await
+}
+
 /// Withdraw `amount` of `asset` out of the shielded pool to a public Stellar `dest`
 /// address (the off-ramp). Returns the tx hash. (A3/G6)
 #[tauri::command]

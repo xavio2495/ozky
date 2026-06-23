@@ -9,6 +9,7 @@ import {
 	isConfigError,
 	type AccountInfo,
 	type AssetBalance,
+	type Escrow,
 	type NewAccount,
 	type Payroll,
 	type PublicBalance,
@@ -18,7 +19,16 @@ import {
 
 export type Activity = {
 	id: number;
-	kind: 'deposit' | 'send' | 'split' | 'payroll' | 'subscription' | 'withdraw' | 'enroll' | 'disclose';
+	kind:
+		| 'deposit'
+		| 'send'
+		| 'split'
+		| 'payroll'
+		| 'subscription'
+		| 'escrow'
+		| 'withdraw'
+		| 'enroll'
+		| 'disclose';
 	label: string;
 	detail?: string;
 	hash?: string;
@@ -32,6 +42,7 @@ class WalletStore {
 	accounts = $state<AccountInfo[]>([]);
 	payrolls = $state<Payroll[]>([]);
 	subscriptions = $state<Subscription[]>([]);
+	escrows = $state<Escrow[]>([]);
 	activity = $state<Activity[]>([]);
 	loading = $state(false);
 	/** Set when the pool contracts aren't configured (dev without deployed IDs). */
@@ -48,6 +59,11 @@ class WalletStore {
 
 	get subDueCount(): number {
 		return this.subscriptions.filter((s) => s.due).length;
+	}
+
+	/** Escrows with an action waiting (releasable as payee, or a refundable contribution). */
+	get escrowActionCount(): number {
+		return this.escrows.filter((e) => e.releasable || e.refundable).length;
 	}
 
 	get initialized() {
@@ -67,17 +83,19 @@ class WalletStore {
 		this.accounts = [];
 		this.payrolls = [];
 		this.subscriptions = [];
+		this.escrows = [];
 		this.activity = [];
 		await this.refreshStatus();
 	}
 
-	/** Load after unlock — accounts + shielded + public balances + payrolls + subscriptions. */
+	/** Load after unlock — accounts + shielded + public balances + payrolls + subscriptions + escrows. */
 	async loadSession() {
 		await this.refreshAccounts();
 		await this.refreshBalances();
 		await this.refreshPublicBalances();
 		await this.refreshPayrolls();
 		await this.refreshSubscriptions();
+		await this.refreshEscrows();
 	}
 
 	async refreshPayrolls() {
@@ -135,6 +153,64 @@ class WalletStore {
 			this.log({ kind: 'subscription', label: `Subscription "${s.label}"`, hash });
 		}
 		await this.refreshSubscriptions();
+	}
+
+	async refreshEscrows() {
+		if (!this.unlocked) return;
+		try {
+			this.escrows = await api.listEscrows();
+		} catch (e) {
+			this.escrows = [];
+			if (!isConfigError(e)) {
+				toast.error('Could not load escrows', { description: errMessage(e) });
+			}
+		}
+	}
+
+	/** Open an escrow as payee (one submit, no proof). Returns the new id; refreshes the list. */
+	async openEscrow(asset: string, target: number, deadlineUnix: number, mode: string) {
+		const id = await runAction(
+			'Opening escrow',
+			() => api.openEscrow(asset, target, deadlineUnix, mode),
+			{ success: (id) => `Escrow #${id} opened`, refresh: false }
+		);
+		if (id !== undefined) this.log({ kind: 'escrow', label: `Opened escrow #${id}` });
+		await this.refreshEscrows();
+		return id;
+	}
+
+	/** Contribute to an escrow (proves + spends a note); logs activity + refreshes. */
+	async contributeEscrow(escrowId: number, payeeCode: string, amount: number) {
+		const idx = await runAction(
+			'Contributing to escrow',
+			() => api.contributeEscrow(escrowId, payeeCode, amount),
+			{ success: () => 'Contribution sent' }
+		);
+		if (idx !== undefined) this.log({ kind: 'escrow', label: `Contributed to escrow #${escrowId}` });
+		await this.refreshEscrows();
+		return idx;
+	}
+
+	/** Release an escrow to the payee (proves + mints); logs activity + refreshes. */
+	async releaseEscrow(escrowId: number) {
+		const hash = await runAction(
+			'Releasing escrow',
+			() => api.releaseEscrow(escrowId),
+			{ success: () => 'Escrow released' }
+		);
+		if (hash) this.log({ kind: 'escrow', label: `Released escrow #${escrowId}`, hash });
+		await this.refreshEscrows();
+	}
+
+	/** Refund this wallet's contribution to a failed escrow (proves + mints); refreshes. */
+	async refundEscrow(escrowId: number, contribIndex: number) {
+		const hash = await runAction(
+			'Refunding contribution',
+			() => api.refundEscrow(escrowId, contribIndex),
+			{ success: () => 'Contribution refunded' }
+		);
+		if (hash) this.log({ kind: 'escrow', label: `Refunded escrow #${escrowId}`, hash });
+		await this.refreshEscrows();
 	}
 
 	/** The active account's public (unshielded) Stellar balances — independent of the pool. */

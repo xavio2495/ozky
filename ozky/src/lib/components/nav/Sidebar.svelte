@@ -12,6 +12,7 @@
 	import SplitIcon from '@lucide/svelte/icons/split';
 	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import RepeatIcon from '@lucide/svelte/icons/repeat';
+	import HandCoinsIcon from '@lucide/svelte/icons/hand-coins';
 	import ReceiptIcon from '@lucide/svelte/icons/receipt';
 	import TrendingUpIcon from '@lucide/svelte/icons/trending-up';
 	import LockIcon from '@lucide/svelte/icons/lock';
@@ -35,6 +36,7 @@
 		{ href: '/split', label: 'Split', icon: SplitIcon },
 		{ href: '/payroll', label: 'Payroll', icon: CalendarClockIcon, badge: 'payroll' },
 		{ href: '/subscriptions', label: 'Subscriptions', icon: RepeatIcon, badge: 'subscription' },
+		{ href: '/escrow', label: 'Escrow', icon: HandCoinsIcon, badge: 'escrow' },
 		{ href: '/receive', label: 'Receive', icon: ArrowDownLeftIcon },
 		{ href: '/deposit', label: 'Deposit', icon: DownloadIcon },
 		{ href: '/withdraw', label: 'Withdraw', icon: UploadIcon },
@@ -62,7 +64,7 @@
 	<ul class="flex flex-col gap-1">
 		{#each items as item (item.href)}
 			{@const active = isActive(item.href)}
-			{@const due = item.badge === 'payroll' ? wallet.dueCount : item.badge === 'subscription' ? wallet.subDueCount : 0}
+			{@const due = item.badge === 'payroll' ? wallet.dueCount : item.badge === 'subscription' ? wallet.subDueCount : item.badge === 'escrow' ? wallet.escrowActionCount : 0}
 			<li class="relative">
 				{#if active}
 					<div

@@ -1,0 +1,67 @@
+//! `channel_close` circuit - public-interface wrapper over `notes::channel::verify_channel_close`.
+//! Settles a merchant-pull subscription channel: opens the hidden cap + the subscriber-signed
+//! cumulative commitment, verifies the subscriber's Schnorr authorization in-circuit, and mints
+//! drawn -> merchant and (cap - drawn) -> subscriber. Public inputs in canonical order (10 fields),
+//! parsed by the contract as CHANNEL_CLOSE_N. All openings + the signature are private.
+use notes::channel::verify_channel_close;
+use std::embedded_curve_ops::EmbeddedCurvePoint;
+
+fn main(
+    domain_sep: pub Field,
+    asset_tag: pub Field,
+    epoch: pub Field,
+    cap_hash: pub Field,
+    auth_key: pub Field,
+    valid_after_ledger: pub Field,
+    merchant_out: pub Field,
+    subscriber_out: pub Field,
+    merchant_bind: pub Field,
+    subscriber_bind: pub Field,
+    cap: Field,
+    r_cap: Field,
+    drawn: Field,
+    r_k: Field,
+    channel_id: Field,
+    pk: EmbeddedCurvePoint,
+    sig_r: EmbeddedCurvePoint,
+    s_lo: Field,
+    s_hi: Field,
+    merchant_pk: Field,
+    m_salt: Field,
+    merchant_blinding: Field,
+    merchant_rho: Field,
+    subscriber_pk: Field,
+    s_salt: Field,
+    subscriber_blinding: Field,
+    subscriber_rho: Field,
+) {
+    verify_channel_close(
+        domain_sep,
+        asset_tag,
+        epoch,
+        cap_hash,
+        auth_key,
+        valid_after_ledger,
+        merchant_out,
+        subscriber_out,
+        merchant_bind,
+        subscriber_bind,
+        cap,
+        r_cap,
+        drawn,
+        r_k,
+        channel_id,
+        pk,
+        sig_r,
+        s_lo,
+        s_hi,
+        merchant_pk,
+        m_salt,
+        merchant_blinding,
+        merchant_rho,
+        subscriber_pk,
+        s_salt,
+        subscriber_blinding,
+        subscriber_rho,
+    );
+}

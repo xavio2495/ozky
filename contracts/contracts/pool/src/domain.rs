@@ -19,6 +19,9 @@ pub const SELECTOR_ESCROW_CONTRIBUTE: u32 = 5;
 /// Shared by escrow release AND refund — the contract distinguishes them by the expected
 /// commitment_hash / floor / recipient_bind, so neither proof can replay as the other.
 pub const SELECTOR_ESCROW_PAYOUT: u32 = 6;
+/// Merchant-pull subscription channel CLOSE (building block B phase 2). Open reuses the escrow
+/// contribute selector (5); reclaim reuses the escrow payout selector (6); only close is new.
+pub const SELECTOR_CHANNEL_CLOSE: u32 = 7;
 
 /// `domain_sep = Poseidon(pool_id, network_id, selector)` — same construction the
 /// prover uses (Poseidon2 parity with the circuit's hash is already established).

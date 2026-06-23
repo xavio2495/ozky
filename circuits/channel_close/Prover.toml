@@ -1,0 +1,35 @@
+domain_sep = "0xabc"
+asset_tag = "1"
+epoch = "5"
+cap_hash = "0x2c48a88806047b18b6867cf0e631230363d1fe9448c4acbb1e01a889edf061cc"
+auth_key = "0x2c39130bc310dab1eda97ffcccbd7501c76184929dffc76590e43f5b3bc3ebac"
+valid_after_ledger = "50"
+merchant_out = "0x09b4963cc5f48a6dd0dce3d36d40842d5ed8e63c38bdc8e7a77151fdea00897c"
+subscriber_out = "0x0d62a2c142417b1c915340c7673af7f07f50b5b0b6629a04ddd43842f17966ca"
+merchant_bind = "0x2e2d92ed22efd6667e8be87dd7fc6ff8fcde8f99e2ea9a669cf13a8c7496a651"
+subscriber_bind = "0x058db364cf113a85a779cd11d6a3fca04b10378c53cb1f086cba56106001720e"
+cap = "1000"
+r_cap = "0xca9"
+drawn = "600"
+r_k = "0xd4a"
+channel_id = "1"
+s_lo = "0xa7cfbb9e6051930fa3f7f5bd66c9d202"
+s_hi = "0x1512fadc1e5a6772f33b6ab3c677c1cc"
+merchant_pk = "0x1f5ee979311d4ff811ffa602775b2322fe9f5932e45d4a11c6d3d2f8d7614321"
+m_salt = "0x3e17"
+merchant_blinding = "222"
+merchant_rho = "333"
+subscriber_pk = "0x0e8fe8305c63daf67a1eaaad069e4c1c70711b36da38b52bdb4d23f6bf5c7626"
+s_salt = "0x5b17"
+subscriber_blinding = "444"
+subscriber_rho = "555"
+
+[pk]
+x = "0x102f436ca51e10edbcc14790feebb4d5f4859b103b735d38c5391829fc67833e"
+y = "0x01ee2d6fb91923147be9d69c48c1487eb75562f0a02de04ca52d3f2ec1d302b0"
+is_infinite = false
+
+[sig_r]
+x = "0x0cedf0ec95adaf1df3e425efc2382bf4cec5c2b663110a21e014c5869ebd6726"
+y = "0x2fc28988d4a06930b7aa9fe2825916b8e842a873aac34eb88fc425c72791307d"
+is_infinite = false

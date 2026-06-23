@@ -22,6 +22,7 @@ pub struct Config {
     pub split_verifier: Address,
     pub escrow_contribute_verifier: Address,
     pub escrow_payout_verifier: Address,
+    pub channel_close_verifier: Address,
     pub policy: Address,
     pub asp_root: U256,
     pub admin: Address,

@@ -13,6 +13,7 @@ pub mod split;
 pub mod deposit;
 pub mod withdraw;
 pub mod escrow;
+pub mod channel;
 
 /// Domain-separation tag for owner-key derivation (Z1 decision D4).
 /// Placeholder value (ASCII "ozky_own"); finalized before VK generation.

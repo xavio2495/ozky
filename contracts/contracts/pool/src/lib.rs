@@ -10,6 +10,7 @@
 //! conservation.
 
 mod assets;
+mod channel;
 mod config;
 mod domain;
 mod escrow;
@@ -87,6 +88,15 @@ pub enum Error {
     BadMode = 24,
     /// The passed running point `(raised_x, raised_y)` does not hash to `c_raised_new`.
     BadRaisedPoint = 25,
+    /// No channel exists for the given id.
+    NoSuchChannel = 26,
+    /// Channel is not Open (already closed or reclaimed).
+    ChannelClosed = 27,
+    /// `auth_key` public input does not equal the channel's stored signing-key handle.
+    BadAuthKey = 28,
+    /// `valid_after_ledger` public input is greater than the current ledger (drawing a future
+    /// period early).
+    ValidAfterNotReached = 29,
 }
 
 #[contract]
@@ -106,6 +116,7 @@ impl Pool {
         split_verifier: Address,
         escrow_contribute_verifier: Address,
         escrow_payout_verifier: Address,
+        channel_close_verifier: Address,
         policy: Address,
         asp_root: U256,
         admin: Address,
@@ -124,6 +135,7 @@ impl Pool {
                 split_verifier,
                 escrow_contribute_verifier,
                 escrow_payout_verifier,
+                channel_close_verifier,
                 policy,
                 asp_root,
                 admin,
@@ -503,6 +515,191 @@ impl Pool {
         escrow::next_id(&env)
     }
 
+    /// Open a subscription channel (subscriber). Spends one owned pool note of a HIDDEN `cap` via an
+    /// escrow_contribute-shaped proof (selector 5, reused frozen VK): the proof's `c_contrib` is the
+    /// cap commitment (provably commits to the vaulted amount) and its `refund_bind` becomes the
+    /// channel's `subscriber_bind`. `merchant_bind` / `auth_key` / `expiry` are subscriber-supplied
+    /// channel params; `merchant_enc` seals (cap, r_cap, salts, ramp) to the merchant. Returns the
+    /// channel id. (building block B phase 2)
+    /// Public inputs: the 14-field escrow_contribute layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_channel(
+        env: Env,
+        asset_tag: U256,
+        public_inputs: Bytes,
+        proof: Bytes,
+        change_enc: Bytes,
+        change_eph: BytesN<32>,
+        change_tag: u32,
+        merchant_bind: U256,
+        auth_key: U256,
+        expiry: u64,
+        merchant_enc: Bytes,
+    ) -> Result<u64, Error> {
+        let cfg = config::get(&env);
+        // A payout can only land in a real vault asset.
+        assets::get(&env, &asset_tag).ok_or(Error::AssetMismatch)?;
+        let f = inputs::read_fields(&env, &public_inputs, inputs::ESCROW_CONTRIBUTE_N)?;
+        check_common(&env, &cfg, &f, domain::SELECTOR_ESCROW_CONTRIBUTE, &asset_tag)?;
+        require_recent_root(&env, &f.get(3).unwrap())?;
+        require_asp_root(&cfg, &f.get(9).unwrap())?;
+        require_nullifier_base(&env, &f.get(4).unwrap())?;
+        // A channel is a single fold from the standard seed, so the cap commitment IS the proof's
+        // c_contrib (point_hash(Commit(cap, r_cap))). Bind c_raised_old to the seed so the cap was
+        // committed onto a known starting point (defensive; the cap soundness is c_contrib +
+        // in-circuit conservation, not the running commitment).
+        if f.get(10).unwrap() != escrow::init_c_raised(&env) {
+            return Err(Error::BadRaisedRoot);
+        }
+
+        verifier::verify(&env, &cfg.escrow_contribute_verifier, public_inputs, proof)?;
+
+        // Spend side: advance the nullifier accumulator, append the shielded change note.
+        nullifier::set_root(&env, &f.get(5).unwrap());
+        emit_nullifiers(&env, &f.get(6).unwrap(), &f.get(7).unwrap());
+        let leaf = tree::append(&env, &f.get(8).unwrap())?;
+        env.events().publish(
+            (symbol_short!("commit"), leaf),
+            (f.get(8).unwrap(), change_enc, change_eph, change_tag),
+        );
+
+        let cap_commitment = f.get(12).unwrap(); // c_contrib
+        let subscriber_bind = f.get(13).unwrap(); // refund_bind
+        let id = channel::open(
+            &env,
+            asset_tag.clone(),
+            cap_commitment,
+            auth_key,
+            merchant_bind,
+            subscriber_bind,
+            expiry,
+        );
+        // Emit the channel-open + the merchant secrets blob (cap, r_cap, salts, ramp) so the merchant
+        // can scan, decrypt, and later close.
+        env.events()
+            .publish((symbol_short!("chanopen"), id), (asset_tag, expiry, merchant_enc));
+        emit_roots(&env);
+        Ok(id)
+    }
+
+    /// Close a channel (merchant). Verifies a channel_close proof (selector 7) that opens the cap +
+    /// the subscriber-signed cumulative commitment, checks the subscriber's signature in-circuit,
+    /// and proves conservation; the contract asserts the proof's cap_hash / auth_key / merchant_bind
+    /// / subscriber_bind match the stored channel and that `valid_after_ledger` has elapsed, then
+    /// mints `drawn` to the merchant and `cap - drawn` to the subscriber. (building block B phase 2)
+    /// Public inputs: [domain_sep, asset_tag, epoch, cap_hash, auth_key, valid_after_ledger,
+    /// merchant_out, subscriber_out, merchant_bind, subscriber_bind].
+    #[allow(clippy::too_many_arguments)]
+    pub fn close_channel(
+        env: Env,
+        channel_id: u64,
+        public_inputs: Bytes,
+        proof: Bytes,
+        merchant_enc: Bytes,
+        merchant_eph: BytesN<32>,
+        merchant_tag: u32,
+        subscriber_enc: Bytes,
+        subscriber_eph: BytesN<32>,
+        subscriber_tag: u32,
+    ) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        let mut ch = channel::get(&env, channel_id).ok_or(Error::NoSuchChannel)?;
+        if ch.status != channel::STATUS_OPEN {
+            return Err(Error::ChannelClosed);
+        }
+        let f = inputs::read_fields(&env, &public_inputs, inputs::CHANNEL_CLOSE_N)?;
+        check_common(&env, &cfg, &f, domain::SELECTOR_CHANNEL_CLOSE, &ch.asset_tag)?;
+        if f.get(3).unwrap() != ch.cap_commitment {
+            return Err(Error::BadCommitmentHash);
+        }
+        if f.get(4).unwrap() != ch.auth_key {
+            return Err(Error::BadAuthKey);
+        }
+        // The signed period must have elapsed: valid_after_ledger <= current ledger.
+        let now = U256::from_u128(&env, env.ledger().sequence() as u128);
+        if f.get(5).unwrap() > now {
+            return Err(Error::ValidAfterNotReached);
+        }
+        if f.get(8).unwrap() != ch.merchant_bind {
+            return Err(Error::BadRecipientBind);
+        }
+        if f.get(9).unwrap() != ch.subscriber_bind {
+            return Err(Error::BadRecipientBind);
+        }
+
+        verifier::verify(&env, &cfg.channel_close_verifier, public_inputs, proof)?;
+
+        // Mint both notes (value already vaulted at open — no token move): drawn -> merchant,
+        // remainder -> subscriber.
+        let m_leaf = tree::append(&env, &f.get(6).unwrap())?;
+        env.events().publish(
+            (symbol_short!("commit"), m_leaf),
+            (f.get(6).unwrap(), merchant_enc, merchant_eph, merchant_tag),
+        );
+        let s_leaf = tree::append(&env, &f.get(7).unwrap())?;
+        env.events().publish(
+            (symbol_short!("commit"), s_leaf),
+            (f.get(7).unwrap(), subscriber_enc, subscriber_eph, subscriber_tag),
+        );
+
+        ch.status = channel::STATUS_CLOSED;
+        channel::set(&env, channel_id, &ch);
+        emit_roots(&env);
+        Ok(())
+    }
+
+    /// Reclaim the full cap (subscriber, expiry path): if the merchant never closed, after `expiry`
+    /// the subscriber sweeps the whole vaulted cap back. Verifies an escrow_payout proof (selector 6,
+    /// reused frozen VK) opening the cap commitment with floor 0, recipient_bind == subscriber_bind.
+    /// (building block B phase 2)
+    /// Public inputs: the 7-field escrow_payout layout (floor must be 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn channel_reclaim(
+        env: Env,
+        channel_id: u64,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_note: Bytes,
+        ephemeral_pub: BytesN<32>,
+        view_tag: u32,
+    ) -> Result<u32, Error> {
+        let cfg = config::get(&env);
+        let mut ch = channel::get(&env, channel_id).ok_or(Error::NoSuchChannel)?;
+        if ch.status != channel::STATUS_OPEN {
+            return Err(Error::ChannelClosed);
+        }
+        if (env.ledger().sequence() as u64) <= ch.expiry {
+            return Err(Error::DeadlineNotPassed);
+        }
+        let leaf = escrow_payout(
+            &env,
+            &cfg,
+            &ch.asset_tag,
+            &public_inputs,
+            proof,
+            &ch.cap_commitment,
+            &U256::from_u32(&env, 0),
+            &ch.subscriber_bind,
+            enc_note,
+            ephemeral_pub,
+            view_tag,
+        )?;
+        ch.status = channel::STATUS_CLOSED;
+        channel::set(&env, channel_id, &ch);
+        emit_roots(&env);
+        Ok(leaf)
+    }
+
+    /// Public channel state for the UI.
+    pub fn channel(env: Env, channel_id: u64) -> Result<channel::Channel, Error> {
+        channel::get(&env, channel_id).ok_or(Error::NoSuchChannel)
+    }
+
+    /// The id the next `open_channel` will assign (monotonic).
+    pub fn next_channel_id(env: Env) -> u64 {
+        channel::next_id(&env)
+    }
+
     /// Admin: upgrade the contract wasm in place (future features without redeploy).
     /// Testnet: dev-controlled; -> governance/multisig before mainnet (handoff §8).
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
@@ -823,6 +1020,7 @@ mod entrypoint_tests {
             (
                 pool_id.clone(),
                 network_id.clone(),
+                verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
@@ -1426,5 +1624,247 @@ mod entrypoint_tests {
         env.ledger().with_mut(|li| li.sequence_number = 200);
         let _ = release(&f, id, &payout_inputs(&f, c_raised, U256::from_u32(env, 0), 0xfee1, payee_bind));
         assert_eq!(f.pool().escrow(&id).status, escrow::STATUS_RELEASED);
+    }
+
+    // ----------------------------- channel (building block B phase 2) -----------------------------
+
+    /// Open a channel via the entrypoint: an escrow_contribute-shaped proof whose c_raised_old is the
+    /// seed, c_contrib is the cap commitment, refund_bind is the subscriber binding. Returns the id.
+    fn open_channel(
+        f: &Fixture,
+        cap_commitment: U256,
+        subscriber_bind: U256,
+        merchant_bind: U256,
+        auth_key: U256,
+        expiry: u64,
+    ) -> u64 {
+        let env = &f.env;
+        let seed = escrow::init_c_raised(env);
+        let pi = contribute_inputs(f, seed, U256::from_u32(env, 0xceee), cap_commitment, subscriber_bind, 0xaa);
+        f.pool().open_channel(
+            &f.asset_tag,
+            &pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &merchant_bind,
+            &auth_key,
+            &expiry,
+            &Bytes::new(env),
+        )
+    }
+
+    /// 10-field channel_close public inputs.
+    fn close_inputs(
+        f: &Fixture,
+        cap_hash: U256,
+        auth_key: U256,
+        valid_after: u64,
+        merchant_out: u32,
+        subscriber_out: u32,
+        merchant_bind: U256,
+        subscriber_bind: U256,
+    ) -> Bytes {
+        let env = &f.env;
+        let domain_sep =
+            domain::compute_domain_sep(env, &f.pool_id, &f.network_id, domain::SELECTOR_CHANNEL_CLOSE);
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0), // epoch 0
+                cap_hash,
+                auth_key,
+                U256::from_u128(env, valid_after as u128),
+                U256::from_u32(env, merchant_out),
+                U256::from_u32(env, subscriber_out),
+                merchant_bind,
+                subscriber_bind,
+            ],
+        )
+    }
+
+    fn try_close(f: &Fixture, id: u64, pi: &Bytes) -> Result<(), Error> {
+        let env = &f.env;
+        match f.pool().try_close_channel(
+            &id,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        ) {
+            Ok(Ok(())) => Ok(()),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected try_close_channel result: {other:?}"),
+        }
+    }
+
+    fn try_reclaim(f: &Fixture, id: u64, pi: &Bytes) -> Result<u32, Error> {
+        let env = &f.env;
+        match f.pool().try_channel_reclaim(
+            &id,
+            pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+        ) {
+            Ok(Ok(v)) => Ok(v),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected try_channel_reclaim result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_channel_records_state() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let cap = U256::from_u32(env, 0xca9);
+        let sub_bind = U256::from_u32(env, 0x5b01);
+        let mer_bind = U256::from_u32(env, 0x3e01);
+        let auth = U256::from_u32(env, 0xa07);
+        let id = open_channel(&f, cap.clone(), sub_bind.clone(), mer_bind.clone(), auth.clone(), 100);
+        assert_eq!(id, 0);
+        assert_eq!(f.pool().next_channel_id(), 1);
+        let ch = f.pool().channel(&id);
+        assert_eq!(ch.status, channel::STATUS_OPEN);
+        assert_eq!(ch.cap_commitment, cap);
+        assert_eq!(ch.subscriber_bind, sub_bind);
+        assert_eq!(ch.merchant_bind, mer_bind);
+        assert_eq!(ch.auth_key, auth);
+        assert_eq!(ch.expiry, 100);
+    }
+
+    #[test]
+    fn open_channel_rejects_non_seed_start() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        // c_raised_old != the seed -> the cap wasn't committed onto the known starting point.
+        let pi = contribute_inputs(
+            &f,
+            U256::from_u32(env, 0xdead),
+            U256::from_u32(env, 0xceee),
+            U256::from_u32(env, 0xca9),
+            U256::from_u32(env, 0x5b01),
+            0xaa,
+        );
+        let res = f.pool().try_open_channel(
+            &f.asset_tag,
+            &pi,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &U256::from_u32(env, 0x3e01),
+            &U256::from_u32(env, 0xa07),
+            &100u64,
+            &Bytes::new(env),
+        );
+        assert_eq!(res, Err(Ok(Error::BadRaisedRoot)));
+    }
+
+    #[test]
+    fn close_channel_validates_binds_and_mints_two_notes() {
+        use soroban_sdk::testutils::Ledger;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let cap = U256::from_u32(env, 0xca9);
+        let sub_bind = U256::from_u32(env, 0x5b01);
+        let mer_bind = U256::from_u32(env, 0x3e01);
+        let auth = U256::from_u32(env, 0xa07);
+        let id = open_channel(&f, cap.clone(), sub_bind.clone(), mer_bind.clone(), auth.clone(), 100);
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+
+        // wrong cap_hash / auth_key / valid_after(future) / binds each rejected.
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, U256::from_u32(env, 0xbad), auth.clone(), 10, 0xd1, 0xd2, mer_bind.clone(), sub_bind.clone())),
+            Err(Error::BadCommitmentHash)
+        );
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, cap.clone(), U256::from_u32(env, 0xbad), 10, 0xd1, 0xd2, mer_bind.clone(), sub_bind.clone())),
+            Err(Error::BadAuthKey)
+        );
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, cap.clone(), auth.clone(), 99, 0xd1, 0xd2, mer_bind.clone(), sub_bind.clone())),
+            Err(Error::ValidAfterNotReached)
+        );
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, cap.clone(), auth.clone(), 10, 0xd1, 0xd2, U256::from_u32(env, 0xbad), sub_bind.clone())),
+            Err(Error::BadRecipientBind)
+        );
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, cap.clone(), auth.clone(), 10, 0xd1, 0xd2, mer_bind.clone(), U256::from_u32(env, 0xbad))),
+            Err(Error::BadRecipientBind)
+        );
+
+        // a valid close mints both notes and closes the channel.
+        try_close(&f, id, &close_inputs(&f, cap.clone(), auth.clone(), 10, 0xdaa1, 0xdaa2, mer_bind.clone(), sub_bind.clone())).unwrap();
+        assert_eq!(f.pool().channel(&id).status, channel::STATUS_CLOSED);
+
+        // a second close is rejected (closed).
+        assert_eq!(
+            try_close(&f, id, &close_inputs(&f, cap, auth, 10, 0xdaa3, 0xdaa4, mer_bind, sub_bind)),
+            Err(Error::ChannelClosed)
+        );
+    }
+
+    #[test]
+    fn channel_reclaim_after_expiry_only() {
+        use soroban_sdk::testutils::Ledger;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let cap = U256::from_u32(env, 0xca9);
+        let sub_bind = U256::from_u32(env, 0x5b01);
+        let id = open_channel(&f, cap.clone(), sub_bind.clone(), U256::from_u32(env, 0x3e01), U256::from_u32(env, 0xa07), 100);
+
+        // before expiry: reclaim rejected.
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+        assert_eq!(
+            try_reclaim(&f, id, &payout_inputs(&f, cap.clone(), U256::from_u32(env, 0), 0xfee0, sub_bind.clone())),
+            Err(Error::DeadlineNotPassed)
+        );
+
+        // after expiry: reclaim (floor 0, cap commitment, subscriber_bind) succeeds and closes.
+        env.ledger().with_mut(|li| li.sequence_number = 200);
+        try_reclaim(&f, id, &payout_inputs(&f, cap.clone(), U256::from_u32(env, 0), 0xfee0, sub_bind.clone())).unwrap();
+        assert_eq!(f.pool().channel(&id).status, channel::STATUS_CLOSED);
+
+        // a second reclaim is rejected (closed).
+        assert_eq!(
+            try_reclaim(&f, id, &payout_inputs(&f, cap, U256::from_u32(env, 0), 0xfee1, sub_bind)),
+            Err(Error::ChannelClosed)
+        );
+    }
+
+    #[test]
+    fn channel_close_then_reclaim_blocked() {
+        use soroban_sdk::testutils::Ledger;
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let cap = U256::from_u32(env, 0xca9);
+        let sub_bind = U256::from_u32(env, 0x5b01);
+        let mer_bind = U256::from_u32(env, 0x3e01);
+        let auth = U256::from_u32(env, 0xa07);
+        let id = open_channel(&f, cap.clone(), sub_bind.clone(), mer_bind.clone(), auth.clone(), 100);
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+        try_close(&f, id, &close_inputs(&f, cap.clone(), auth, 10, 0xdaa1, 0xdaa2, mer_bind, sub_bind.clone())).unwrap();
+
+        // once closed, even past expiry the subscriber cannot reclaim (first-mover close wins).
+        env.ledger().with_mut(|li| li.sequence_number = 200);
+        assert_eq!(
+            try_reclaim(&f, id, &payout_inputs(&f, cap, U256::from_u32(env, 0), 0xfee0, sub_bind)),
+            Err(Error::ChannelClosed)
+        );
     }
 }

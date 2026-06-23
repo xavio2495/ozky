@@ -16,17 +16,28 @@ pub const MODE_KEEP_WHAT_YOU_RAISE: u32 = 1;
 pub const STATUS_OPEN: u32 = 0;
 pub const STATUS_RELEASED: u32 = 1;
 
-/// Seed for a fresh escrow's running commitment: the hash of the Pedersen identity point.
-/// = `point_hash(EmbeddedCurvePoint::point_at_infinity())` from the Noir circuit's
-/// `escrow::empty_raised_hash` (E3 parity-pinned). The contribute circuit folds the first
-/// contribution onto this exact value, so its `c_raised_old` for the first contribute equals it.
+/// Seed POINT for a fresh escrow's running commitment: the fixed generator `G1 = Commit(0, 1)`,
+/// NOT the identity. bb 0.87's `embedded_curve_add` blackbox rejects the point-at-infinity as an
+/// input (it on-curve-checks regardless of `is_infinite`), so the first contribution can't fold
+/// onto identity in a real proof. Seeding with G1 keeps every `p_old` a valid on-curve point; the
+/// `Commit(0, 1)` offset is absorbed at release as `blinding = ΣR + 1`. The contribute circuit
+/// takes `p_old` as input (no seed hardcoded), so the VK is unchanged — only this constant moved.
+const SEED_X: [u8; 32] = [
+    0x05, 0x4a, 0xa8, 0x6a, 0x73, 0xcb, 0x8a, 0x34, 0x52, 0x5e, 0x5b, 0xbe, 0xd6, 0xe4, 0x3b, 0xa1,
+    0x19, 0x8e, 0x86, 0x0f, 0x5f, 0x39, 0x50, 0x26, 0x8f, 0x71, 0xdf, 0x45, 0x91, 0xbd, 0xe4, 0x02,
+];
+const SEED_Y: [u8; 32] = [
+    0x20, 0x9d, 0xcf, 0xbf, 0x2c, 0xfb, 0x57, 0xf9, 0xf6, 0x04, 0x6f, 0x44, 0xd7, 0x1a, 0xc6, 0xfa,
+    0xf8, 0x72, 0x54, 0xaf, 0xc7, 0x40, 0x7c, 0x04, 0xeb, 0x62, 0x1a, 0x62, 0x87, 0xca, 0xc1, 0x26,
+];
+/// `point_hash(G1) = Poseidon2([G1.x, G1.y])` — the seed's running-commitment hash (E6 parity).
+const SEED_RAISED_HASH: [u8; 32] = [
+    0x27, 0x3a, 0x06, 0xc5, 0xfa, 0x48, 0xd9, 0x5f, 0x4b, 0xd3, 0x17, 0xe8, 0xd3, 0xf3, 0x26, 0x89,
+    0x1d, 0xda, 0xfe, 0x83, 0x65, 0xb2, 0x17, 0x16, 0xb1, 0xf4, 0x34, 0xcc, 0x63, 0xb8, 0x35, 0x4d,
+];
+
 pub fn init_c_raised(env: &Env) -> U256 {
-    const EMPTY_RAISED_HASH: [u8; 32] = [
-        0x0b, 0x63, 0xa5, 0x37, 0x87, 0x02, 0x1a, 0x4a, 0x96, 0x2a, 0x45, 0x2c, 0x29, 0x21, 0xb3,
-        0x66, 0x3a, 0xff, 0x1f, 0xfd, 0x8d, 0x55, 0x10, 0x54, 0x0f, 0x8e, 0x65, 0x9e, 0x78, 0x29,
-        0x56, 0xf1,
-    ];
-    U256::from_be_bytes(env, &Bytes::from_array(env, &EMPTY_RAISED_HASH))
+    U256::from_be_bytes(env, &Bytes::from_array(env, &SEED_RAISED_HASH))
 }
 
 #[contracttype]
@@ -41,7 +52,7 @@ pub struct Escrow {
     pub c_raised: U256,
     /// The running commitment POINT coordinates (x, y), cached so the NEXT contributor can read
     /// it to fold (the chain stores the hash for the chaining check; the point is needed as a
-    /// fold witness). Verified at contribute: `Poseidon(x, y) == c_raised`. Identity = (0, 0).
+    /// fold witness). Verified at contribute: `Poseidon(x, y) == c_raised`. Seeded to `G1` at open.
     pub raised_x: U256,
     pub raised_y: U256,
     pub n_contrib: u32,
@@ -93,8 +104,8 @@ pub fn open(
         mode,
         payee_bind,
         c_raised: init_c_raised(env),
-        raised_x: U256::from_u32(env, 0),
-        raised_y: U256::from_u32(env, 0),
+        raised_x: U256::from_be_bytes(env, &Bytes::from_array(env, &SEED_X)),
+        raised_y: U256::from_be_bytes(env, &Bytes::from_array(env, &SEED_Y)),
         n_contrib: 0,
         status: STATUS_OPEN,
     };

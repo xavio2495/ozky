@@ -223,8 +223,10 @@ pub fn contribute(
         return Err(CoreError::Proving("wallet not enrolled in this pool's ASP set".into()));
     }
 
-    // The escrow's running commitment point (identity until the first contribution).
-    let p_old = pedersen::point_from_coords(&st.raised_x, &st.raised_y, st.n_contrib == 0);
+    // The escrow's running commitment point. The contract seeds (raised_x, raised_y) to G1 at open
+    // and every fold yields a real point, so the stored coords are always a valid non-identity
+    // point (never the identity bb 0.87 rejects) — read them directly.
+    let p_old = pedersen::point_from_coords(&st.raised_x, &st.raised_y, false);
     let blinding_r = Fr::random();
     let contrib_salt = Fr::random();
     let change_blinding = Fr::random();
@@ -258,7 +260,7 @@ pub fn contribute(
 
     // The new running point (for the contract to cache so the next contributor can fold).
     let c = pedersen::commit(&Fr::from_u64(amount), &blinding_r);
-    let p_new = pedersen::add(&pedersen::point_from_coords(&st.raised_x, &st.raised_y, st.n_contrib == 0), &c);
+    let p_new = pedersen::add(&pedersen::point_from_coords(&st.raised_x, &st.raised_y, false), &c);
     let (raised_x, raised_y) = pedersen::coords(&p_new);
 
     // Encrypt the change note to self (the pool publishes no ciphertext for escrow change).
@@ -324,6 +326,9 @@ pub fn release(
     let payee_salt = Fr::from_hex(&opened.payee_salt).ok_or_else(|| CoreError::Crypto("payee_salt hex".into()))?;
     let floor = if st.mode == MODE_KEEP_WHAT_YOU_RAISE { 0 } else { st.target };
 
+    // The running commitment is G1 + Σ commit(vᵢ, rᵢ) = commit(S, ΣR + 1), since the escrow seeds
+    // its running point to G1 = commit(0, 1). Open it with blinding = ΣR + 1.
+    let seeded_r = pedersen::sum_blindings(&[total_r, Fr::from_u64(1)]);
     let out_blinding = Fr::random();
     let out_rho = Fr::random();
     let witness = PayoutWitness::build(
@@ -336,7 +341,7 @@ pub fn release(
             domain_bind: DOMAIN_ESCROW_PAYEE,
             recipient_sk: id.owner_sk,
             value: total_value,
-            blinding_r: total_r,
+            blinding_r: seeded_r,
             out_blinding,
             out_rho,
             salt: payee_salt,

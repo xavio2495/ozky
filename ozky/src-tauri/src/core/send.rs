@@ -949,33 +949,46 @@ mod tests {
         std::env::set_var("OZKY_REPO_ROOT", repo_root());
 
         // --- 1. Withdraw owned notes from the OLD pool back to the public account. ---
+        // Drain note-by-note (largest first, re-scanning each time): a single withdraw can only
+        // spend ONE note, so the balance can be fragmented across several. Force a fresh RPC scan
+        // each iteration and sleep one ledger so the spent note's nullifier propagates before the
+        // next selection (avoids re-picking a just-spent note).
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
         let mut old_cfg = PoolConfig::load().expect("old pool config (ozky.config.json)");
         old_cfg.relayer_secret = None;
-        let old_state = chain::pool_state(&old_cfg).unwrap();
-        let local = notes::load(&wallet).unwrap();
-        let owned = scan::owned_notes(&id, &old_state, &local, 0).unwrap();
-        let mut xlm_base: u64 = 0;
-        let mut usdc_base: u64 = 0;
-        let xlm_tag = Fr::from_u64(1).to_decimal();
-        let usdc_tag = Fr::from_u64(2).to_decimal();
-        for n in &owned {
-            if n.asset_tag.to_decimal() == xlm_tag {
-                xlm_base += n.value;
-            } else if n.asset_tag.to_decimal() == usdc_tag {
-                usdc_base += n.value;
+
+        let drain = |asset: &str| -> u64 {
+            let c = old_cfg.clone().with_asset(asset).unwrap();
+            let mut total: u64 = 0;
+            let mut done: Vec<u32> = Vec::new(); // leaf indices already withdrawn this run
+            loop {
+                let st = chain::pool_state(&c).unwrap();
+                let local = notes::load(&wallet).unwrap();
+                let mut owned: Vec<_> = scan::owned_notes(&id, &st, &local, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|n| n.asset_tag == c.asset_tag && !done.contains(&n.leaf_index))
+                    .collect();
+                if owned.is_empty() {
+                    break;
+                }
+                owned.sort_by_key(|n| std::cmp::Reverse(n.value));
+                let n = &owned[0];
+                // Withdraw exactly the note's value (no change). Picking the LARGEST means the
+                // verifier's `find(value >= amount)` resolves to this note, not a larger one.
+                withdraw::withdraw_with(&wallet, &c, &addr, n.value)
+                    .unwrap_or_else(|e| panic!("withdraw {asset} note {}: {e:?}", n.leaf_index));
+                eprintln!("withdrew {} {asset} base (note {})", n.value, n.leaf_index);
+                total += n.value;
+                done.push(n.leaf_index);
+                std::thread::sleep(std::time::Duration::from_secs(7));
             }
-        }
-        eprintln!("OLD pool owned: {} XLM base, {} USDC base", xlm_base, usdc_base);
-        if xlm_base > 0 {
-            let c = old_cfg.clone().with_asset("XLM").unwrap();
-            withdraw::withdraw_with(&wallet, &c, &addr, xlm_base).expect("withdraw XLM from old pool");
-            eprintln!("withdrew {} XLM base from old pool", xlm_base);
-        }
-        if usdc_base > 0 {
-            let c = old_cfg.clone().with_asset("USDC").unwrap();
-            withdraw::withdraw_with(&wallet, &c, &addr, usdc_base).expect("withdraw USDC from old pool");
-            eprintln!("withdrew {} USDC base from old pool", usdc_base);
-        }
+            total
+        };
+
+        let xlm_base = drain("XLM");
+        let usdc_base = drain("USDC");
+        eprintln!("OLD pool drained: {} XLM base, {} USDC base", xlm_base, usdc_base);
 
         // --- 2. Deploy the NEW escrow-capable pool (6 verifiers incl. escrow pair). ---
         let setup = format!(

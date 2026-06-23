@@ -172,10 +172,18 @@ pub fn point_hash(h: &Hasher, pt: &Point) -> Fr {
     h.hash(&[biguint_to_fr(&pt.x), biguint_to_fr(&pt.y)])
 }
 
-/// The seed every fresh escrow's running commitment starts from: `point_hash(identity)`.
-/// Must equal the contract's `escrow::init_c_raised` and the circuit's `empty_raised_hash`.
+/// The fixed non-identity seed point `G1 = commit(0, 1)` every fresh escrow's running commitment
+/// starts from. bb 0.87's `embedded_curve_add` rejects the identity as an input, so the first
+/// contribution folds onto G1 instead; the `commit(0,1)` offset is absorbed at release as
+/// `blinding = ΣR + 1`. Must match the contract's seeded `(raised_x, raised_y)`.
+pub fn seed_point() -> Point {
+    g1()
+}
+
+/// The seed every fresh escrow's running commitment hashes to: `point_hash(G1)`.
+/// Must equal the contract's `escrow::init_c_raised`.
 pub fn empty_raised_hash(h: &Hasher) -> Fr {
-    point_hash(h, &Point::identity())
+    point_hash(h, &seed_point())
 }
 
 #[cfg(test)]
@@ -183,8 +191,10 @@ mod tests {
     use super::*;
 
     // Reference vectors from claude-docs/escrow_parity.md (captured from the Noir circuit).
-    const EMPTY_RAISED_HASH: &str =
-        "0x0b63a53787021a4a962a452c2921b3663aff1ffd8d5510540f8e659e782956f1";
+    // The running-commitment seed is G1 = commit(0,1) (point_hash below), not the identity —
+    // bb 0.87 rejects identity as an embedded_curve_add input (see pedersen::seed_point).
+    const SEED_RAISED_HASH: &str =
+        "0x273a06c5fa48d95f4bd317e8d3f326891ddafe8365b21716b1f434cc63b8354d";
     const COMMIT_700_X: &str =
         "0x10e4cbe00548da97f3816bbfd7c18661f3da5072d6967fa5b01ffc8c07279c27";
     const COMMIT_700_Y: &str =
@@ -210,7 +220,7 @@ mod tests {
     #[test]
     fn empty_hash_matches_contract_seed() {
         let h = Hasher::new();
-        assert_eq!(empty_raised_hash(&h).to_hex(), EMPTY_RAISED_HASH);
+        assert_eq!(empty_raised_hash(&h).to_hex(), SEED_RAISED_HASH);
     }
 
     #[test]

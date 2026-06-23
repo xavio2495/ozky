@@ -30,6 +30,7 @@ pub mod keychain;
 pub mod keys;
 pub mod notes;
 pub mod payroll;
+pub mod pedersen;
 pub mod poseidon;
 pub mod price;
 pub mod proving;

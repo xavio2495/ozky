@@ -85,6 +85,8 @@ pub enum Error {
     RefundNotAllowed = 23,
     /// `mode` passed to `open_escrow` is not a valid escrow mode.
     BadMode = 24,
+    /// The passed running point `(raised_x, raised_y)` does not hash to `c_raised_new`.
+    BadRaisedPoint = 25,
 }
 
 #[contract]
@@ -330,6 +332,8 @@ impl Pool {
         change_eph: BytesN<32>,
         change_tag: u32,
         payee_enc: Bytes,
+        raised_x: U256,
+        raised_y: U256,
     ) -> Result<u32, Error> {
         let cfg = config::get(&env);
         let mut e = escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)?;
@@ -345,8 +349,17 @@ impl Pool {
         require_asp_root(&cfg, &f.get(9).unwrap())?;
         require_nullifier_base(&env, &f.get(4).unwrap())?;
         // Running-commitment chaining (same old/new pattern as the nullifier accumulator).
+        let c_raised_new = f.get(11).unwrap();
         if f.get(10).unwrap() != e.c_raised {
             return Err(Error::BadRaisedRoot);
+        }
+        // The passed running POINT (raised_x, raised_y) must hash to the proof's c_raised_new, so
+        // the cached point a later contributor reads is bound to the verified commitment.
+        let mut pt = Vec::new(&env);
+        pt.push_back(raised_x.clone());
+        pt.push_back(raised_y.clone());
+        if poseidon::hash(&env, &pt) != c_raised_new {
+            return Err(Error::BadRaisedPoint);
         }
 
         verifier::verify(&env, &cfg.escrow_contribute_verifier, public_inputs, proof)?;
@@ -360,7 +373,9 @@ impl Pool {
         );
 
         let idx = e.n_contrib;
-        e.c_raised = f.get(11).unwrap();
+        e.c_raised = c_raised_new;
+        e.raised_x = raised_x;
+        e.raised_y = raised_y;
         e.n_contrib += 1;
         escrow::set(&env, escrow_id, &e);
         escrow::set_contrib(
@@ -480,6 +495,12 @@ impl Pool {
     /// Public escrow state for the UI.
     pub fn escrow(env: Env, escrow_id: u64) -> Result<escrow::Escrow, Error> {
         escrow::get(&env, escrow_id).ok_or(Error::NoSuchEscrow)
+    }
+
+    /// The id the next `open_escrow` will assign (monotonic). Lets the opener learn its escrow's
+    /// id deterministically (the wallet submits one open at a time).
+    pub fn next_escrow_id(env: Env) -> u64 {
+        escrow::next_id(&env)
     }
 
     /// Admin: upgrade the contract wasm in place (future features without redeploy).
@@ -1129,7 +1150,17 @@ mod entrypoint_tests {
         )
     }
 
-    fn do_contribute(f: &Fixture, id: u64, pi: &Bytes) -> u32 {
+    /// Hash a running point `(px, py)` the way the contract does — so the stub-verifier tests can
+    /// pass a `c_raised_new` that satisfies the on-chain `Poseidon(raised_x, raised_y)` check.
+    fn pt_hash(f: &Fixture, px: u32, py: u32) -> U256 {
+        let env = &f.env;
+        let mut pt = Vec::new(env);
+        pt.push_back(U256::from_u32(env, px));
+        pt.push_back(U256::from_u32(env, py));
+        poseidon::hash(env, &pt)
+    }
+
+    fn do_contribute(f: &Fixture, id: u64, pi: &Bytes, px: u32, py: u32) -> u32 {
         let env = &f.env;
         f.pool().escrow_contribute(
             &id,
@@ -1140,7 +1171,19 @@ mod entrypoint_tests {
             &BytesN::from_array(env, &[0u8; 32]),
             &0u32,
             &Bytes::new(env),
+            &U256::from_u32(env, px),
+            &U256::from_u32(env, py),
         )
+    }
+
+    /// One valid contribution: reads the escrow's current `c_raised` as the old root, folds to a
+    /// chosen point `(px, py)` whose hash becomes the new root, and submits. Returns the index.
+    fn contribute_step(f: &Fixture, id: u64, px: u32, py: u32, refund_bind: U256, change_cm: u32) -> u32 {
+        let env = &f.env;
+        let c_old = f.pool().escrow(&id).c_raised;
+        let c_new = pt_hash(f, px, py);
+        let pi = contribute_inputs(f, c_old, c_new, U256::from_u32(env, 0xc1), refund_bind, change_cm);
+        do_contribute(f, id, &pi, px, py)
     }
 
     fn release(f: &Fixture, id: u64, pi: &Bytes) -> u32 {
@@ -1234,30 +1277,23 @@ mod entrypoint_tests {
         let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
 
         let seed = escrow::init_c_raised(env);
-        let c1 = U256::from_u32(env, 0x1111);
-        let idx = do_contribute(
-            &f,
-            id,
-            &contribute_inputs(&f, seed.clone(), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0xbb01), 0xaa),
-        );
+        // first contribution: fold to point (0x100, 0x101); c_raised := hash(point).
+        let idx = contribute_step(&f, id, 0x100, 0x101, U256::from_u32(env, 0xbb01), 0xaa);
         assert_eq!(idx, 0);
         let e = f.pool().escrow(&id);
-        assert_eq!(e.c_raised, c1);
+        assert_eq!(e.c_raised, pt_hash(&f, 0x100, 0x101));
+        assert_eq!(e.raised_x, U256::from_u32(env, 0x100));
+        assert_eq!(e.raised_y, U256::from_u32(env, 0x101));
         assert_eq!(e.n_contrib, 1);
 
-        // second contribution chains from c1 -> c2
-        let c2 = U256::from_u32(env, 0x2222);
-        let idx2 = do_contribute(
-            &f,
-            id,
-            &contribute_inputs(&f, c1.clone(), c2.clone(), U256::from_u32(env, 0xc2), U256::from_u32(env, 0xbb02), 0xbb),
-        );
+        // second contribution chains from the stored point to a new one.
+        let idx2 = contribute_step(&f, id, 0x200, 0x201, U256::from_u32(env, 0xbb02), 0xbb);
         assert_eq!(idx2, 1);
-        assert_eq!(f.pool().escrow(&id).c_raised, c2);
+        assert_eq!(f.pool().escrow(&id).c_raised, pt_hash(&f, 0x200, 0x201));
 
-        // a contribute with a STALE c_raised_old (reusing the seed) is rejected
-        let pi_bad =
-            contribute_inputs(&f, seed, U256::from_u32(env, 0x3333), U256::from_u32(env, 0xc3), U256::from_u32(env, 0xbb03), 0xcc);
+        // a contribute with a STALE c_raised_old (reusing the seed) is rejected.
+        let c_new = pt_hash(&f, 0x300, 0x301);
+        let pi_bad = contribute_inputs(&f, seed, c_new, U256::from_u32(env, 0xc3), U256::from_u32(env, 0xbb03), 0xcc);
         let res = f.pool().try_escrow_contribute(
             &id,
             &f.asset_tag,
@@ -1267,8 +1303,27 @@ mod entrypoint_tests {
             &BytesN::from_array(env, &[0u8; 32]),
             &0u32,
             &Bytes::new(env),
+            &U256::from_u32(env, 0x300),
+            &U256::from_u32(env, 0x301),
         );
         assert_eq!(res, Err(Ok(Error::BadRaisedRoot)));
+
+        // a contribute whose passed point does NOT hash to c_raised_new is rejected.
+        let c_old_now = f.pool().escrow(&id).c_raised;
+        let pi_mismatch = contribute_inputs(&f, c_old_now, pt_hash(&f, 0x400, 0x401), U256::from_u32(env, 0xc4), U256::from_u32(env, 0xbb04), 0xdd);
+        let res2 = f.pool().try_escrow_contribute(
+            &id,
+            &f.asset_tag,
+            &pi_mismatch,
+            &Bytes::new(env),
+            &Bytes::new(env),
+            &BytesN::from_array(env, &[0u8; 32]),
+            &0u32,
+            &Bytes::new(env),
+            &U256::from_u32(env, 0x999), // wrong point
+            &U256::from_u32(env, 0x998),
+        );
+        assert_eq!(res2, Err(Ok(Error::BadRaisedPoint)));
     }
 
     #[test]
@@ -1277,22 +1332,18 @@ mod entrypoint_tests {
         let env = &f.env;
         prime_recent_root(&f);
         let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
-        let c1 = U256::from_u32(env, 0x1111);
-        do_contribute(
-            &f,
-            id,
-            &contribute_inputs(&f, escrow::init_c_raised(env), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0xbb01), 0xaa),
-        );
+        contribute_step(&f, id, 0x100, 0x101, U256::from_u32(env, 0xbb01), 0xaa);
+        let c_raised = f.pool().escrow(&id).c_raised; // release opens the running commitment
         let payee_bind = U256::from_u32(env, 0x9001);
         let target = U256::from_u128(env, 1000);
 
         // wrong recipient_bind / floor / commitment_hash each rejected
         assert_eq!(
-            try_release(&f, id, &payout_inputs(&f, c1.clone(), target.clone(), 0xfee1, U256::from_u32(env, 0xbad))),
+            try_release(&f, id, &payout_inputs(&f, c_raised.clone(), target.clone(), 0xfee1, U256::from_u32(env, 0xbad))),
             Err(Error::BadRecipientBind)
         );
         assert_eq!(
-            try_release(&f, id, &payout_inputs(&f, c1.clone(), U256::from_u128(env, 999), 0xfee1, payee_bind.clone())),
+            try_release(&f, id, &payout_inputs(&f, c_raised.clone(), U256::from_u128(env, 999), 0xfee1, payee_bind.clone())),
             Err(Error::BadFloor)
         );
         assert_eq!(
@@ -1301,12 +1352,12 @@ mod entrypoint_tests {
         );
 
         // correct release succeeds and closes the escrow
-        let _leaf = release(&f, id, &payout_inputs(&f, c1.clone(), target.clone(), 0xfee1, payee_bind.clone()));
+        let _leaf = release(&f, id, &payout_inputs(&f, c_raised.clone(), target.clone(), 0xfee1, payee_bind.clone()));
         assert_eq!(f.pool().escrow(&id).status, escrow::STATUS_RELEASED);
 
         // a second release is rejected (closed)
         assert_eq!(
-            try_release(&f, id, &payout_inputs(&f, c1, target, 0xfee2, payee_bind)),
+            try_release(&f, id, &payout_inputs(&f, c_raised, target, 0xfee2, payee_bind)),
             Err(Error::EscrowClosed)
         );
     }
@@ -1319,11 +1370,8 @@ mod entrypoint_tests {
         prime_recent_root(&f);
         let id = open_basic(&f, escrow::MODE_ALL_OR_NOTHING, 1000, 100, 0x9001);
         let refund_bind = U256::from_u32(env, 0xbb01);
-        do_contribute(
-            &f,
-            id,
-            &contribute_inputs(&f, escrow::init_c_raised(env), U256::from_u32(env, 0x1111), U256::from_u32(env, 0xc1), refund_bind.clone(), 0xaa),
-        );
+        // contribution stores c_contrib = 0xc1 (refund opens THAT, not the running commitment).
+        contribute_step(&f, id, 0x100, 0x101, refund_bind.clone(), 0xaa);
 
         // before the deadline: refund rejected
         env.ledger().with_mut(|li| li.sequence_number = 50);
@@ -1363,24 +1411,20 @@ mod entrypoint_tests {
         let env = &f.env;
         prime_recent_root(&f);
         let id = open_basic(&f, escrow::MODE_KEEP_WHAT_YOU_RAISE, 1000, 100, 0x9001);
-        let c1 = U256::from_u32(env, 0x1111);
-        do_contribute(
-            &f,
-            id,
-            &contribute_inputs(&f, escrow::init_c_raised(env), c1.clone(), U256::from_u32(env, 0xc1), U256::from_u32(env, 0x1), 0xaa),
-        );
+        contribute_step(&f, id, 0x100, 0x101, U256::from_u32(env, 0x1), 0xaa);
+        let c_raised = f.pool().escrow(&id).c_raised;
         let payee_bind = U256::from_u32(env, 0x9001);
 
         // before deadline: keep-what-you-raise release needs the deadline passed (floor=0)
         env.ledger().with_mut(|li| li.sequence_number = 50);
         assert_eq!(
-            try_release(&f, id, &payout_inputs(&f, c1.clone(), U256::from_u32(env, 0), 0xfee1, payee_bind.clone())),
+            try_release(&f, id, &payout_inputs(&f, c_raised.clone(), U256::from_u32(env, 0), 0xfee1, payee_bind.clone())),
             Err(Error::DeadlineNotPassed)
         );
 
         // after deadline: succeeds at floor=0 (any amount)
         env.ledger().with_mut(|li| li.sequence_number = 200);
-        let _ = release(&f, id, &payout_inputs(&f, c1, U256::from_u32(env, 0), 0xfee1, payee_bind));
+        let _ = release(&f, id, &payout_inputs(&f, c_raised, U256::from_u32(env, 0), 0xfee1, payee_bind));
         assert_eq!(f.pool().escrow(&id).status, escrow::STATUS_RELEASED);
     }
 }

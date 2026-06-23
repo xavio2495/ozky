@@ -447,6 +447,237 @@ impl WithdrawWitness {
     }
 }
 
+// ----------------------------- escrow (building block B) -----------------------------
+
+use super::pedersen::{self, Point};
+use super::poseidon::{DOMAIN_ESCROW_REFUND};
+
+/// Escrow contribute witness: a withdraw-shaped spend that folds a HIDDEN `amount` into the
+/// running Pedersen commitment. Public inputs in the canonical 14-field order.
+pub struct ContributeWitness {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub commitment_root: Fr,
+    pub nullifier_old_root: Fr,
+    pub nullifier_new_root: Fr,
+    pub nullifiers: [Fr; 2],
+    pub change_commitment: Fr,
+    pub asp_root: Fr,
+    pub c_raised_old: Fr,
+    pub c_raised_new: Fr,
+    pub c_contrib: Fr,
+    pub refund_bind: Fr,
+    // private
+    pub owner_sk: Fr,
+    pub inputs: [InputWitness; 2],
+    pub change: OutputWitness,
+    pub amount: Fr,
+    pub blinding_r: Fr,
+    pub contrib_salt: Fr,
+    /// The prior running commitment point (identity for the first contribution).
+    pub p_old_x: Fr,
+    pub p_old_y: Fr,
+    pub p_old_inf: bool,
+}
+
+pub struct ContributeInputs<'a> {
+    pub owner_sk: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub note_epoch: Fr,
+    pub domain_sep: Fr,
+    pub note_value: u64,
+    pub note_blinding: Fr,
+    pub note_rho: Fr,
+    pub note_leaf_index: usize,
+    pub commitment_leaves: &'a [Fr],
+    pub asp_leaves: &'a [Fr],
+    pub prior_nullifiers: &'a [Fr],
+    pub dummy_rho: Fr,
+    /// The hidden contribution amount (folded into the running commitment).
+    pub amount: u64,
+    pub blinding_r: Fr,
+    pub contrib_salt: Fr,
+    pub change_blinding: Fr,
+    pub change_rho: Fr,
+    /// The escrow's current running commitment POINT (identity for the first contribution).
+    pub p_old: Point,
+}
+
+impl ContributeWitness {
+    pub fn build(h: &Hasher, p: ContributeInputs) -> ContributeWitness {
+        let owner_pk = h.owner_pk(&p.owner_sk);
+        let nf0 = h.nullifier(&p.note_rho, &p.owner_sk);
+        let nf1 = h.nullifier(&p.dummy_rho, &p.owner_sk);
+        let (nf_old, nf_new, w0, w1) = build_two_insertions(h, p.prior_nullifiers, nf0, nf1);
+
+        let real_note = SpendNote {
+            value: p.note_value,
+            blinding: p.note_blinding,
+            epoch: p.note_epoch,
+            rho: p.note_rho,
+            leaf_index: p.note_leaf_index,
+        };
+        let real_in = real_input(h, &real_note, p.commitment_leaves, p.asp_leaves, owner_pk, w0);
+        let dummy_in = dummy_input(p.epoch, p.dummy_rho, w1);
+
+        let change = OutputWitness {
+            value: Fr::from_u64(p.note_value - p.amount),
+            owner_pk,
+            blinding: p.change_blinding,
+            rho: p.change_rho,
+        };
+
+        // Pedersen fold: c = commit(amount, r); p_new = p_old + c. The contract checks
+        // c_raised_old == stored and stores c_raised_new (running-sum induction).
+        let amount = Fr::from_u64(p.amount);
+        let c = pedersen::commit(&amount, &p.blinding_r);
+        let p_new = pedersen::add(&p.p_old, &c);
+        let (p_old_x, p_old_y) = pedersen::coords(&p.p_old);
+
+        ContributeWitness {
+            domain_sep: p.domain_sep,
+            asset_tag: p.asset_tag,
+            epoch: p.epoch,
+            commitment_root: real_in.cm.root,
+            nullifier_old_root: nf_old,
+            nullifier_new_root: nf_new,
+            nullifiers: [nf0, nf1],
+            change_commitment: change.commitment(h, &p.asset_tag, &p.epoch),
+            asp_root: real_in.asp.root,
+            c_raised_old: pedersen::point_hash(h, &p.p_old),
+            c_raised_new: pedersen::point_hash(h, &p_new),
+            c_contrib: pedersen::point_hash(h, &c),
+            refund_bind: h.escrow_bind(DOMAIN_ESCROW_REFUND, &owner_pk, &p.contrib_salt),
+            owner_sk: p.owner_sk,
+            inputs: [real_in, dummy_in],
+            change,
+            amount,
+            blinding_r: p.blinding_r,
+            contrib_salt: p.contrib_salt,
+            p_old_x,
+            p_old_y,
+            p_old_inf: p.p_old.inf,
+        }
+    }
+
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_tag = {}\n", q(&self.asset_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("commitment_root = {}\n", q(&self.commitment_root)));
+        s.push_str(&format!("nullifier_old_root = {}\n", q(&self.nullifier_old_root)));
+        s.push_str(&format!("nullifier_new_root = {}\n", q(&self.nullifier_new_root)));
+        s.push_str(&format!("nullifiers = {}\n", fr_array(&self.nullifiers)));
+        s.push_str(&format!("change_commitment = {}\n", q(&self.change_commitment)));
+        s.push_str(&format!("asp_root = {}\n", q(&self.asp_root)));
+        s.push_str(&format!("c_raised_old = {}\n", q(&self.c_raised_old)));
+        s.push_str(&format!("c_raised_new = {}\n", q(&self.c_raised_new)));
+        s.push_str(&format!("c_contrib = {}\n", q(&self.c_contrib)));
+        s.push_str(&format!("refund_bind = {}\n", q(&self.refund_bind)));
+        s.push_str(&format!("owner_sk = {}\n", q(&self.owner_sk)));
+        s.push_str(&format!("amount = {}\n", q(&self.amount)));
+        s.push_str(&format!("blinding_r = {}\n", q(&self.blinding_r)));
+        s.push_str(&format!("contrib_salt = {}\n", q(&self.contrib_salt)));
+        s.push_str(&input_block(&self.inputs[0]));
+        s.push_str(&input_block(&self.inputs[1]));
+        s.push_str("\n[change]\n");
+        s.push_str(&format!("value = {}\n", q(&self.change.value)));
+        s.push_str(&format!("owner_pk = {}\n", q(&self.change.owner_pk)));
+        s.push_str(&format!("blinding = {}\n", q(&self.change.blinding)));
+        s.push_str(&format!("rho = {}\n", q(&self.change.rho)));
+        s.push_str("\n[p_old]\n");
+        s.push_str(&format!("x = {}\n", q(&self.p_old_x)));
+        s.push_str(&format!("y = {}\n", q(&self.p_old_y)));
+        s.push_str(&format!("is_infinite = {}\n", self.p_old_inf));
+        s
+    }
+}
+
+/// Escrow payout witness (release & refund): open a Pedersen commitment to `value`, prove
+/// `value >= floor`, mint a note of `value` to the recipient-bound key. Public inputs (7 fields).
+pub struct PayoutWitness {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub commitment_hash: Fr,
+    pub floor: Fr,
+    pub out_commitment: Fr,
+    pub recipient_bind: Fr,
+    // private
+    pub domain_bind: Fr,
+    pub recipient_sk: Fr,
+    pub value: Fr,
+    pub blinding_r: Fr,
+    pub out_blinding: Fr,
+    pub out_rho: Fr,
+    pub salt: Fr,
+}
+
+pub struct PayoutInputs {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub floor: u64,
+    /// Binding domain: `DOMAIN_ESCROW_PAYEE` (release) or `_REFUND` (refund).
+    pub domain_bind: u64,
+    pub recipient_sk: Fr,
+    /// The opened committed value (the running total for release, the contribution for refund).
+    pub value: u64,
+    /// The opening blinding (sum of contributors' `r` for release, the contribution `r` for refund).
+    pub blinding_r: Fr,
+    pub out_blinding: Fr,
+    pub out_rho: Fr,
+    pub salt: Fr,
+}
+
+impl PayoutWitness {
+    pub fn build(h: &Hasher, p: PayoutInputs) -> PayoutWitness {
+        let value = Fr::from_u64(p.value);
+        let recipient_pk = h.owner_pk(&p.recipient_sk);
+        let c = pedersen::commit(&value, &p.blinding_r);
+        let out_commitment =
+            h.commitment(&value, &p.asset_tag, &recipient_pk, &p.out_blinding, &p.epoch, &p.out_rho);
+        PayoutWitness {
+            domain_sep: p.domain_sep,
+            asset_tag: p.asset_tag,
+            epoch: p.epoch,
+            commitment_hash: pedersen::point_hash(h, &c),
+            floor: Fr::from_u64(p.floor),
+            out_commitment,
+            recipient_bind: h.escrow_bind(p.domain_bind, &recipient_pk, &p.salt),
+            domain_bind: Fr::from_u64(p.domain_bind),
+            recipient_sk: p.recipient_sk,
+            value,
+            blinding_r: p.blinding_r,
+            out_blinding: p.out_blinding,
+            out_rho: p.out_rho,
+            salt: p.salt,
+        }
+    }
+
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_tag = {}\n", q(&self.asset_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("commitment_hash = {}\n", q(&self.commitment_hash)));
+        s.push_str(&format!("floor = {}\n", q(&self.floor)));
+        s.push_str(&format!("out_commitment = {}\n", q(&self.out_commitment)));
+        s.push_str(&format!("recipient_bind = {}\n", q(&self.recipient_bind)));
+        s.push_str(&format!("domain_bind = {}\n", q(&self.domain_bind)));
+        s.push_str(&format!("recipient_sk = {}\n", q(&self.recipient_sk)));
+        s.push_str(&format!("value = {}\n", q(&self.value)));
+        s.push_str(&format!("blinding_r = {}\n", q(&self.blinding_r)));
+        s.push_str(&format!("out_blinding = {}\n", q(&self.out_blinding)));
+        s.push_str(&format!("out_rho = {}\n", q(&self.out_rho)));
+        s.push_str(&format!("salt = {}\n", q(&self.salt)));
+        s
+    }
+}
+
 // ----------------------------- Spend assembly + demos -----------------------------
 
 /// A note this wallet owns and can spend (the spendable inputs to a transfer/withdraw).
@@ -1027,5 +1258,95 @@ mod tests {
         assert_eq!(toml.matches("[[outputs]]").count(), N_SPLIT_OUTPUTS);
         assert!(toml.contains("owner_sk = \"0x3039\""));
         assert!(toml.contains("[inputs.nf_low]"));
+    }
+
+    // ----- escrow witness parity (vs the Noir demos, captured 2026-06-23) -----
+    // The escrow-specific public values of `notes::escrow::{contribute_demo, payout_demo}`
+    // (epoch 5, domain_sep 0xabc). If the native builders reproduce these, they match the
+    // circuit's derivation of the Pedersen + binding fields.
+
+    use super::super::poseidon::DOMAIN_ESCROW_PAYEE;
+
+    /// Reproduces the Noir `contribute_demo_at` via [`ContributeWitness::build`].
+    fn contribute_demo(h: &Hasher) -> ContributeWitness {
+        let asset_tag = Fr::from_u64(1);
+        let epoch = Fr::from_u64(5);
+        let owner_sk = Fr::from_u64(12345);
+        let owner_pk = h.owner_pk(&owner_sk);
+        let in_commitment = h.commitment(
+            &Fr::from_u64(1000), &asset_tag, &owner_pk, &Fr::from_u64(777), &epoch, &Fr::from_u64(111),
+        );
+        ContributeWitness::build(
+            h,
+            ContributeInputs {
+                owner_sk,
+                asset_tag,
+                epoch,
+                note_epoch: epoch,
+                domain_sep: Fr::from_u64(0xabc),
+                note_value: 1000,
+                note_blinding: Fr::from_u64(777),
+                note_rho: Fr::from_u64(111),
+                note_leaf_index: 0,
+                commitment_leaves: &[in_commitment],
+                asp_leaves: &[owner_pk],
+                prior_nullifiers: &[],
+                dummy_rho: Fr::from_u64(0xdead),
+                amount: 700,
+                blinding_r: Fr::from_u64(0xb11d),
+                contrib_salt: Fr::from_u64(0x5a17),
+                change_blinding: Fr::from_u64(444),
+                change_rho: Fr::from_u64(555),
+                p_old: super::super::pedersen::Point::identity(),
+            },
+        )
+    }
+
+    #[test]
+    fn contribute_witness_matches_noir_demo() {
+        let h = Hasher::new();
+        let w = contribute_demo(&h);
+        assert_eq!(w.c_raised_old.to_hex(),
+            "0x0b63a53787021a4a962a452c2921b3663aff1ffd8d5510540f8e659e782956f1", "c_raised_old");
+        assert_eq!(w.c_raised_new.to_hex(),
+            "0x0467924615dd23f09f9b1ab6aaee224abe0ca3febf75aa9842df18d70422e449", "c_raised_new");
+        assert_eq!(w.c_contrib.to_hex(),
+            "0x0467924615dd23f09f9b1ab6aaee224abe0ca3febf75aa9842df18d70422e449", "c_contrib");
+        assert_eq!(w.refund_bind.to_hex(),
+            "0x2cb9678816a794efd76a759b84fb2b965cfbbe6a67ab2d4cb8f522f00758ffeb", "refund_bind");
+        assert_eq!(w.change_commitment.to_hex(),
+            "0x27f831ed3b6cd55e06303ffd1e3836e4a60119de767c1caeb859b96e737c02e3", "change_commitment");
+        // Prover.toml carries the point table + the new escrow fields.
+        let toml = w.to_prover_toml();
+        assert!(toml.contains("[p_old]"));
+        assert!(toml.contains("is_infinite = true"));
+        assert!(toml.contains("c_raised_new ="));
+    }
+
+    #[test]
+    fn payout_witness_matches_noir_demo() {
+        let h = Hasher::new();
+        let w = PayoutWitness::build(
+            &h,
+            PayoutInputs {
+                domain_sep: Fr::from_u64(0xabc),
+                asset_tag: Fr::from_u64(1),
+                epoch: Fr::from_u64(5),
+                floor: 500,
+                domain_bind: DOMAIN_ESCROW_PAYEE,
+                recipient_sk: Fr::from_u64(99),
+                value: 700,
+                blinding_r: Fr::from_u64(0xb11d),
+                out_blinding: Fr::from_u64(222),
+                out_rho: Fr::from_u64(333),
+                salt: Fr::from_u64(0x9a17),
+            },
+        );
+        assert_eq!(w.commitment_hash.to_hex(),
+            "0x0467924615dd23f09f9b1ab6aaee224abe0ca3febf75aa9842df18d70422e449", "commitment_hash");
+        assert_eq!(w.out_commitment.to_hex(),
+            "0x2940974a422a3491d0d2872653520132b05a40b48e2570daeeaa6380e7ad7a17", "out_commitment");
+        assert_eq!(w.recipient_bind.to_hex(),
+            "0x1b1f9287484b321f50a6fd56b221a4d5fcb7e9eba6802fed96ec5a3005372a68", "recipient_bind");
     }
 }

@@ -12,7 +12,9 @@
 //! - **Docker fallback** (when `OZKY_PROVER_BIN` is unset): `nargo execute` + `bb prove`
 //!   + `bb verify` in the ZK container (the toolchain that froze the VKs).
 
-use super::witness::{DepositWitness, SplitWitness, TransferWitness, WithdrawWitness};
+use super::witness::{
+    ContributeWitness, DepositWitness, PayoutWitness, SplitWitness, TransferWitness, WithdrawWitness,
+};
 use super::CoreError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +31,8 @@ pub enum Circuit {
     Transfer,
     Withdraw,
     Split,
+    EscrowContribute,
+    EscrowPayout,
 }
 
 impl Circuit {
@@ -38,6 +42,8 @@ impl Circuit {
             Circuit::Transfer => "transfer",
             Circuit::Withdraw => "withdraw",
             Circuit::Split => "split",
+            Circuit::EscrowContribute => "escrow_contribute",
+            Circuit::EscrowPayout => "escrow_payout",
         }
     }
 }
@@ -154,6 +160,16 @@ pub fn prove_withdraw_witness(w: &WithdrawWitness) -> Result<ProofBundle, CoreEr
 /// Prove a split (2-in / 8-out) from a fully-built witness, verifying against the frozen VK.
 pub fn prove_split_witness(w: &SplitWitness) -> Result<ProofBundle, CoreError> {
     prove(Circuit::Split, &w.to_prover_toml())
+}
+
+/// Prove an escrow contribute (withdraw-shaped spend + Pedersen fold) against the frozen VK.
+pub fn prove_escrow_contribute_witness(w: &ContributeWitness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::EscrowContribute, &w.to_prover_toml())
+}
+
+/// Prove an escrow payout (release/refund: open commitment, V>=floor, mint) against the frozen VK.
+pub fn prove_escrow_payout_witness(w: &PayoutWitness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::EscrowPayout, &w.to_prover_toml())
 }
 
 // --- Command-facing entrypoints -------------------------------------------------

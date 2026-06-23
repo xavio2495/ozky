@@ -39,6 +39,11 @@ pub struct Escrow {
     pub payee_bind: U256,
     /// Poseidon(x,y) of the running Pedersen commitment to the hidden total (opaque).
     pub c_raised: U256,
+    /// The running commitment POINT coordinates (x, y), cached so the NEXT contributor can read
+    /// it to fold (the chain stores the hash for the chaining check; the point is needed as a
+    /// fold witness). Verified at contribute: `Poseidon(x, y) == c_raised`. Identity = (0, 0).
+    pub raised_x: U256,
+    pub raised_y: U256,
     pub n_contrib: u32,
     pub status: u32,
 }
@@ -88,6 +93,8 @@ pub fn open(
         mode,
         payee_bind,
         c_raised: init_c_raised(env),
+        raised_x: U256::from_u32(env, 0),
+        raised_y: U256::from_u32(env, 0),
         n_contrib: 0,
         status: STATUS_OPEN,
     };

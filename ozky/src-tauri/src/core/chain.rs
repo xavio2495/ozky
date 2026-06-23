@@ -914,6 +914,206 @@ pub fn submit_withdraw(
     invoke_contract(cfg, source_secret, &cfg.pool_contract, "withdraw", args)
 }
 
+// ----------------------------- escrow (building block B) -----------------------------
+
+/// Public escrow state read from the pool's `escrow(id)` view (the fields the client needs).
+pub struct EscrowState {
+    pub asset_tag: Fr,
+    pub target: u64,
+    pub deadline: u64,
+    pub mode: u32,
+    pub payee_bind: Fr,
+    pub c_raised: Fr,
+    /// The running commitment point coordinates (identity = (0,0)), for the next contributor's fold.
+    pub raised_x: Fr,
+    pub raised_y: Fr,
+    pub n_contrib: u32,
+    pub status: u32,
+}
+
+fn sc_u64(n: u64) -> ScVal {
+    ScVal::U64(n)
+}
+
+fn u256_to_fr(v: &ScVal) -> Option<Fr> {
+    if let ScVal::U256(p) = v {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&p.hi_hi.to_be_bytes());
+        b[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+        b[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+        b[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+        Some(Fr(b))
+    } else {
+        None
+    }
+}
+
+/// Simulate a read-only contract call and return its result `ScVal` (no signing/submit).
+fn simulate_invoke(cfg: &PoolConfig, contract: &str, fn_name: &str, args: Vec<ScVal>) -> Result<ScVal, CoreError> {
+    // A throwaway source just to form a well-typed simulate envelope (no signature needed).
+    let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+    let call_args: VecM<ScVal> = args.try_into().map_err(|_| CoreError::Chain("too many args".into()))?;
+    let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address(contract)?,
+        function_name: sc_symbol_str(fn_name)?,
+        args: call_args,
+    });
+    let tx = build_tx(&source, 1, BASE_FEE, host_function, VecM::default(), TransactionExt::V0)?;
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures: VecM::default() });
+    let b64 = env.to_xdr_base64(Limits::none()).map_err(|e| CoreError::Chain(format!("xdr: {e}")))?;
+    let sim = rpc_call(&cfg.rpc_url, "simulateTransaction", json!({ "transaction": b64 })).map_err(CoreError::Chain)?;
+    if let Some(err) = sim.get("error").and_then(|v| v.as_str()) {
+        return Err(CoreError::Chain(friendly_sim_error(fn_name, err)));
+    }
+    let xdr = sim
+        .get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("xdr"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::Chain(format!("{fn_name}: no result returnValue")))?;
+    ScVal::from_xdr_base64(xdr, Limits::none()).map_err(|e| CoreError::Chain(format!("decode {fn_name} result: {e}")))
+}
+
+/// The id the next `open_escrow` will assign (pool `next_escrow_id` view).
+pub fn escrow_next_id(cfg: &PoolConfig) -> Result<u64, CoreError> {
+    match simulate_invoke(cfg, &cfg.pool_contract, "next_escrow_id", vec![])? {
+        ScVal::U64(n) => Ok(n),
+        _ => Err(CoreError::Chain("next_escrow_id: unexpected return type".into())),
+    }
+}
+
+/// Read an escrow's public state (pool `escrow(id)` view). Errors if no such escrow.
+pub fn read_escrow(cfg: &PoolConfig, escrow_id: u64) -> Result<EscrowState, CoreError> {
+    let v = simulate_invoke(cfg, &cfg.pool_contract, "escrow", vec![sc_u64(escrow_id)])?;
+    let entries = match v {
+        ScVal::Map(Some(ScMap(m))) => m,
+        _ => return Err(CoreError::Chain("escrow: unexpected return type".into())),
+    };
+    let field = |name: &str| -> Option<&ScVal> {
+        entries.iter().find(|e| matches!(&e.key, ScVal::Symbol(s) if s.0.as_slice() == name.as_bytes())).map(|e| &e.val)
+    };
+    let u64f = |name: &str| -> Result<u64, CoreError> {
+        match field(name) {
+            Some(ScVal::U64(n)) => Ok(*n),
+            _ => Err(CoreError::Chain(format!("escrow: missing/bad u64 {name}"))),
+        }
+    };
+    let u32f = |name: &str| -> Result<u32, CoreError> {
+        match field(name) {
+            Some(ScVal::U32(n)) => Ok(*n),
+            _ => Err(CoreError::Chain(format!("escrow: missing/bad u32 {name}"))),
+        }
+    };
+    let frf = |name: &str| -> Result<Fr, CoreError> {
+        field(name).and_then(u256_to_fr).ok_or_else(|| CoreError::Chain(format!("escrow: missing/bad U256 {name}")))
+    };
+    Ok(EscrowState {
+        asset_tag: frf("asset_tag")?,
+        target: u64f("target")?,
+        deadline: u64f("deadline")?,
+        mode: u32f("mode")?,
+        payee_bind: frf("payee_bind")?,
+        c_raised: frf("c_raised")?,
+        raised_x: frf("raised_x")?,
+        raised_y: frf("raised_y")?,
+        n_contrib: u32f("n_contrib")?,
+        status: u32f("status")?,
+    })
+}
+
+/// Open an escrow: `open_escrow(asset_tag, target, deadline, mode, payee_bind)`. Returns the tx
+/// hash; the assigned id is read separately via [`escrow_next_id`] before the call.
+pub fn submit_open_escrow(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    target: u64,
+    deadline: u64,
+    mode: u32,
+    payee_bind: &Fr,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u256_fr(&cfg.asset_tag),
+        sc_u64(target),
+        sc_u64(deadline),
+        ScVal::U32(mode),
+        sc_u256_fr(payee_bind),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "open_escrow", args)
+}
+
+/// Contribute to an escrow. `change` is the shielded change-note payload; `payee_enc` is the
+/// `(amount, r)` blob encrypted to the payee; `(raised_x, raised_y)` is the new running point.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_escrow_contribute(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    escrow_id: u64,
+    public_inputs: &[u8],
+    proof: &[u8],
+    change: &OutputPayload,
+    payee_enc: &[u8],
+    raised_x: &Fr,
+    raised_y: &Fr,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u64(escrow_id),
+        sc_u256_fr(&cfg.asset_tag),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&change.enc_note)?,
+        sc_bytes(&change.ephemeral_pub)?,
+        ScVal::U32(change.view_tag),
+        sc_bytes(payee_enc)?,
+        sc_u256_fr(raised_x),
+        sc_u256_fr(raised_y),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "escrow_contribute", args)
+}
+
+/// Release an escrow to the payee: `escrow_release(id, pi, proof, enc_note, eph, view_tag)`.
+pub fn submit_escrow_release(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    escrow_id: u64,
+    public_inputs: &[u8],
+    proof: &[u8],
+    out: &OutputPayload,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u64(escrow_id),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&out.enc_note)?,
+        sc_bytes(&out.ephemeral_pub)?,
+        ScVal::U32(out.view_tag),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "escrow_release", args)
+}
+
+/// Refund one contribution: `escrow_refund(id, contrib_index, pi, proof, enc_note, eph, view_tag)`.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_escrow_refund(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    escrow_id: u64,
+    contrib_index: u32,
+    public_inputs: &[u8],
+    proof: &[u8],
+    out: &OutputPayload,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u64(escrow_id),
+        ScVal::U32(contrib_index),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&out.enc_note)?,
+        sc_bytes(&out.ephemeral_pub)?,
+        ScVal::U32(out.view_tag),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "escrow_refund", args)
+}
+
 /// Enroll a wallet (admin path): `policy.enroll(owner_pk, who)` then `pool.sync_asp_root`
 /// (two transactions — a Soroban tx carries exactly one host-function op). `owner_pk_dec`
 /// is the decimal `U256`. Returns the enroll transaction hash.

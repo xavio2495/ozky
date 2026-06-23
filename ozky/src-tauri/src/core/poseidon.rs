@@ -30,6 +30,13 @@ pub const SELECTOR_DEPOSIT: u64 = 1;
 pub const SELECTOR_TRANSFER: u64 = 2;
 pub const SELECTOR_WITHDRAW: u64 = 3;
 pub const SELECTOR_SPLIT: u64 = 4;
+pub const SELECTOR_ESCROW_CONTRIBUTE: u64 = 5;
+pub const SELECTOR_ESCROW_PAYOUT: u64 = 6;
+
+/// Domain tags for escrow recipient bindings (circuit `notes::escrow`). Distinct so a refund
+/// proof can't pass as a release. MUST match the Noir `DOMAIN_ESCROW_*` constants.
+pub const DOMAIN_ESCROW_PAYEE: u64 = 0x6f7a6b795f706179; // "ozky_pay"
+pub const DOMAIN_ESCROW_REFUND: u64 = 0x6f7a6b795f726566; // "ozky_ref"
 
 /// A BN254 Fr field element, 32-byte big-endian. The canonical wire form everywhere
 /// witnesses, commitments, nullifiers and roots are passed around in this core.
@@ -170,6 +177,12 @@ impl Hasher {
     /// (circuit `accumulator.nr::IndexedLeaf::hash`).
     pub fn indexed_leaf(&self, value: &Fr, next_index: u64, next_value: &Fr) -> Fr {
         self.hash(&[*value, Fr::from_u64(next_index), *next_value])
+    }
+
+    /// Escrow recipient binding: `Poseidon([domain, recipient_pk, salt], 3)` (circuit
+    /// `escrow::bind`). `domain` is `DOMAIN_ESCROW_PAYEE` (release) or `_REFUND` (refund).
+    pub fn escrow_bind(&self, domain: u64, recipient_pk: &Fr, salt: &Fr) -> Fr {
+        self.hash(&[Fr::from_u64(domain), *recipient_pk, *salt])
     }
 }
 

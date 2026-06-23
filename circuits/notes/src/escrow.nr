@@ -429,6 +429,32 @@ fn print_pedersen_parity_vectors() {
     println(f"refund_bind_sample = {rb}");
 }
 
+/// Escrow-specific public values of the contribute/payout demos (epoch 5, domain_sep 0xabc),
+/// for the Rust witness-builder parity test (E4). The spend-side publics (roots, nullifiers) are
+/// already covered by the withdraw parity; these are the NEW escrow fields.
+#[test]
+fn print_escrow_demo_publics() {
+    let c = contribute_demo();
+    let c_old = c.c_raised_old;
+    let c_new = c.c_raised_new;
+    let c_con = c.c_contrib;
+    let c_rb = c.refund_bind;
+    let c_chg = c.change_commitment;
+    println(f"contribute.c_raised_old = {c_old}");
+    println(f"contribute.c_raised_new = {c_new}");
+    println(f"contribute.c_contrib = {c_con}");
+    println(f"contribute.refund_bind = {c_rb}");
+    println(f"contribute.change_commitment = {c_chg}");
+
+    let p = payout_demo();
+    let p_ch = p.commitment_hash;
+    let p_oc = p.out_commitment;
+    let p_rb = p.recipient_bind;
+    println(f"payout.commitment_hash = {p_ch}");
+    println(f"payout.out_commitment = {p_oc}");
+    println(f"payout.recipient_bind = {p_rb}");
+}
+
 /// The two homomorphic folds compose: contributing v0 then v1 yields a running commitment whose
 /// hash equals Commit(v0+v1, r0+r1)'s hash (the payee can open the total).
 #[test]

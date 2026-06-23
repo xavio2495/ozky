@@ -768,6 +768,148 @@ pub async fn refund_escrow(escrow_id: u64, contrib_index: u32) -> Result<String,
     .await
 }
 
+// ----------------------------- merchant-pull channel (building block B phase 2) -----------------------------
+
+/// A subscription channel this wallet is involved in (subscriber and/or merchant), merged with its
+/// public on-chain state. Cap + draw amounts stay hidden on-chain; `cap`/`drawn_so_far` are the
+/// wallet's own local knowledge (it holds the ramp). (merchant-pull channel)
+#[derive(Serialize)]
+pub struct ChannelView {
+    pub id: u64,
+    pub asset: String,
+    pub status: String, // "open" | "closed"
+    pub expiry_unix: i64,
+    pub expiry_passed: bool,
+    pub is_subscriber: bool,
+    pub is_merchant: bool,
+    /// The hidden cap (this wallet's own knowledge from the ramp).
+    pub cap: u64,
+    pub amount_per_period: u64,
+    /// The highest cumulative amount currently authorized (elapsed periods) — what a close would draw.
+    pub drawn_so_far: u64,
+    /// Merchant: a close is possible now (open + an elapsed authorization exists).
+    pub closeable: bool,
+    /// Subscriber: a reclaim is possible now (open + past expiry).
+    pub reclaimable: bool,
+}
+
+/// List the subscription channels this wallet opened (subscriber) or imported (merchant), with
+/// on-chain status + eligibility flags. Network-heavy (reads each channel + latest ledger), so it
+/// runs off the UI thread. (merchant-pull channel)
+#[tauri::command]
+pub async fn list_channels() -> Result<Vec<ChannelView>, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        let now = core::payroll::now();
+        let latest = core::chain::latest_ledger(&cfg.rpc_url)? as u64;
+        let id_w = core::scan::wallet_identity(&wallet)?;
+        let my_pk = id_w.owner_pk.to_hex();
+
+        let records = core::channel::list_records(&wallet)?;
+        let mut views = Vec::new();
+        for rec in records {
+            // A stale local record (channel gone) shouldn't break the whole list.
+            let st = match core::chain::read_channel(&cfg, rec.channel_id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let is_subscriber = rec.subscriber_owner_pk == my_pk;
+            let is_merchant = rec.merchant_owner_pk == my_pk;
+            let is_open = st.status == 0;
+            let expiry_passed = latest > st.expiry;
+            let expiry_unix = now + (st.expiry as i64 - latest as i64) * 5;
+
+            // The highest cumulative the merchant could draw right now (elapsed periods).
+            let drawn_so_far = rec
+                .ramp
+                .iter()
+                .filter(|e| e.valid_after_ledger <= latest)
+                .map(|e| e.cum_amount)
+                .max()
+                .unwrap_or(0);
+
+            let closeable = is_merchant && is_open && drawn_so_far > 0;
+            let reclaimable = is_subscriber && is_open && expiry_passed;
+
+            views.push(ChannelView {
+                id: rec.channel_id,
+                asset: rec.asset,
+                status: if is_open { "open".into() } else { "closed".into() },
+                expiry_unix,
+                expiry_passed,
+                is_subscriber,
+                is_merchant,
+                cap: rec.cap,
+                amount_per_period: rec.amount_per_period,
+                drawn_so_far,
+                closeable,
+                reclaimable,
+            });
+        }
+        Ok(views)
+    })
+    .await
+}
+
+/// Open a subscription channel as the subscriber: lock `cap` (hidden), pre-sign a ramp of
+/// `n_periods` cumulative authorizations (`amount_per_period` each, `period_secs` apart), and seal
+/// it to the merchant. Returns the channel id. (merchant-pull channel)
+#[tauri::command]
+pub async fn open_channel(
+    asset: String,
+    cap: u64,
+    merchant_code: String,
+    amount_per_period: u64,
+    n_periods: u32,
+    period_secs: i64,
+) -> Result<u64, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        // Ledgers close ~5s apart; convert the wall-clock period to a ledger span (min 1).
+        let ledgers_per_period = (period_secs / 5).max(1) as u64;
+        core::channel::open(&wallet, &cfg, &asset, cap, &merchant_code, amount_per_period, n_periods, ledgers_per_period)
+    })
+    .await
+}
+
+/// Close a channel (merchant) at the highest elapsed authorization: mints the drawn amount to the
+/// merchant and the remainder back to the subscriber. Returns the tx hash. (merchant-pull channel)
+#[tauri::command]
+pub async fn close_channel(channel_id: u64) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::channel::close(&wallet, &cfg, channel_id)
+    })
+    .await
+}
+
+/// Reclaim the full cap (subscriber) after a channel expires unclosed. Returns the tx hash.
+/// (merchant-pull channel)
+#[tauri::command]
+pub async fn reclaim_channel(channel_id: u64) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::channel::reclaim(&wallet, &cfg, channel_id)
+    })
+    .await
+}
+
+/// Import a channel this wallet is the merchant for (decrypt the on-chain `chanopen` blob into a
+/// local record so it can be closed). Returns nothing. (merchant-pull channel)
+#[tauri::command]
+pub async fn import_channel(channel_id: u64) -> Result<(), CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        core::channel::import_from_chain(&wallet, &cfg, channel_id)
+    })
+    .await
+}
+
 /// Withdraw `amount` of `asset` out of the shielded pool to a public Stellar `dest`
 /// address (the off-ramp). Returns the tx hash. (A3/G6)
 #[tauri::command]

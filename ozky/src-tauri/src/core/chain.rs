@@ -1193,6 +1193,199 @@ pub fn submit_escrow_refund(
     invoke_contract(cfg, source_secret, &cfg.pool_contract, "escrow_refund", args)
 }
 
+// ----------------------------- channel (building block B phase 2) -----------------------------
+
+#[derive(Clone)]
+pub struct ChannelState {
+    pub asset_tag: Fr,
+    pub cap_commitment: Fr,
+    pub auth_key: Fr,
+    pub merchant_bind: Fr,
+    pub subscriber_bind: Fr,
+    pub expiry: u64,
+    pub status: u32,
+}
+
+/// The id the next `open_channel` will assign (pool `next_channel_id` view).
+pub fn channel_next_id(cfg: &PoolConfig) -> Result<u64, CoreError> {
+    match simulate_invoke(cfg, &cfg.pool_contract, "next_channel_id", vec![])? {
+        ScVal::U64(n) => Ok(n),
+        _ => Err(CoreError::Chain("next_channel_id: unexpected return type".into())),
+    }
+}
+
+/// Read a channel's public state (pool `channel(id)` view). Errors if no such channel.
+pub fn read_channel(cfg: &PoolConfig, channel_id: u64) -> Result<ChannelState, CoreError> {
+    let v = simulate_invoke(cfg, &cfg.pool_contract, "channel", vec![sc_u64(channel_id)])?;
+    let entries = match v {
+        ScVal::Map(Some(ScMap(m))) => m,
+        _ => return Err(CoreError::Chain("channel: unexpected return type".into())),
+    };
+    let field = |name: &str| -> Option<&ScVal> {
+        entries.iter().find(|e| matches!(&e.key, ScVal::Symbol(s) if s.0.as_slice() == name.as_bytes())).map(|e| &e.val)
+    };
+    let u64f = |name: &str| -> Result<u64, CoreError> {
+        match field(name) {
+            Some(ScVal::U64(n)) => Ok(*n),
+            _ => Err(CoreError::Chain(format!("channel: missing/bad u64 {name}"))),
+        }
+    };
+    let u32f = |name: &str| -> Result<u32, CoreError> {
+        match field(name) {
+            Some(ScVal::U32(n)) => Ok(*n),
+            _ => Err(CoreError::Chain(format!("channel: missing/bad u32 {name}"))),
+        }
+    };
+    let frf = |name: &str| -> Result<Fr, CoreError> {
+        field(name).and_then(u256_to_fr).ok_or_else(|| CoreError::Chain(format!("channel: missing/bad U256 {name}")))
+    };
+    Ok(ChannelState {
+        asset_tag: frf("asset_tag")?,
+        cap_commitment: frf("cap_commitment")?,
+        auth_key: frf("auth_key")?,
+        merchant_bind: frf("merchant_bind")?,
+        subscriber_bind: frf("subscriber_bind")?,
+        expiry: u64f("expiry")?,
+        status: u32f("status")?,
+    })
+}
+
+/// Drain this channel's `chanopen` event and return the sealed `merchant_enc` blob (the channel
+/// secrets + ramp the merchant decrypts to close). The blob is the 3rd element of the event value
+/// `(asset_tag, expiry, merchant_enc)`. Returns `None` if no matching event is found.
+pub fn channel_open_blob(cfg: &PoolConfig, channel_id: u64) -> Result<Option<Vec<u8>>, CoreError> {
+    let pool = &cfg.pool_contract;
+    let start = resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?;
+    let mut cursor: Option<String> = None;
+    let mut empty_run = 0u32;
+    let mut seen = 0usize;
+
+    for _ in 0..MAX_PAGES {
+        let (events, next) = get_events_page(
+            &cfg.rpc_url,
+            pool,
+            if cursor.is_none() { Some(start) } else { None },
+            cursor.as_deref(),
+        )
+        .map_err(CoreError::Chain)?;
+        let n = events.len();
+        seen += n;
+        for raw in &events {
+            if let Some(blob) = classify_channel_open(raw, channel_id) {
+                return Ok(Some(blob));
+            }
+        }
+        let advanced = next.is_some() && next != cursor;
+        if next.is_some() {
+            cursor = next;
+        }
+        if n == 0 {
+            empty_run += 1;
+            if !advanced || (seen > 0 && empty_run >= EMPTY_TOLERANCE) {
+                break;
+            }
+        } else {
+            empty_run = 0;
+        }
+    }
+    Ok(None)
+}
+
+/// Decode a `chanopen` event for `channel_id` -> the `merchant_enc` blob. Topics are
+/// `(Symbol "chanopen", U64 channel_id)`; value is `(asset_tag U256, expiry U64, merchant_enc Bytes)`.
+fn classify_channel_open(e: &RawEvent, channel_id: u64) -> Option<Vec<u8>> {
+    match scval(e.topics.first()?)? {
+        ScVal::Symbol(s) if s.0.as_slice() == b"chanopen" => {}
+        _ => return None,
+    };
+    match scval(e.topics.get(1)?)? {
+        ScVal::U64(n) if n == channel_id => {}
+        _ => return None,
+    };
+    match scval(&e.value)? {
+        ScVal::Vec(Some(items)) => match items.get(2)? {
+            ScVal::Bytes(b) => Some(b.0.as_slice().to_vec()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Open a subscription channel. Verifies an escrow_contribute-shaped proof; `change` is the shielded
+/// change payload; `merchant_enc` seals the channel secrets + ramp to the merchant. Returns the tx
+/// hash; the assigned id is read separately via [`channel_next_id`] before the call.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_open_channel(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    public_inputs: &[u8],
+    proof: &[u8],
+    change: &OutputPayload,
+    merchant_bind: &Fr,
+    auth_key: &Fr,
+    expiry: u64,
+    merchant_enc: &[u8],
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u256_fr(&cfg.asset_tag),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&change.enc_note)?,
+        sc_bytes(&change.ephemeral_pub)?,
+        ScVal::U32(change.view_tag),
+        sc_u256_fr(merchant_bind),
+        sc_u256_fr(auth_key),
+        sc_u64(expiry),
+        sc_bytes(merchant_enc)?,
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "open_channel", args)
+}
+
+/// Close a channel (merchant): mints drawn -> merchant + remainder -> subscriber.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_close_channel(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    channel_id: u64,
+    public_inputs: &[u8],
+    proof: &[u8],
+    merchant: &OutputPayload,
+    subscriber: &OutputPayload,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u64(channel_id),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&merchant.enc_note)?,
+        sc_bytes(&merchant.ephemeral_pub)?,
+        ScVal::U32(merchant.view_tag),
+        sc_bytes(&subscriber.enc_note)?,
+        sc_bytes(&subscriber.ephemeral_pub)?,
+        ScVal::U32(subscriber.view_tag),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "close_channel", args)
+}
+
+/// Reclaim the full cap (subscriber, expiry path): mints the cap back via the escrow_payout proof.
+pub fn submit_channel_reclaim(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    channel_id: u64,
+    public_inputs: &[u8],
+    proof: &[u8],
+    out: &OutputPayload,
+) -> Result<String, CoreError> {
+    let args = vec![
+        sc_u64(channel_id),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        sc_bytes(&out.enc_note)?,
+        sc_bytes(&out.ephemeral_pub)?,
+        ScVal::U32(out.view_tag),
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "channel_reclaim", args)
+}
+
 /// Enroll a wallet (admin path): `policy.enroll(owner_pk, who)` then `pool.sync_asp_root`
 /// (two transactions — a Soroban tx carries exactly one host-function op). `owner_pk_dec`
 /// is the decimal `U256`. Returns the enroll transaction hash.

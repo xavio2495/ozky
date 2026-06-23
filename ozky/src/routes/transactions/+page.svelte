@@ -16,6 +16,7 @@
 	import SplitIcon from '@lucide/svelte/icons/split';
 	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import RepeatIcon from '@lucide/svelte/icons/repeat';
+	import Repeat2Icon from '@lucide/svelte/icons/repeat-2';
 	import HandCoinsIcon from '@lucide/svelte/icons/hand-coins';
 	import InfoIcon from '@lucide/svelte/icons/info';
 
@@ -26,6 +27,7 @@
 		payroll: CalendarClockIcon,
 		subscription: RepeatIcon,
 		escrow: HandCoinsIcon,
+		channel: Repeat2Icon,
 		withdraw: UploadIcon,
 		enroll: ShieldCheckIcon,
 		disclose: ScaleIcon

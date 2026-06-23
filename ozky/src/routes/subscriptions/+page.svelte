@@ -17,15 +17,108 @@
 	import PlayIcon from '@lucide/svelte/icons/play';
 	import PauseIcon from '@lucide/svelte/icons/pause';
 	import RepeatIcon from '@lucide/svelte/icons/repeat';
+	import Repeat2Icon from '@lucide/svelte/icons/repeat-2';
 	import InfoIcon from '@lucide/svelte/icons/info';
 	import { toast } from 'svelte-sonner';
-	import { api, errMessage, type Subscription } from '$lib/api';
+	import { api, errMessage, type Subscription, type Channel } from '$lib/api';
 	import { wallet } from '$lib/wallet.svelte';
 	import { toBaseUnits } from '$lib/assets';
 	import { prettyAmount } from '$lib/format';
 
 	let proving = $state(false);
 	let provingTitle = $state('Charging subscription');
+
+	// --- merchant-pull channel state ---
+	let chOpen = $state(false); // open-channel dialog
+	let chAsset = $state('USDC');
+	let chMerchant = $state('');
+	let chPerAmount = $state('');
+	let chPeriods = $state('12');
+	let chCadence = $state('monthly'); // weekly | monthly | days
+	let chIntervalDays = $state('30');
+	let importOpen = $state(false);
+	let importId = $state('');
+	let confirmCloseId = $state<number | null>(null);
+	let confirmReclaimId = $state<number | null>(null);
+
+	const chBal = $derived(wallet.balances.find((b) => b.code === chAsset));
+	const chDecimals = $derived(chBal?.decimals ?? 7);
+	const periodSecs = $derived(
+		chCadence === 'weekly'
+			? 7 * 86400
+			: chCadence === 'monthly'
+				? 30 * 86400
+				: Math.max(1, Number(chIntervalDays) || 1) * 86400
+	);
+	// The cap a channel locks = the full pre-authorized ramp (per-period * periods).
+	const chCap = $derived(
+		(Number(chPerAmount) > 0 ? Number(chPerAmount) : 0) * (Number(chPeriods) || 0)
+	);
+
+	function openChannelCreate() {
+		chAsset = 'USDC';
+		chMerchant = '';
+		chPerAmount = '';
+		chPeriods = '12';
+		chCadence = 'monthly';
+		chIntervalDays = '30';
+		chOpen = true;
+	}
+
+	async function doOpenChannel() {
+		if (!chMerchant.trim().startsWith('ozky'))
+			return toast.error('Enter a valid ozky… merchant code');
+		if (!(Number(chPerAmount) > 0)) return toast.error('Enter a per-period amount greater than zero');
+		const periods = Number(chPeriods) || 0;
+		if (!(periods > 0)) return toast.error('Enter at least one period');
+		let perBase: number, capBase: number;
+		try {
+			perBase = toBaseUnits(chPerAmount, chDecimals);
+			capBase = toBaseUnits(String(chCap), chDecimals);
+		} catch (e) {
+			return toast.error(errMessage(e));
+		}
+		chOpen = false;
+		provingTitle = 'Opening channel';
+		proving = true;
+		await wallet.openChannel(chAsset, capBase, chMerchant.trim(), perBase, periods, periodSecs);
+		proving = false;
+	}
+
+	async function doImportChannel() {
+		const id = Number(importId);
+		if (!Number.isInteger(id) || id < 0) return toast.error('Enter a valid channel id');
+		importOpen = false;
+		await wallet.importChannel(id);
+	}
+
+	async function doCloseChannel() {
+		const id = confirmCloseId;
+		confirmCloseId = null;
+		if (id == null) return;
+		provingTitle = `Closing channel #${id}`;
+		proving = true;
+		await wallet.closeChannel(id);
+		proving = false;
+	}
+
+	async function doReclaimChannel() {
+		const id = confirmReclaimId;
+		confirmReclaimId = null;
+		if (id == null) return;
+		provingTitle = `Reclaiming channel #${id}`;
+		proving = true;
+		await wallet.reclaimChannel(id);
+		proving = false;
+	}
+
+	const chDec = (c: Channel) => wallet.balances.find((b) => b.code === c.asset)?.decimals ?? 7;
+	const chRole = (c: Channel) =>
+		c.is_subscriber && c.is_merchant
+			? 'You (both sides)'
+			: c.is_subscriber
+				? 'You pay'
+				: 'You charge';
 
 	// Create/edit dialog state.
 	let editOpen = $state(false);
@@ -189,6 +282,73 @@
 					</Card.Root>
 				{/each}
 			{/if}
+
+			<!-- Merchant-pull channels (the pull direction) -->
+			<div class="mt-6 flex items-center justify-between">
+				<div>
+					<h2 class="text-sm font-semibold">Merchant-pull channels</h2>
+					<p class="text-xs text-muted-foreground">
+						Lock a capped amount; a merchant draws each period while you're offline.
+					</p>
+				</div>
+				<div class="flex gap-2">
+					<Button variant="outline" size="sm" onclick={() => (importOpen = true)}>Import</Button>
+					<Button size="sm" onclick={openChannelCreate} class="gap-2">
+						<PlusIcon class="size-4" /> New channel
+					</Button>
+				</div>
+			</div>
+
+			{#if wallet.channels.length === 0}
+				<Empty.Root class="rounded-xl border border-dashed py-12">
+					<Empty.Header>
+						<Empty.Media variant="icon"><Repeat2Icon /></Empty.Media>
+						<Empty.Title>No channels yet</Empty.Title>
+						<Empty.Description>
+							Open a channel to pre-authorize a merchant, or import one you collect on.
+						</Empty.Description>
+					</Empty.Header>
+				</Empty.Root>
+			{:else}
+				{#each wallet.channels as c (c.id)}
+					<Card.Root>
+						<Card.Content class="flex items-center gap-4 py-4">
+							<div class="min-w-0 flex-1">
+								<div class="flex items-center gap-2">
+									<span class="font-medium">Channel #{c.id}</span>
+									<Badge variant="outline">{chRole(c)}</Badge>
+									{#if c.status === 'closed'}<Badge variant="secondary">Closed</Badge>
+									{:else if c.expiry_passed}<Badge>Expired</Badge>{/if}
+								</div>
+								<p class="mt-0.5 text-xs text-muted-foreground">
+									cap {prettyAmount(String(c.cap / 10 ** chDec(c)))} {c.asset} ·
+									{prettyAmount(String(c.amount_per_period / 10 ** chDec(c)))}/period ·
+									drawn so far {prettyAmount(String(c.drawn_so_far / 10 ** chDec(c)))} ·
+									expires {fmtDate(c.expiry_unix)}
+								</p>
+							</div>
+							<div class="flex items-center gap-1.5">
+								{#if c.is_merchant && c.status === 'open'}
+									<Button size="sm" onclick={() => (confirmCloseId = c.id)} disabled={!c.closeable}>
+										Close &amp; collect
+									</Button>
+								{/if}
+								{#if c.is_subscriber && c.status === 'open'}
+									<Button
+										size="sm"
+										variant="outline"
+										onclick={() => (confirmReclaimId = c.id)}
+										disabled={!c.reclaimable}
+										title={c.reclaimable ? 'Reclaim the full cap' : 'Reclaimable after expiry'}
+									>
+										Reclaim
+									</Button>
+								{/if}
+							</div>
+						</Card.Content>
+					</Card.Root>
+				{/each}
+			{/if}
 		</div>
 	{/snippet}
 
@@ -201,6 +361,17 @@
 					<li>Runs only while ozky is open — due subscriptions are flagged for you to pay.</li>
 					<li>Each charge is one shielded transfer to the recipient.</li>
 					<li>This is a push (you pay) subscription — cancel any time by deleting it.</li>
+				</ul>
+			</Alert.Description>
+		</Alert.Root>
+		<Alert.Root class="mt-3">
+			<Repeat2Icon />
+			<Alert.Title>Merchant-pull channels</Alert.Title>
+			<Alert.Description>
+				<ul class="mt-1 flex list-disc flex-col gap-1 pl-4 text-xs">
+					<li>You lock a capped amount and pre-sign each period's charge — the merchant draws while you're offline.</li>
+					<li>Amounts stay hidden on-chain; your loss is capped, the unused remainder is always refundable.</li>
+					<li>To cancel, ask the merchant to close, or reclaim the full cap after the channel expires.</li>
 				</ul>
 			</Alert.Description>
 		</Alert.Root>
@@ -290,6 +461,120 @@
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
 			<AlertDialog.Action onclick={doDelete}>Delete</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
+
+<!-- Open channel (subscriber) -->
+<Dialog.Root bind:open={chOpen}>
+	<Dialog.Content class="max-w-xl">
+		<Dialog.Header>
+			<Dialog.Title>New merchant-pull channel</Dialog.Title>
+			<Dialog.Description>
+				Pre-authorize a merchant to charge a fixed amount each period, up to a cap you lock now.
+			</Dialog.Description>
+		</Dialog.Header>
+		<Field.Group>
+			<Field.Field>
+				<Field.Label for="chmerchant">Merchant code</Field.Label>
+				<Input id="chmerchant" bind:value={chMerchant} placeholder="ozky…" class="font-mono text-sm" />
+			</Field.Field>
+			<div class="grid grid-cols-2 gap-3">
+				<Field.Field>
+					<Field.Label>Asset</Field.Label>
+					<AssetSelect bind:value={chAsset} />
+				</Field.Field>
+				<Field.Field>
+					<Field.Label for="chper">Amount / period</Field.Label>
+					<Input id="chper" bind:value={chPerAmount} inputmode="decimal" placeholder="0.00" class="font-mono" />
+				</Field.Field>
+			</div>
+			<div class="grid grid-cols-2 gap-3">
+				<Field.Field>
+					<Field.Label>Period</Field.Label>
+					<Select.Root type="single" bind:value={chCadence}>
+						<Select.Trigger class="h-12 w-full">{cadenceOptions.find((o) => o.value === chCadence)?.label ?? 'Monthly'}</Select.Trigger>
+						<Select.Content>
+							{#each cadenceOptions as o (o.value)}
+								<Select.Item value={o.value} label={o.label}>{o.label}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+				</Field.Field>
+				<Field.Field>
+					<Field.Label for="chperiods">Number of periods</Field.Label>
+					<Input id="chperiods" bind:value={chPeriods} inputmode="numeric" placeholder="12" />
+				</Field.Field>
+			</div>
+			{#if chCadence === 'days'}
+				<Field.Field>
+					<Field.Label for="chinterval">Interval (days)</Field.Label>
+					<Input id="chinterval" bind:value={chIntervalDays} inputmode="numeric" placeholder="30" />
+				</Field.Field>
+			{/if}
+			<Alert.Root>
+				<InfoIcon />
+				<Alert.Description class="text-xs">
+					Locks a cap of <strong>{prettyAmount(String(chCap || 0))} {chAsset}</strong>
+					({Number(chPeriods) || 0} × {chPerAmount || 0}). The remainder is refundable if the merchant draws less.
+				</Alert.Description>
+			</Alert.Root>
+		</Field.Group>
+		<Dialog.Footer>
+			<Button variant="outline" onclick={() => (chOpen = false)}>Cancel</Button>
+			<Button onclick={doOpenChannel}>Open channel</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
+
+<!-- Import channel (merchant) -->
+<Dialog.Root bind:open={importOpen}>
+	<Dialog.Content class="max-w-md">
+		<Dialog.Header>
+			<Dialog.Title>Import a channel</Dialog.Title>
+			<Dialog.Description>
+				As the merchant, import a channel a subscriber opened to you so you can collect on it.
+			</Dialog.Description>
+		</Dialog.Header>
+		<Field.Field>
+			<Field.Label for="impid">Channel id</Field.Label>
+			<Input id="impid" bind:value={importId} inputmode="numeric" placeholder="0" />
+		</Field.Field>
+		<Dialog.Footer>
+			<Button variant="outline" onclick={() => (importOpen = false)}>Cancel</Button>
+			<Button onclick={doImportChannel}>Import</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
+
+<!-- Close channel confirm (merchant) -->
+<AlertDialog.Root open={confirmCloseId !== null} onOpenChange={(o) => { if (!o) confirmCloseId = null; }}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>Close and collect?</AlertDialog.Title>
+			<AlertDialog.Description>
+				Settles the channel at the highest elapsed authorization: mints your draw to you and refunds the remainder to the subscriber. This closes the channel.
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Action onclick={doCloseChannel}>Close &amp; collect</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
+
+<!-- Reclaim channel confirm (subscriber) -->
+<AlertDialog.Root open={confirmReclaimId !== null} onOpenChange={(o) => { if (!o) confirmReclaimId = null; }}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>Reclaim the full cap?</AlertDialog.Title>
+			<AlertDialog.Description>
+				The channel has expired without the merchant closing it. This mints the entire locked cap back to you and closes the channel.
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Action onclick={doReclaimChannel}>Reclaim</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>

@@ -98,6 +98,26 @@ export type Escrow = {
 	refundable: boolean;
 };
 
+/** A merchant-pull subscription channel this wallet opened (subscriber) or imported (merchant). */
+export type Channel = {
+	id: number;
+	asset: string;
+	status: string; // "open" | "closed"
+	expiry_unix: number;
+	expiry_passed: boolean;
+	is_subscriber: boolean;
+	is_merchant: boolean;
+	/** The hidden cap (this wallet's own knowledge from the ramp). */
+	cap: number;
+	amount_per_period: number;
+	/** Highest cumulative amount currently authorized (elapsed periods) — what a close would draw. */
+	drawn_so_far: number;
+	/** Merchant: a close is possible now. */
+	closeable: boolean;
+	/** Subscriber: a reclaim is possible now (past expiry, unclosed). */
+	reclaimable: boolean;
+};
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -174,6 +194,27 @@ export const api = {
 	releaseEscrow: (escrowId: number) => invoke<string>('release_escrow', { escrowId }),
 	refundEscrow: (escrowId: number, contribIndex: number) =>
 		invoke<string>('refund_escrow', { escrowId, contribIndex }),
+
+	listChannels: () => invoke<Channel[]>('list_channels'),
+	openChannel: (
+		asset: string,
+		cap: number,
+		merchantCode: string,
+		amountPerPeriod: number,
+		nPeriods: number,
+		periodSecs: number
+	) =>
+		invoke<number>('open_channel', {
+			asset,
+			cap,
+			merchantCode,
+			amountPerPeriod,
+			nPeriods,
+			periodSecs
+		}),
+	closeChannel: (channelId: number) => invoke<string>('close_channel', { channelId }),
+	reclaimChannel: (channelId: number) => invoke<string>('reclaim_channel', { channelId }),
+	importChannel: (channelId: number) => invoke<void>('import_channel', { channelId }),
 
 	withdraw: (asset: string, dest: string, amount: number) =>
 		invoke<string>('withdraw', { asset, dest, amount }),

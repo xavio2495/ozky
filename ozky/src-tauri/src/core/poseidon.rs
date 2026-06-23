@@ -32,11 +32,17 @@ pub const SELECTOR_WITHDRAW: u64 = 3;
 pub const SELECTOR_SPLIT: u64 = 4;
 pub const SELECTOR_ESCROW_CONTRIBUTE: u64 = 5;
 pub const SELECTOR_ESCROW_PAYOUT: u64 = 6;
+pub const SELECTOR_CHANNEL_CLOSE: u64 = 7;
 
 /// Domain tags for escrow recipient bindings (circuit `notes::escrow`). Distinct so a refund
 /// proof can't pass as a release. MUST match the Noir `DOMAIN_ESCROW_*` constants.
 pub const DOMAIN_ESCROW_PAYEE: u64 = 0x6f7a6b795f706179; // "ozky_pay"
 pub const DOMAIN_ESCROW_REFUND: u64 = 0x6f7a6b795f726566; // "ozky_ref"
+
+/// Domain tag for the channel merchant-draw binding (circuit `notes::channel::DOMAIN_CHANNEL_MERCHANT`,
+/// ASCII "ozky_mrc"). The subscriber-remainder binding reuses `DOMAIN_ESCROW_REFUND` (open reuses the
+/// escrow_contribute proof, whose refund_bind becomes the channel's subscriber_bind).
+pub const DOMAIN_CHANNEL_MERCHANT: u64 = 0x6f7a6b795f6d7263; // "ozky_mrc"
 
 /// A BN254 Fr field element, 32-byte big-endian. The canonical wire form everywhere
 /// witnesses, commitments, nullifiers and roots are passed around in this core.

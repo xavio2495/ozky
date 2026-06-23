@@ -21,6 +21,7 @@
 
 pub mod accounts;
 pub mod chain;
+pub mod channel;
 pub mod config;
 pub mod deposit;
 pub mod disclose;

@@ -678,6 +678,154 @@ impl PayoutWitness {
     }
 }
 
+// ----------------------------- channel close (building block B phase 2) -----------------------------
+
+use super::pedersen::Signature;
+use super::poseidon::DOMAIN_CHANNEL_MERCHANT;
+
+/// Channel close witness: open the cap + the subscriber-signed cumulative commitment, carry the
+/// in-circuit Schnorr signature, mint drawn -> merchant and (cap - drawn) -> subscriber. Public
+/// inputs in the canonical 10-field order.
+pub struct ChannelCloseWitness {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub cap_hash: Fr,
+    pub auth_key: Fr,
+    pub valid_after_ledger: Fr,
+    pub merchant_out: Fr,
+    pub subscriber_out: Fr,
+    pub merchant_bind: Fr,
+    pub subscriber_bind: Fr,
+    // private
+    pub cap: Fr,
+    pub r_cap: Fr,
+    pub drawn: Fr,
+    pub r_k: Fr,
+    pub channel_id: Fr,
+    pub pk_x: Fr,
+    pub pk_y: Fr,
+    pub sig_r_x: Fr,
+    pub sig_r_y: Fr,
+    pub s_lo: Fr,
+    pub s_hi: Fr,
+    pub merchant_pk: Fr,
+    pub m_salt: Fr,
+    pub merchant_blinding: Fr,
+    pub merchant_rho: Fr,
+    pub subscriber_pk: Fr,
+    pub s_salt: Fr,
+    pub subscriber_blinding: Fr,
+    pub subscriber_rho: Fr,
+}
+
+pub struct ChannelCloseInputs {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub valid_after_ledger: u64,
+    pub channel_id: u64,
+    /// The hidden cap and its Pedersen blinding (opened at close).
+    pub cap: u64,
+    pub r_cap: Fr,
+    /// The drawn cumulative amount and its blinding (the subscriber-signed commitment).
+    pub drawn: u64,
+    pub r_k: Fr,
+    /// The per-channel signing public key and the subscriber's signature over the period.
+    pub pk: Point,
+    pub sig: Signature,
+    /// Merchant output (the draw): owner pk + salt (binds merchant_bind) + note randomness.
+    pub merchant_pk: Fr,
+    pub m_salt: Fr,
+    pub merchant_blinding: Fr,
+    pub merchant_rho: Fr,
+    /// Subscriber output (the remainder): owner pk + salt (binds subscriber_bind) + note randomness.
+    pub subscriber_pk: Fr,
+    pub s_salt: Fr,
+    pub subscriber_blinding: Fr,
+    pub subscriber_rho: Fr,
+}
+
+impl ChannelCloseWitness {
+    pub fn build(h: &Hasher, p: ChannelCloseInputs) -> ChannelCloseWitness {
+        let cap = Fr::from_u64(p.cap);
+        let drawn = Fr::from_u64(p.drawn);
+        let remainder = Fr::from_u64(p.cap - p.drawn); // caller validates drawn <= cap
+        let c_cap = pedersen::commit(&cap, &p.r_cap);
+        let (pk_x, pk_y) = pedersen::coords(&p.pk);
+        let (sig_r_x, sig_r_y) = pedersen::coords(&p.sig.r);
+        ChannelCloseWitness {
+            domain_sep: p.domain_sep,
+            asset_tag: p.asset_tag,
+            epoch: p.epoch,
+            cap_hash: pedersen::point_hash(h, &c_cap),
+            auth_key: pedersen::point_hash(h, &p.pk),
+            valid_after_ledger: Fr::from_u64(p.valid_after_ledger),
+            merchant_out: h.commitment(&drawn, &p.asset_tag, &p.merchant_pk, &p.merchant_blinding, &p.epoch, &p.merchant_rho),
+            subscriber_out: h.commitment(&remainder, &p.asset_tag, &p.subscriber_pk, &p.subscriber_blinding, &p.epoch, &p.subscriber_rho),
+            merchant_bind: h.escrow_bind(DOMAIN_CHANNEL_MERCHANT, &p.merchant_pk, &p.m_salt),
+            subscriber_bind: h.escrow_bind(DOMAIN_ESCROW_REFUND, &p.subscriber_pk, &p.s_salt),
+            cap,
+            r_cap: p.r_cap,
+            drawn,
+            r_k: p.r_k,
+            channel_id: Fr::from_u64(p.channel_id),
+            pk_x,
+            pk_y,
+            sig_r_x,
+            sig_r_y,
+            s_lo: p.sig.s_lo,
+            s_hi: p.sig.s_hi,
+            merchant_pk: p.merchant_pk,
+            m_salt: p.m_salt,
+            merchant_blinding: p.merchant_blinding,
+            merchant_rho: p.merchant_rho,
+            subscriber_pk: p.subscriber_pk,
+            s_salt: p.s_salt,
+            subscriber_blinding: p.subscriber_blinding,
+            subscriber_rho: p.subscriber_rho,
+        }
+    }
+
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_tag = {}\n", q(&self.asset_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("cap_hash = {}\n", q(&self.cap_hash)));
+        s.push_str(&format!("auth_key = {}\n", q(&self.auth_key)));
+        s.push_str(&format!("valid_after_ledger = {}\n", q(&self.valid_after_ledger)));
+        s.push_str(&format!("merchant_out = {}\n", q(&self.merchant_out)));
+        s.push_str(&format!("subscriber_out = {}\n", q(&self.subscriber_out)));
+        s.push_str(&format!("merchant_bind = {}\n", q(&self.merchant_bind)));
+        s.push_str(&format!("subscriber_bind = {}\n", q(&self.subscriber_bind)));
+        s.push_str(&format!("cap = {}\n", q(&self.cap)));
+        s.push_str(&format!("r_cap = {}\n", q(&self.r_cap)));
+        s.push_str(&format!("drawn = {}\n", q(&self.drawn)));
+        s.push_str(&format!("r_k = {}\n", q(&self.r_k)));
+        s.push_str(&format!("channel_id = {}\n", q(&self.channel_id)));
+        s.push_str(&format!("s_lo = {}\n", q(&self.s_lo)));
+        s.push_str(&format!("s_hi = {}\n", q(&self.s_hi)));
+        s.push_str(&format!("merchant_pk = {}\n", q(&self.merchant_pk)));
+        s.push_str(&format!("m_salt = {}\n", q(&self.m_salt)));
+        s.push_str(&format!("merchant_blinding = {}\n", q(&self.merchant_blinding)));
+        s.push_str(&format!("merchant_rho = {}\n", q(&self.merchant_rho)));
+        s.push_str(&format!("subscriber_pk = {}\n", q(&self.subscriber_pk)));
+        s.push_str(&format!("s_salt = {}\n", q(&self.s_salt)));
+        s.push_str(&format!("subscriber_blinding = {}\n", q(&self.subscriber_blinding)));
+        s.push_str(&format!("subscriber_rho = {}\n", q(&self.subscriber_rho)));
+        s.push_str("\n[pk]\n");
+        s.push_str(&format!("x = {}\n", q(&self.pk_x)));
+        s.push_str(&format!("y = {}\n", q(&self.pk_y)));
+        s.push_str("is_infinite = false\n");
+        s.push_str("\n[sig_r]\n");
+        s.push_str(&format!("x = {}\n", q(&self.sig_r_x)));
+        s.push_str(&format!("y = {}\n", q(&self.sig_r_y)));
+        s.push_str("is_infinite = false\n");
+        s
+    }
+}
+
 // ----------------------------- Spend assembly + demos -----------------------------
 
 /// A note this wallet owns and can spend (the spendable inputs to a transfer/withdraw).
@@ -1348,5 +1496,68 @@ mod tests {
             "0x2940974a422a3491d0d2872653520132b05a40b48e2570daeeaa6380e7ad7a17", "out_commitment");
         assert_eq!(w.recipient_bind.to_hex(),
             "0x1b1f9287484b321f50a6fd56b221a4d5fcb7e9eba6802fed96ec5a3005372a68", "recipient_bind");
+    }
+
+    // ----- channel close witness parity (vs the Noir `channel::close_demo`, captured 2026-06-24) -----
+
+    /// Reproduces the Noir `channel::close_demo` via [`ChannelCloseWitness::build`] — including the
+    /// Schnorr signature the native signer produces (sk=0x1234567, k=0x89abcdef over the period msg).
+    /// If the publics match the circuit's, the whole sign+witness path is parity-correct.
+    #[test]
+    fn channel_close_witness_matches_noir_demo() {
+        let h = Hasher::new();
+        let sk = Fr::from_hex("0x1234567").unwrap();
+        let k = Fr::from_hex("0x89abcdef").unwrap();
+        let drawn = 600u64;
+        let r_k = Fr::from_hex("0xd4a").unwrap();
+        // msg = Poseidon2([channel_id, valid_after, c_k.x, c_k.y]); c_k = commit(drawn, r_k).
+        let c_k = pedersen::commit(&Fr::from_u64(drawn), &r_k);
+        let (ckx, cky) = pedersen::coords(&c_k);
+        let msg = h.hash(&[Fr::from_u64(1), Fr::from_u64(50), ckx, cky]);
+        let pk = pedersen::schnorr_pubkey(&sk);
+        let sig = pedersen::schnorr_sign(&h, &sk, &k, &msg);
+
+        let w = ChannelCloseWitness::build(
+            &h,
+            ChannelCloseInputs {
+                domain_sep: Fr::from_u64(0xabc),
+                asset_tag: Fr::from_u64(1),
+                epoch: Fr::from_u64(5),
+                valid_after_ledger: 50,
+                channel_id: 1,
+                cap: 1000,
+                r_cap: Fr::from_hex("0xca9").unwrap(),
+                drawn,
+                r_k,
+                pk,
+                sig,
+                merchant_pk: h.owner_pk(&Fr::from_hex("0x3e").unwrap()),
+                m_salt: Fr::from_hex("0x3e17").unwrap(),
+                merchant_blinding: Fr::from_u64(222),
+                merchant_rho: Fr::from_u64(333),
+                subscriber_pk: h.owner_pk(&Fr::from_hex("0x5b").unwrap()),
+                s_salt: Fr::from_hex("0x5b17").unwrap(),
+                subscriber_blinding: Fr::from_u64(444),
+                subscriber_rho: Fr::from_u64(555),
+            },
+        );
+        assert_eq!(w.cap_hash.to_hex(),
+            "0x2c48a88806047b18b6867cf0e631230363d1fe9448c4acbb1e01a889edf061cc", "cap_hash");
+        assert_eq!(w.auth_key.to_hex(),
+            "0x2c39130bc310dab1eda97ffcccbd7501c76184929dffc76590e43f5b3bc3ebac", "auth_key");
+        assert_eq!(w.merchant_out.to_hex(),
+            "0x09b4963cc5f48a6dd0dce3d36d40842d5ed8e63c38bdc8e7a77151fdea00897c", "merchant_out");
+        assert_eq!(w.subscriber_out.to_hex(),
+            "0x0d62a2c142417b1c915340c7673af7f07f50b5b0b6629a04ddd43842f17966ca", "subscriber_out");
+        assert_eq!(w.merchant_bind.to_hex(),
+            "0x2e2d92ed22efd6667e8be87dd7fc6ff8fcde8f99e2ea9a669cf13a8c7496a651", "merchant_bind");
+        assert_eq!(w.subscriber_bind.to_hex(),
+            "0x058db364cf113a85a779cd11d6a3fca04b10378c53cb1f086cba56106001720e", "subscriber_bind");
+        // The Prover.toml carries the signature point tables + the limb response.
+        let toml = w.to_prover_toml();
+        assert!(toml.contains("[pk]"));
+        assert!(toml.contains("[sig_r]"));
+        assert!(toml.contains("s_lo ="));
+        assert!(toml.contains("channel_id = \"0x01\""));
     }
 }

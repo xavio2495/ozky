@@ -64,7 +64,7 @@
 	<ul class="flex flex-col gap-1">
 		{#each items as item (item.href)}
 			{@const active = isActive(item.href)}
-			{@const due = item.badge === 'payroll' ? wallet.dueCount : item.badge === 'subscription' ? wallet.subDueCount : item.badge === 'escrow' ? wallet.escrowActionCount : 0}
+			{@const due = item.badge === 'payroll' ? wallet.dueCount : item.badge === 'subscription' ? wallet.subDueCount + wallet.channelActionCount : item.badge === 'escrow' ? wallet.escrowActionCount : 0}
 			<li class="relative">
 				{#if active}
 					<div

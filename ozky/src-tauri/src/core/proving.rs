@@ -13,7 +13,8 @@
 //!   + `bb verify` in the ZK container (the toolchain that froze the VKs).
 
 use super::witness::{
-    ContributeWitness, DepositWitness, PayoutWitness, SplitWitness, TransferWitness, WithdrawWitness,
+    ChannelCloseWitness, ContributeWitness, DepositWitness, PayoutWitness, SplitWitness,
+    TransferWitness, WithdrawWitness,
 };
 use super::CoreError;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ pub enum Circuit {
     Split,
     EscrowContribute,
     EscrowPayout,
+    ChannelClose,
 }
 
 impl Circuit {
@@ -44,6 +46,7 @@ impl Circuit {
             Circuit::Split => "split",
             Circuit::EscrowContribute => "escrow_contribute",
             Circuit::EscrowPayout => "escrow_payout",
+            Circuit::ChannelClose => "channel_close",
         }
     }
 }
@@ -172,6 +175,11 @@ pub fn prove_escrow_payout_witness(w: &PayoutWitness) -> Result<ProofBundle, Cor
     prove(Circuit::EscrowPayout, &w.to_prover_toml())
 }
 
+/// Prove a channel close (open cap + cumulative, verify Schnorr, mint two notes) against the frozen VK.
+pub fn prove_channel_close_witness(w: &ChannelCloseWitness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::ChannelClose, &w.to_prover_toml())
+}
+
 // --- Command-facing entrypoints -------------------------------------------------
 //
 // The transfer (send) flow is wired in `super::send` (it builds the witness from live
@@ -270,6 +278,52 @@ mod tests {
             },
         );
         prove_transfer_witness(&w).expect("stateful multi-leaf transfer must verify");
+    }
+
+    /// The Rust core's `ChannelCloseWitness` -> Prover.toml -> prove path produces a proof the FROZEN
+    /// channel_close VK accepts (the `close_demo` vector, signed by the native signer). This is the
+    /// end-to-end CH4 check that the witness serialization matches the circuit's ABI.
+    #[test]
+    #[ignore = "needs the ZK Docker container; run with --ignored"]
+    fn channel_close_demo_proof_verifies_against_frozen_vk() {
+        use crate::core::pedersen;
+        use crate::core::witness::{ChannelCloseInputs, ChannelCloseWitness};
+        let h = Hasher::new();
+        let sk = Fr::from_hex("0x1234567").unwrap();
+        let k = Fr::from_hex("0x89abcdef").unwrap();
+        let r_k = Fr::from_hex("0xd4a").unwrap();
+        let c_k = pedersen::commit(&Fr::from_u64(600), &r_k);
+        let (ckx, cky) = pedersen::coords(&c_k);
+        let msg = h.hash(&[Fr::from_u64(1), Fr::from_u64(50), ckx, cky]);
+        let pk = pedersen::schnorr_pubkey(&sk);
+        let sig = pedersen::schnorr_sign(&h, &sk, &k, &msg);
+        let w = ChannelCloseWitness::build(
+            &h,
+            ChannelCloseInputs {
+                domain_sep: Fr::from_u64(0xabc),
+                asset_tag: Fr::from_u64(1),
+                epoch: Fr::from_u64(5),
+                valid_after_ledger: 50,
+                channel_id: 1,
+                cap: 1000,
+                r_cap: Fr::from_hex("0xca9").unwrap(),
+                drawn: 600,
+                r_k,
+                pk,
+                sig,
+                merchant_pk: h.owner_pk(&Fr::from_hex("0x3e").unwrap()),
+                m_salt: Fr::from_hex("0x3e17").unwrap(),
+                merchant_blinding: Fr::from_u64(222),
+                merchant_rho: Fr::from_u64(333),
+                subscriber_pk: h.owner_pk(&Fr::from_hex("0x5b").unwrap()),
+                s_salt: Fr::from_hex("0x5b17").unwrap(),
+                subscriber_blinding: Fr::from_u64(444),
+                subscriber_rho: Fr::from_u64(555),
+            },
+        );
+        let bundle = prove_channel_close_witness(&w).expect("channel close must verify against frozen VK");
+        // keccak proof = 14592 bytes; 10 public inputs * 32 = 320 bytes.
+        assert_eq!(bundle.public_inputs.len(), 320, "10 public inputs");
     }
 
     #[test]

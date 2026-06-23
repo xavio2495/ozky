@@ -9,6 +9,7 @@ import {
 	isConfigError,
 	type AccountInfo,
 	type AssetBalance,
+	type Channel,
 	type Escrow,
 	type NewAccount,
 	type Payroll,
@@ -26,6 +27,7 @@ export type Activity = {
 		| 'payroll'
 		| 'subscription'
 		| 'escrow'
+		| 'channel'
 		| 'withdraw'
 		| 'enroll'
 		| 'disclose';
@@ -43,6 +45,7 @@ class WalletStore {
 	payrolls = $state<Payroll[]>([]);
 	subscriptions = $state<Subscription[]>([]);
 	escrows = $state<Escrow[]>([]);
+	channels = $state<Channel[]>([]);
 	activity = $state<Activity[]>([]);
 	loading = $state(false);
 	/** Set when the pool contracts aren't configured (dev without deployed IDs). */
@@ -66,6 +69,11 @@ class WalletStore {
 		return this.escrows.filter((e) => e.releasable || e.refundable).length;
 	}
 
+	/** Channels with an action waiting (closeable as merchant, or reclaimable as subscriber). */
+	get channelActionCount(): number {
+		return this.channels.filter((c) => c.closeable || c.reclaimable).length;
+	}
+
 	get initialized() {
 		return this.status?.initialized ?? false;
 	}
@@ -84,6 +92,7 @@ class WalletStore {
 		this.payrolls = [];
 		this.subscriptions = [];
 		this.escrows = [];
+		this.channels = [];
 		this.activity = [];
 		await this.refreshStatus();
 	}
@@ -96,6 +105,7 @@ class WalletStore {
 		await this.refreshPayrolls();
 		await this.refreshSubscriptions();
 		await this.refreshEscrows();
+		await this.refreshChannels();
 	}
 
 	async refreshPayrolls() {
@@ -211,6 +221,64 @@ class WalletStore {
 		);
 		if (hash) this.log({ kind: 'escrow', label: `Refunded escrow #${escrowId}`, hash });
 		await this.refreshEscrows();
+	}
+
+	async refreshChannels() {
+		if (!this.unlocked) return;
+		try {
+			this.channels = await api.listChannels();
+		} catch (e) {
+			this.channels = [];
+			if (!isConfigError(e)) {
+				toast.error('Could not load channels', { description: errMessage(e) });
+			}
+		}
+	}
+
+	/** Open a subscription channel as the subscriber (proves + spends the cap). Returns the id. */
+	async openChannel(
+		asset: string,
+		cap: number,
+		merchantCode: string,
+		amountPerPeriod: number,
+		nPeriods: number,
+		periodSecs: number
+	) {
+		const id = await runAction(
+			'Opening channel',
+			() => api.openChannel(asset, cap, merchantCode, amountPerPeriod, nPeriods, periodSecs),
+			{ success: (id) => `Channel #${id} opened`, refresh: false }
+		);
+		if (id !== undefined) this.log({ kind: 'channel', label: `Opened channel #${id}` });
+		await this.refreshChannels();
+		return id;
+	}
+
+	/** Close a channel as the merchant (proves + mints both notes); logs activity + refreshes. */
+	async closeChannel(channelId: number) {
+		const hash = await runAction('Closing channel', () => api.closeChannel(channelId), {
+			success: () => 'Channel closed'
+		});
+		if (hash) this.log({ kind: 'channel', label: `Closed channel #${channelId}`, hash });
+		await this.refreshChannels();
+	}
+
+	/** Reclaim the full cap as the subscriber after expiry (proves + mints); refreshes. */
+	async reclaimChannel(channelId: number) {
+		const hash = await runAction('Reclaiming channel', () => api.reclaimChannel(channelId), {
+			success: () => 'Cap reclaimed'
+		});
+		if (hash) this.log({ kind: 'channel', label: `Reclaimed channel #${channelId}`, hash });
+		await this.refreshChannels();
+	}
+
+	/** Import a channel this wallet is the merchant for (decrypt the on-chain blob); refreshes. */
+	async importChannel(channelId: number) {
+		await runAction('Importing channel', () => api.importChannel(channelId), {
+			success: () => `Channel #${channelId} imported`,
+			refresh: false
+		});
+		await this.refreshChannels();
 	}
 
 	/** The active account's public (unshielded) Stellar balances — independent of the pool. */

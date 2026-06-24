@@ -2,6 +2,7 @@
 	import Workspace from '$lib/components/layout/Workspace.svelte';
 	import AssetSelect from '$lib/components/shared/AssetSelect.svelte';
 	import AmountInput from '$lib/components/shared/AmountInput.svelte';
+	import DenominationChips from '$lib/components/shared/DenominationChips.svelte';
 	import ProvingOverlay from '$lib/components/shared/ProvingOverlay.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -75,6 +76,7 @@
 					<Field.Field>
 						<Field.Label>Amount</Field.Label>
 						<AmountInput bind:value={amount} code={asset} decimals={bal?.decimals ?? 7} max={bal?.raw} />
+						<DenominationChips bind:value={amount} />
 						{#if bal}<Field.Description>Available: {bal.display} {asset}</Field.Description>{/if}
 					</Field.Field>
 				</Field.Group>

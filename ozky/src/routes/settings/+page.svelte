@@ -12,9 +12,12 @@
 	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
 	import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
 	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
+	import ZapIcon from '@lucide/svelte/icons/zap';
+	import ShieldIcon from '@lucide/svelte/icons/shield';
 	import { toast } from 'svelte-sonner';
 	import { api, errMessage } from '$lib/api';
 	import { wallet, runAction } from '$lib/wallet.svelte';
+	import { settings } from '$lib/settings.svelte';
 
 	let funding = $state('');
 	let keyOpen = $state(false);
@@ -85,6 +88,34 @@
 
 			<Card.Root>
 				<Card.Header>
+					<Card.Title>Default privacy</Card.Title>
+					<Card.Description>
+						The default mode for new payments. A timing strategy on this device only — both
+						modes look identical on-chain.
+					</Card.Description>
+				</Card.Header>
+				<Card.Content>
+					<div class="grid grid-cols-2 gap-2">
+						<button type="button" class="mode" data-active={settings.privacyMode === 'instant'} onclick={() => (settings.privacyMode = 'instant')}>
+							<ZapIcon class="size-4" />
+							<span class="flex flex-col items-start">
+								<span class="text-sm font-medium">Instant</span>
+								<span class="text-xs text-muted-foreground">Submit right away</span>
+							</span>
+						</button>
+						<button type="button" class="mode" data-active={settings.privacyMode === 'max'} onclick={() => (settings.privacyMode = 'max')}>
+							<ShieldIcon class="size-4" />
+							<span class="flex flex-col items-start">
+								<span class="text-sm font-medium">Maximum privacy</span>
+								<span class="text-xs text-muted-foreground">Delay before submit</span>
+							</span>
+						</button>
+					</div>
+				</Card.Content>
+			</Card.Root>
+
+			<Card.Root>
+				<Card.Header>
 					<Card.Title>Keys</Card.Title>
 					<Card.Description>Your spending public key (shareable) and network.</Card.Description>
 				</Card.Header>
@@ -124,3 +155,24 @@
 		</div>
 	</Dialog.Content>
 </Dialog.Root>
+
+<style>
+	.mode {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-md);
+		text-align: left;
+		transition: border-color 0.15s ease, background 0.15s ease;
+	}
+	.mode:hover {
+		border-color: color-mix(in oklch, var(--primary) 35%, var(--border));
+	}
+	.mode[data-active='true'] {
+		border-color: var(--primary);
+		background: color-mix(in oklch, var(--primary) 8%, transparent);
+		color: var(--primary);
+	}
+</style>

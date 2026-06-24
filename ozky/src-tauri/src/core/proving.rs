@@ -14,7 +14,7 @@
 
 use super::witness::{
     ChannelCloseWitness, ContributeWitness, DepositWitness, PayoutWitness, SplitWitness,
-    TransferWitness, WithdrawWitness,
+    SwapWitness, TransferWitness, WithdrawWitness,
 };
 use super::CoreError;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ pub enum Circuit {
     EscrowContribute,
     EscrowPayout,
     ChannelClose,
+    ShieldedSwap,
 }
 
 impl Circuit {
@@ -47,6 +48,7 @@ impl Circuit {
             Circuit::EscrowContribute => "escrow_contribute",
             Circuit::EscrowPayout => "escrow_payout",
             Circuit::ChannelClose => "channel_close",
+            Circuit::ShieldedSwap => "shielded_swap",
         }
     }
 }
@@ -178,6 +180,11 @@ pub fn prove_escrow_payout_witness(w: &PayoutWitness) -> Result<ProofBundle, Cor
 /// Prove a channel close (open cap + cumulative, verify Schnorr, mint two notes) against the frozen VK.
 pub fn prove_channel_close_witness(w: &ChannelCloseWitness) -> Result<ProofBundle, CoreError> {
     prove(Circuit::ChannelClose, &w.to_prover_toml())
+}
+
+/// Prove an in-pool swap (spend A-note, mint B-note + A change, conserve A) against the frozen VK.
+pub fn prove_swap_witness(w: &SwapWitness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::ShieldedSwap, &w.to_prover_toml())
 }
 
 // --- Command-facing entrypoints -------------------------------------------------
@@ -334,5 +341,51 @@ mod tests {
         let dsep = h.domain_sep(&Fr::from_u64(7), &Fr::from_u64(42), crate::core::poseidon::SELECTOR_WITHDRAW);
         let w = WithdrawWitness::demo(&h, 28, dsep);
         prove_withdraw_witness(&w).expect("withdraw demo must verify against frozen VK");
+    }
+
+    /// The Rust core's `SwapWitness` -> Prover.toml -> prove path produces a proof the FROZEN
+    /// shielded_swap VK accepts (SW4↔SW2 ABI check): spend a 1000 A-note, swap 800 into asset 2,
+    /// keep 200 A change, mint a 750 B-note.
+    #[test]
+    #[ignore = "needs the ZK Docker container; run with --ignored"]
+    fn swap_demo_proof_verifies_against_frozen_vk() {
+        use crate::core::witness::{SwapInputs, SwapWitness};
+        let h = Hasher::new();
+        let dsep = h.domain_sep(&Fr::from_u64(7), &Fr::from_u64(42), crate::core::poseidon::SELECTOR_SWAP);
+        let asset_a = Fr::from_u64(1);
+        let owner_sk = Fr::from_u64(12345);
+        let owner_pk = h.owner_pk(&owner_sk);
+        let epoch = Fr::from_u64(28);
+        let in_commitment = h.commitment(
+            &Fr::from_u64(1000), &asset_a, &owner_pk, &Fr::from_u64(777), &epoch, &Fr::from_u64(111),
+        );
+        let w = SwapWitness::build(
+            &h,
+            SwapInputs {
+                owner_sk,
+                asset_a_tag: asset_a,
+                asset_b_tag: Fr::from_u64(2),
+                epoch,
+                note_epoch: epoch,
+                domain_sep: dsep,
+                note_value: 1000,
+                note_blinding: Fr::from_u64(777),
+                note_rho: Fr::from_u64(111),
+                note_leaf_index: 0,
+                commitment_leaves: &[in_commitment],
+                asp_leaves: &[owner_pk],
+                prior_nullifiers: &[],
+                dummy_rho: Fr::from_u64(0xdead),
+                value_a: 800,
+                value_b: 750,
+                change_blinding: Fr::from_u64(444),
+                change_rho: Fr::from_u64(555),
+                out_owner_pk: owner_pk,
+                out_blinding: Fr::from_u64(888),
+                out_rho: Fr::from_u64(999),
+            },
+        );
+        let bundle = prove_swap_witness(&w).expect("swap demo must verify against frozen VK");
+        assert_eq!(bundle.public_inputs.len(), 448, "14 public inputs");
     }
 }

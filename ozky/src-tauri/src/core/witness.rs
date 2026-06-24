@@ -1268,6 +1268,145 @@ impl WithdrawWitness {
     }
 }
 
+// ----------------------------- in-pool swap (roadmap 2.5 Phase 2) -----------------------------
+
+/// In-pool constant-product AMM swap witness (roadmap 2.5 Phase 2). A withdraw-shaped spend of an
+/// A-note that ALSO mints a B-note bound to the public `value_b`. Public inputs in the canonical
+/// 14-field order (matches `circuits/shielded_swap`).
+pub struct SwapWitness {
+    pub domain_sep: Fr,
+    pub asset_a_tag: Fr,
+    pub asset_b_tag: Fr,
+    pub epoch: Fr,
+    pub commitment_root: Fr,
+    pub nullifier_old_root: Fr,
+    pub nullifier_new_root: Fr,
+    pub nullifiers: [Fr; 2],
+    pub change_commitment: Fr,
+    pub out_commitment_b: Fr,
+    pub asp_root: Fr,
+    pub value_a: Fr,
+    pub value_b: Fr,
+    pub owner_sk: Fr,
+    pub inputs: [InputWitness; 2],
+    pub change: OutputWitness,
+    pub out_b: OutputWitness,
+}
+
+pub struct SwapInputs<'a> {
+    pub owner_sk: Fr,
+    pub asset_a_tag: Fr,
+    pub asset_b_tag: Fr,
+    /// Current epoch — the public `epoch` input + new-note stamp.
+    pub epoch: Fr,
+    /// The spent A-note's mint epoch (recompute its commitment to match its leaf).
+    pub note_epoch: Fr,
+    pub domain_sep: Fr,
+    pub note_value: u64,
+    pub note_blinding: Fr,
+    pub note_rho: Fr,
+    pub note_leaf_index: usize,
+    pub commitment_leaves: &'a [Fr],
+    pub asp_leaves: &'a [Fr],
+    pub prior_nullifiers: &'a [Fr],
+    pub dummy_rho: Fr,
+    /// Amount of A consumed into the reserve (the AMM input).
+    pub value_a: u64,
+    /// Amount of B minted (the AMM output the contract prices + debits from reserve_B).
+    pub value_b: u64,
+    pub change_blinding: Fr,
+    pub change_rho: Fr,
+    /// The minted B-note's owner (this wallet) + freshness.
+    pub out_owner_pk: Fr,
+    pub out_blinding: Fr,
+    pub out_rho: Fr,
+}
+
+impl SwapWitness {
+    /// Build a swap witness against live state: spend an A-note, re-shield the A remainder
+    /// (value `note_value - value_a`), and mint a B-note of value `value_b`.
+    pub fn build(h: &Hasher, p: SwapInputs) -> SwapWitness {
+        let owner_pk = h.owner_pk(&p.owner_sk);
+        let nf0 = h.nullifier(&p.note_rho, &p.owner_sk);
+        let nf1 = h.nullifier(&p.dummy_rho, &p.owner_sk);
+        let (nf_old, nf_new, w0, w1) = build_two_insertions(h, p.prior_nullifiers, nf0, nf1);
+
+        let real_note = SpendNote {
+            value: p.note_value,
+            blinding: p.note_blinding,
+            epoch: p.note_epoch,
+            rho: p.note_rho,
+            leaf_index: p.note_leaf_index,
+        };
+        let real_in = real_input(h, &real_note, p.commitment_leaves, p.asp_leaves, owner_pk, w0);
+        let dummy_in = dummy_input(p.epoch, p.dummy_rho, w1);
+
+        let change = OutputWitness {
+            value: Fr::from_u64(p.note_value - p.value_a),
+            owner_pk,
+            blinding: p.change_blinding,
+            rho: p.change_rho,
+        };
+        let out_b = OutputWitness {
+            value: Fr::from_u64(p.value_b),
+            owner_pk: p.out_owner_pk,
+            blinding: p.out_blinding,
+            rho: p.out_rho,
+        };
+
+        SwapWitness {
+            domain_sep: p.domain_sep,
+            asset_a_tag: p.asset_a_tag,
+            asset_b_tag: p.asset_b_tag,
+            epoch: p.epoch,
+            commitment_root: real_in.cm.root,
+            nullifier_old_root: nf_old,
+            nullifier_new_root: nf_new,
+            nullifiers: [nf0, nf1],
+            change_commitment: change.commitment(h, &p.asset_a_tag, &p.epoch),
+            out_commitment_b: out_b.commitment(h, &p.asset_b_tag, &p.epoch),
+            asp_root: real_in.asp.root,
+            value_a: Fr::from_u64(p.value_a),
+            value_b: Fr::from_u64(p.value_b),
+            owner_sk: p.owner_sk,
+            inputs: [real_in, dummy_in],
+            change,
+            out_b,
+        }
+    }
+
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_a_tag = {}\n", q(&self.asset_a_tag)));
+        s.push_str(&format!("asset_b_tag = {}\n", q(&self.asset_b_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("commitment_root = {}\n", q(&self.commitment_root)));
+        s.push_str(&format!("nullifier_old_root = {}\n", q(&self.nullifier_old_root)));
+        s.push_str(&format!("nullifier_new_root = {}\n", q(&self.nullifier_new_root)));
+        s.push_str(&format!("nullifiers = {}\n", fr_array(&self.nullifiers)));
+        s.push_str(&format!("change_commitment = {}\n", q(&self.change_commitment)));
+        s.push_str(&format!("out_commitment_b = {}\n", q(&self.out_commitment_b)));
+        s.push_str(&format!("asp_root = {}\n", q(&self.asp_root)));
+        s.push_str(&format!("value_a = {}\n", q(&self.value_a)));
+        s.push_str(&format!("value_b = {}\n", q(&self.value_b)));
+        s.push_str(&format!("owner_sk = {}\n", q(&self.owner_sk)));
+        s.push_str(&input_block(&self.inputs[0]));
+        s.push_str(&input_block(&self.inputs[1]));
+        s.push_str("\n[change]\n");
+        s.push_str(&format!("value = {}\n", q(&self.change.value)));
+        s.push_str(&format!("owner_pk = {}\n", q(&self.change.owner_pk)));
+        s.push_str(&format!("blinding = {}\n", q(&self.change.blinding)));
+        s.push_str(&format!("rho = {}\n", q(&self.change.rho)));
+        s.push_str("\n[out_b]\n");
+        s.push_str(&format!("value = {}\n", q(&self.out_b.value)));
+        s.push_str(&format!("owner_pk = {}\n", q(&self.out_b.owner_pk)));
+        s.push_str(&format!("blinding = {}\n", q(&self.out_b.blinding)));
+        s.push_str(&format!("rho = {}\n", q(&self.out_b.rho)));
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

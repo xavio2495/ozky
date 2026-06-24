@@ -76,6 +76,120 @@ pub fn public_balances(addr: &str) -> Result<Vec<PublicBalance>, CoreError> {
     Ok(out)
 }
 
+/// One public (unshielded) payment on the wallet's classic Stellar account, from Horizon. The
+/// PUBLIC half of transaction history (FEATURE_SET G8) — funding, classic in/out payments. The
+/// SHIELDED half (pool flows) is the durable [`super::history`] store; the two are toggled in the UI.
+#[derive(serde::Serialize)]
+pub struct PublicTx {
+    /// "received" (credited this account) or "sent" (debited).
+    pub direction: String,
+    /// "create_account" | "payment" | "path_payment" | the raw Horizon type.
+    pub kind: String,
+    /// Human-readable amount (Horizon returns it already scaled).
+    pub amount: String,
+    /// "XLM" for native, else the asset code.
+    pub asset: String,
+    /// The other party (`G…`), when known.
+    pub counterparty: Option<String>,
+    /// Transaction hash.
+    pub hash: String,
+    /// Unix milliseconds (parsed from Horizon's `created_at`).
+    pub ts: i64,
+}
+
+/// Read the wallet's PUBLIC classic payment history from Horizon (newest first). Captures account
+/// funding (`create_account`) + classic `payment`/`path_payment` in/out. SAC (Soroban) deposit/
+/// withdraw legs are recorded on the shielded side (the wallet initiates and logs them), so this
+/// tab stays the "classic Stellar account" view. An unfunded account (404) returns an empty list.
+pub fn public_payments(addr: &str) -> Result<Vec<PublicTx>, CoreError> {
+    let url = format!(
+        "{}/accounts/{}/payments?order=desc&limit=50&join=transactions",
+        super::config::cfg_var("OZKY_HORIZON_URL").unwrap_or_else(|| DEFAULT_HORIZON_URL.into()),
+        addr
+    );
+    let resp = match ureq::get(&url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
+        Err(e) => return Err(CoreError::Chain(format!("horizon payments: {e}"))),
+    };
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| CoreError::Chain(format!("horizon payments decode: {e}")))?;
+    let records = v
+        .pointer("/_embedded/records")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let str_at = |o: &serde_json::Value, k: &str| -> String {
+        o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    let mut out = Vec::new();
+    for r in &records {
+        let kind = str_at(r, "type");
+        let hash = str_at(r, "transaction_hash");
+        let ts = chrono_ms(&str_at(r, "created_at"));
+        match kind.as_str() {
+            "create_account" => {
+                // The account was funded into existence.
+                let received = str_at(r, "account") == addr;
+                out.push(PublicTx {
+                    direction: if received { "received".into() } else { "sent".into() },
+                    kind,
+                    amount: str_at(r, "starting_balance"),
+                    asset: "XLM".into(),
+                    counterparty: Some(str_at(r, "funder")).filter(|s| !s.is_empty()),
+                    hash,
+                    ts,
+                });
+            }
+            "payment" | "path_payment_strict_receive" | "path_payment_strict_send" => {
+                let to = str_at(r, "to");
+                let from = str_at(r, "from");
+                let received = to == addr;
+                let asset = if str_at(r, "asset_type") == "native" {
+                    "XLM".into()
+                } else {
+                    str_at(r, "asset_code")
+                };
+                out.push(PublicTx {
+                    direction: if received { "received".into() } else { "sent".into() },
+                    kind: "payment".into(),
+                    amount: str_at(r, "amount"),
+                    asset,
+                    counterparty: Some(if received { from } else { to }).filter(|s| !s.is_empty()),
+                    hash,
+                    ts,
+                });
+            }
+            _ => {} // skip non-payment operation types
+        }
+    }
+    Ok(out)
+}
+
+/// Parse an RFC-3339 timestamp (Horizon `created_at`, e.g. `2026-06-24T12:34:56Z`) to unix ms.
+/// A tiny hand parser (no chrono dep): `YYYY-MM-DDThh:mm:ssZ`. Returns 0 on any malformation.
+fn chrono_ms(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
+        return 0;
+    }
+    let num = |a: usize, n: usize| -> i64 {
+        s[a..a + n].parse::<i64>().unwrap_or(0)
+    };
+    let (y, mo, d) = (num(0, 4), num(5, 2), num(8, 2));
+    let (h, mi, se) = (num(11, 2), num(14, 2), num(17, 2));
+    // Days since unix epoch via a civil-from-days algorithm (Howard Hinnant's), UTC.
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    (((days * 24 + h) * 60 + mi) * 60 + se) * 1000
+}
+
 /// How far back (ledgers) to scan a pool's events; testnet RPC retains ~120k.
 const SCAN_LOOKBACK: u32 = 120_000;
 /// Paging safety bounds for one event drain (mirrors the indexer's poller).
@@ -923,6 +1037,48 @@ pub fn submit_withdraw(
         sc_bytes(proof)?,
     ];
     invoke_contract(cfg, source_secret, &cfg.pool_contract, "withdraw", args)
+}
+
+// ----------------------------- in-pool shielded swap (roadmap 2.5 Phase 2) -----------------------------
+// Interior constant-product AMM swap (spec claude-docs/swap_pool_interface.md): spend an A-note,
+// mint a B-note priced by the pool's on-chain reserves, re-shield the A remainder. No public edge.
+
+/// Read the pool's AMM reserve balance for `asset_tag` (the `reserve(asset_tag)` view).
+pub fn read_reserve(cfg: &PoolConfig, asset_tag: &Fr) -> Result<i128, CoreError> {
+    match simulate_invoke(cfg, &cfg.pool_contract, "reserve", vec![sc_u256_fr(asset_tag)])? {
+        ScVal::I128(Int128Parts { hi, lo }) => Ok(((hi as i128) << 64) | (lo as i128)),
+        _ => Err(CoreError::Chain("reserve: unexpected return type".into())),
+    }
+}
+
+/// Submit a `shielded_swap` to the pool. `outputs[0]` is the A change note, `outputs[1]` the minted
+/// B note (same order as the proof's change_commitment / out_commitment_b). Returns the tx hash.
+pub fn submit_swap(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    asset_a_tag: &Fr,
+    asset_b_tag: &Fr,
+    public_inputs: &[u8],
+    proof: &[u8],
+    outputs: &[OutputPayload],
+) -> Result<String, CoreError> {
+    let enc_notes = sc_vec(
+        outputs.iter().map(|o| sc_bytes(&o.enc_note)).collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let ephemeral_pubs = sc_vec(
+        outputs.iter().map(|o| sc_bytes(&o.ephemeral_pub)).collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let view_tags = sc_vec(outputs.iter().map(|o| ScVal::U32(o.view_tag)).collect())?;
+    let args = vec![
+        sc_u256_fr(asset_a_tag),
+        sc_u256_fr(asset_b_tag),
+        sc_bytes(public_inputs)?,
+        sc_bytes(proof)?,
+        enc_notes,
+        ephemeral_pubs,
+        view_tags,
+    ];
+    invoke_contract(cfg, source_secret, &cfg.pool_contract, "shielded_swap", args)
 }
 
 // ----------------------------- escrow (building block B) -----------------------------

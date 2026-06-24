@@ -12,6 +12,7 @@
 	import SplitIcon from '@lucide/svelte/icons/split';
 	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import RepeatIcon from '@lucide/svelte/icons/repeat';
+	import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right';
 	import HandCoinsIcon from '@lucide/svelte/icons/hand-coins';
 	import ReceiptIcon from '@lucide/svelte/icons/receipt';
 	import TrendingUpIcon from '@lucide/svelte/icons/trending-up';
@@ -40,6 +41,7 @@
 		{ href: '/receive', label: 'Receive', icon: ArrowDownLeftIcon },
 		{ href: '/deposit', label: 'Deposit', icon: DownloadIcon },
 		{ href: '/withdraw', label: 'Withdraw', icon: UploadIcon },
+		{ href: '/swap', label: 'Swap', icon: ArrowLeftRightIcon },
 		{ href: '/transactions', label: 'Transactions', icon: ReceiptIcon },
 		{ href: '/markets', label: 'Markets', icon: TrendingUpIcon },
 		{ href: '/auditor', label: 'Auditor', icon: ScaleIcon },

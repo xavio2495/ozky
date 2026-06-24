@@ -33,6 +33,7 @@ pub const SELECTOR_SPLIT: u64 = 4;
 pub const SELECTOR_ESCROW_CONTRIBUTE: u64 = 5;
 pub const SELECTOR_ESCROW_PAYOUT: u64 = 6;
 pub const SELECTOR_CHANNEL_CLOSE: u64 = 7;
+pub const SELECTOR_SWAP: u64 = 8;
 
 /// Domain tags for escrow recipient bindings (circuit `notes::escrow`). Distinct so a refund
 /// proof can't pass as a release. MUST match the Noir `DOMAIN_ESCROW_*` constants.

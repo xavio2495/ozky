@@ -4,6 +4,7 @@
 	import AssetSelect from '$lib/components/shared/AssetSelect.svelte';
 	import AmountInput from '$lib/components/shared/AmountInput.svelte';
 	import AddressField from '$lib/components/shared/AddressField.svelte';
+	import DenominationChips from '$lib/components/shared/DenominationChips.svelte';
 	import ProvingOverlay from '$lib/components/shared/ProvingOverlay.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
@@ -64,6 +65,7 @@
 					<Field.Field>
 						<Field.Label>Amount</Field.Label>
 						<AmountInput bind:value={amount} code={asset} decimals={bal?.decimals ?? 7} />
+						<DenominationChips bind:value={amount} />
 						<Field.Description>Must be held in your public funding account first.</Field.Description>
 					</Field.Field>
 				</Field.Group>

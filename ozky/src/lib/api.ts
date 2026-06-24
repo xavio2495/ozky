@@ -118,6 +118,48 @@ export type Channel = {
 	reclaimable: boolean;
 };
 
+/** A persisted shielded-history entry (the wallet's own pool actions). Shape matches `Activity`. */
+export type ShieldedTx = {
+	id: number;
+	kind: string;
+	label: string;
+	detail?: string;
+	hash?: string;
+	/** Unix milliseconds. */
+	ts: number;
+};
+
+/** A public (classic Stellar) payment on the wallet's funding `G…` account, from Horizon. */
+export type PublicTx = {
+	direction: string; // "received" | "sent"
+	kind: string; // "create_account" | "payment"
+	amount: string;
+	asset: string;
+	counterparty?: string;
+	hash: string;
+	/** Unix milliseconds. */
+	ts: number;
+};
+
+/** An in-pool constant-product swap quote, read from the live on-chain reserves. */
+export type SwapQuote = {
+	/** Estimated destination amount at the current reserves, in base units. */
+	dest_amount: number;
+	/** Source reserve (base units). */
+	reserve_from: number;
+	/** Destination reserve (base units). */
+	reserve_to: number;
+};
+
+/** The result of an atomic in-pool swap. */
+export type SwapReceipt = {
+	tx_hash: string;
+	from: string;
+	to: string;
+	sent: number;
+	received: number;
+};
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -165,6 +207,16 @@ export const api = {
 	balance: () => invoke<AssetBalance[]>('balance'),
 	spendingKey: () => invoke<string>('spending_key'),
 	enroll: () => invoke<string>('enroll'),
+
+	publicHistory: () => invoke<PublicTx[]>('public_history'),
+	shieldedHistory: () => invoke<ShieldedTx[]>('shielded_history'),
+	recordActivity: (kind: string, label: string, detail?: string, hash?: string) =>
+		invoke<ShieldedTx>('record_activity', {
+			kind,
+			label,
+			detail: detail ?? null,
+			hash: hash ?? null
+		}),
 
 	deposit: (asset: string, amount: number) => invoke<string>('deposit', { asset, amount }),
 	send: (asset: string, recipient: string, amount: number) =>
@@ -218,6 +270,11 @@ export const api = {
 
 	withdraw: (asset: string, dest: string, amount: number) =>
 		invoke<string>('withdraw', { asset, dest, amount }),
+
+	swapQuote: (from: string, to: string, amount: number) =>
+		invoke<SwapQuote>('swap_quote', { from, to, amount }),
+	swap: (from: string, to: string, amount: number, slippageBps: number) =>
+		invoke<SwapReceipt>('swap', { from, to, amount, slippageBps }),
 
 	fundingAddress: () => invoke<string>('funding_address'),
 	receiveAddress: () => invoke<string>('receive_address'),

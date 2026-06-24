@@ -209,6 +209,47 @@ pub async fn public_balances() -> Result<Vec<core::chain::PublicBalance>, CoreEr
     .await
 }
 
+/// The active account's PUBLIC payment history from Horizon (funding + classic in/out), newest
+/// first. The public half of transaction history (G8); off the UI thread. (network)
+#[tauri::command]
+pub async fn public_history() -> Result<Vec<core::chain::PublicTx>, CoreError> {
+    blocking(|| {
+        let wallet = core::keys::current_wallet()?;
+        core::chain::public_payments(wallet.stellar_address())
+    })
+    .await
+}
+
+/// The active account's durable SHIELDED history (the wallet's pool actions, persisted encrypted
+/// at rest), newest first. The shielded half of transaction history (G8). (keychain)
+#[tauri::command]
+pub async fn shielded_history() -> Result<Vec<core::history::ShieldedTx>, CoreError> {
+    blocking(|| {
+        let wallet = core::keys::current_wallet()?;
+        core::history::load(&wallet)
+    })
+    .await
+}
+
+/// Persist one shielded action to the durable history store (mirrors the UI's in-session log so it
+/// survives restart). Returns the stored entry (id/ts filled in). (keychain)
+#[tauri::command]
+pub async fn record_activity(
+    kind: String,
+    label: String,
+    detail: Option<String>,
+    hash: Option<String>,
+) -> Result<core::history::ShieldedTx, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        core::history::record(
+            &wallet,
+            core::history::ShieldedTx { id: 0, kind, label, detail, hash, ts: 0 },
+        )
+    })
+    .await
+}
+
 /// Current USD spot prices (+ 24h change) for the wallet's assets. Public market data;
 /// needs no wallet. Network I/O runs off the UI thread.
 #[tauri::command]
@@ -915,6 +956,26 @@ pub async fn import_channel(channel_id: u64) -> Result<(), CoreError> {
 #[tauri::command]
 pub fn withdraw(asset: String, dest: String, amount: u64) -> Result<String, CoreError> {
     core::withdraw::withdraw(&asset, &dest, amount)
+}
+
+/// Quote swapping `amount` (base units) of `from` into `to` via the Stellar DEX (strict-send,
+/// Phase 1 edge swap). Read-only — moves no funds. (asset swap)
+#[tauri::command]
+pub async fn swap_quote(from: String, to: String, amount: u64) -> Result<core::swap::SwapQuote, CoreError> {
+    blocking(move || core::swap::quote(&from, &to, amount)).await
+}
+
+/// Swap `amount` (base units) of `from` into shielded `to`, tolerating up to `slippage_bps`
+/// basis points of slippage. PRIVACY-LEAKY edge swap (withdraw A -> public DEX -> deposit B);
+/// the UI warns. Proves off the UI thread; returns a per-leg receipt. (asset swap)
+#[tauri::command]
+pub async fn swap(
+    from: String,
+    to: String,
+    amount: u64,
+    slippage_bps: u32,
+) -> Result<core::swap::SwapReceipt, CoreError> {
+    blocking(move || core::swap::swap(&from, &to, amount, slippage_bps)).await
 }
 
 /// This wallet's **public Stellar funding address** (`G…`). Give this to any wallet or

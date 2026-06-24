@@ -1053,6 +1053,353 @@ mod tests {
         println!("REDEPOSITED_USDC_BASE={usdc_base}");
     }
 
+    /// One-off **channel-pool migration** (building block B phase 2): like [`deploy_escrow_pool`] but
+    /// the new pool's constructor includes ALL SEVEN verifiers — the 6 escrow-capable ones plus the
+    /// 7th `channel_close_verifier` (frozen `channel_close` VK). Withdraws owned notes from the OLD
+    /// pool, deploys the new 7-verifier pool (register XLM+USDC, enroll owner_pk +2 decoys, viewkeys,
+    /// relayer), re-deposits. Prints the new IDs for `ozky.config.json`.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture deploy_channel_pool
+    #[test]
+    #[ignore = "one-off channel-pool migration; needs ZK container + network + $OZKY_DEPLOY_MNEMONIC + ozky.config.json"]
+    fn deploy_channel_pool() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let h = Hasher::new();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let addr = wallet.stellar_address().to_string();
+        let secret = wallet.stellar_secret().to_string();
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
+
+        let notes_dir = std::env::temp_dir().join("ozky-channel-migrate-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+
+        // --- 1. Drain owned notes from the OLD pool note-by-note (see deploy_escrow_pool). ---
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
+        let mut old_cfg = PoolConfig::load().expect("old pool config (ozky.config.json)");
+        old_cfg.relayer_secret = None;
+
+        let drain = |asset: &str| -> u64 {
+            let c = old_cfg.clone().with_asset(asset).unwrap();
+            let mut total: u64 = 0;
+            let mut done: Vec<u32> = Vec::new();
+            loop {
+                let st = chain::pool_state(&c).unwrap();
+                let local = notes::load(&wallet).unwrap();
+                let mut owned: Vec<_> = scan::owned_notes(&id, &st, &local, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|n| n.asset_tag == c.asset_tag && !done.contains(&n.leaf_index))
+                    .collect();
+                if owned.is_empty() {
+                    break;
+                }
+                owned.sort_by_key(|n| std::cmp::Reverse(n.value));
+                let n = &owned[0];
+                withdraw::withdraw_with(&wallet, &c, &addr, n.value)
+                    .unwrap_or_else(|e| panic!("withdraw {asset} note {}: {e:?}", n.leaf_index));
+                eprintln!("withdrew {} {asset} base (note {})", n.value, n.leaf_index);
+                total += n.value;
+                done.push(n.leaf_index);
+                std::thread::sleep(std::time::Duration::from_secs(7));
+            }
+            total
+        };
+
+        let xlm_base = drain("XLM");
+        let usdc_base = drain("USDC");
+        eprintln!("OLD pool drained: {} XLM base, {} USDC base", xlm_base, usdc_base);
+
+        // --- 2. Deploy the NEW channel-capable pool (7 verifiers incl. channel_close). ---
+        let setup = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             T=/workspace/contracts/target/wasm32v1-none/release\n\
+             VK=/workspace/contracts/frozen_vks\n\
+             V=$T/rs_soroban_ultrahonk.wasm\n\
+             VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
+             VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
+             VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
+             VSPL=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/split/vk)\n\
+             VECON=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_contribute/vk)\n\
+             VEPAY=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_payout/vk)\n\
+             VCHAN=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/channel_close/vk)\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
+             SAC=$(stellar contract id asset --asset native --network testnet)\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --split_verifier $VSPL --escrow_contribute_verifier $VECON --escrow_payout_verifier $VEPAY --channel_close_verifier $VCHAN --policy $POLICY --asp_root $ASP --admin {addr})\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             EURC_ISSUER=GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO\n\
+             EURC_SAC=$(stellar contract id asset --asset EURC:$EURC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset EURC:$EURC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 4 --sac $EURC_SAC --decimals 7 >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
+        );
+        let out = run_zk(&secret, &setup);
+        let pool = kv(&out, "POOL");
+        let policy = kv(&out, "POLICY");
+        let viewkeys = kv(&out, "VIEWKEYS");
+        let relayer_secret = kv(&out, "RELAYER_SECRET");
+
+        std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        std::env::remove_var("OZKY_RELAYER_SECRET"); // deposit is user-sourced anyway
+        let new_cfg = PoolConfig::load().unwrap();
+
+        // --- 3. Re-deposit the recovered amounts into the NEW pool. ---
+        if xlm_base > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("XLM").unwrap(), xlm_base)
+                .expect("re-deposit XLM into new pool");
+        }
+        if usdc_base > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("USDC").unwrap(), usdc_base)
+                .expect("re-deposit USDC into new pool");
+        }
+
+        println!("=== CHANNEL POOL DEPLOY DONE ===");
+        println!("OZKY_POOL_CONTRACT={pool}");
+        println!("OZKY_POLICY_CONTRACT={policy}");
+        println!("OZKY_VIEWKEYS_CONTRACT={viewkeys}");
+        println!("OZKY_RELAYER_SECRET={relayer_secret}");
+        println!("REDEPOSITED_XLM_BASE={xlm_base}");
+        println!("REDEPOSITED_USDC_BASE={usdc_base}");
+    }
+
+    /// Roadmap 2.5 Phase 2 (SW5): migrate to an 8-verifier SWAP-capable pool, then seed the AMM
+    /// XLM+USDC reserves from the drained balance and re-deposit the remainder. Mirrors
+    /// `deploy_channel_pool` + the 8th `shielded_swap_verifier`; seeds `XLM_RESERVE`/`USDC_RESERVE`
+    /// base units (defaults 20 XLM / 1 USDC) so a live swap is immediately demonstrable. The
+    /// reserve is the user's own liquidity (admin can `withdraw_reserve` it back).
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture deploy_swap_pool
+    #[test]
+    #[ignore = "one-off swap-pool migration; needs ZK container + network + $OZKY_DEPLOY_MNEMONIC + ozky.config.json"]
+    fn deploy_swap_pool() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let h = Hasher::new();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let addr = wallet.stellar_address().to_string();
+        let secret = wallet.stellar_secret().to_string();
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
+
+        // Reserve seed amounts (base units). Overridable; defaults 20 XLM / 1 USDC.
+        let xlm_reserve: u64 = std::env::var("XLM_RESERVE").ok().and_then(|s| s.parse().ok()).unwrap_or(20 * 10_000_000);
+        let usdc_reserve: u64 = std::env::var("USDC_RESERVE").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+
+        let notes_dir = std::env::temp_dir().join("ozky-swap-migrate-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+
+        // --- 1. Drain owned notes from the OLD pool note-by-note. ---
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
+        let mut old_cfg = PoolConfig::load().expect("old pool config (ozky.config.json)");
+        old_cfg.relayer_secret = None;
+        let drain = |asset: &str| -> u64 {
+            let c = old_cfg.clone().with_asset(asset).unwrap();
+            let mut total: u64 = 0;
+            let mut done: Vec<u32> = Vec::new();
+            loop {
+                let st = chain::pool_state(&c).unwrap();
+                let local = notes::load(&wallet).unwrap();
+                let mut owned: Vec<_> = scan::owned_notes(&id, &st, &local, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|n| n.asset_tag == c.asset_tag && !done.contains(&n.leaf_index))
+                    .collect();
+                if owned.is_empty() {
+                    break;
+                }
+                owned.sort_by_key(|n| std::cmp::Reverse(n.value));
+                let n = &owned[0];
+                withdraw::withdraw_with(&wallet, &c, &addr, n.value)
+                    .unwrap_or_else(|e| panic!("withdraw {asset} note {}: {e:?}", n.leaf_index));
+                eprintln!("withdrew {} {asset} base (note {})", n.value, n.leaf_index);
+                total += n.value;
+                done.push(n.leaf_index);
+                std::thread::sleep(std::time::Duration::from_secs(7));
+            }
+            total
+        };
+        let xlm_base = drain("XLM");
+        let usdc_base = drain("USDC");
+        eprintln!("OLD pool drained: {} XLM base, {} USDC base", xlm_base, usdc_base);
+        assert!(xlm_base > xlm_reserve, "need > {xlm_reserve} XLM base to seed the reserve");
+        assert!(usdc_base > usdc_reserve, "need > {usdc_reserve} USDC base to seed the reserve");
+
+        // --- 2. Deploy the NEW swap-capable pool (8 verifiers incl. shielded_swap) + seed reserves. ---
+        let setup = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             T=/workspace/contracts/target/wasm32v1-none/release\n\
+             VK=/workspace/contracts/frozen_vks\n\
+             V=$T/rs_soroban_ultrahonk.wasm\n\
+             VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
+             VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
+             VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
+             VSPL=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/split/vk)\n\
+             VECON=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_contribute/vk)\n\
+             VEPAY=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_payout/vk)\n\
+             VCHAN=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/channel_close/vk)\n\
+             VSWAP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/shielded_swap/vk)\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
+             SAC=$(stellar contract id asset --asset native --network testnet)\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --deposit_verifier $VDEP --transfer_verifier $VTRA --withdraw_verifier $VWIT --split_verifier $VSPL --escrow_contribute_verifier $VECON --escrow_payout_verifier $VEPAY --channel_close_verifier $VCHAN --swap_verifier $VSWAP --policy $POLICY --asp_root $ASP --admin {addr})\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             EURC_ISSUER=GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO\n\
+             EURC_SAC=$(stellar contract id asset --asset EURC:$EURC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset EURC:$EURC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 4 --sac $EURC_SAC --decimals 7 >/dev/null\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- seed_reserve --asset_tag 1 --amount {xlm_reserve} >/dev/null\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- seed_reserve --asset_tag 2 --amount {usdc_reserve} >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
+            xlm_reserve = xlm_reserve, usdc_reserve = usdc_reserve,
+        );
+        let out = run_zk(&secret, &setup);
+        let pool = kv(&out, "POOL");
+        let policy = kv(&out, "POLICY");
+        let viewkeys = kv(&out, "VIEWKEYS");
+        let relayer_secret = kv(&out, "RELAYER_SECRET");
+
+        std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        std::env::remove_var("OZKY_RELAYER_SECRET");
+        let new_cfg = PoolConfig::load().unwrap();
+
+        // --- 3. Re-deposit the remainder (drained - reserve) into the NEW pool. ---
+        let xlm_redeposit = xlm_base - xlm_reserve;
+        let usdc_redeposit = usdc_base - usdc_reserve;
+        if xlm_redeposit > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("XLM").unwrap(), xlm_redeposit)
+                .expect("re-deposit XLM into new pool");
+        }
+        if usdc_redeposit > 0 {
+            deposit::deposit_with(&wallet, &new_cfg.clone().with_asset("USDC").unwrap(), usdc_redeposit)
+                .expect("re-deposit USDC into new pool");
+        }
+
+        println!("=== SWAP POOL DEPLOY DONE (8 verifiers) ===");
+        println!("OZKY_POOL_CONTRACT={pool}");
+        println!("OZKY_POLICY_CONTRACT={policy}");
+        println!("OZKY_VIEWKEYS_CONTRACT={viewkeys}");
+        println!("OZKY_RELAYER_SECRET={relayer_secret}");
+        println!("SEEDED_XLM_RESERVE={xlm_reserve} SEEDED_USDC_RESERVE={usdc_reserve}");
+        println!("REDEPOSITED_XLM_BASE={xlm_redeposit} REDEPOSITED_USDC_BASE={usdc_redeposit}");
+    }
+
+    /// Roadmap 2.5 Phase 2 (SW5): the REAL in-pool swap lifecycle on the swap-capable pool. Reads
+    /// `$OZKY_DEPLOY_MNEMONIC`; swaps `SWAP_XLM` base (default 5 XLM) of shielded XLM into USDC via
+    /// the constant-product AMM, then rescans and asserts a USDC note was minted, XLM was spent, and
+    /// the reserves moved as priced. Proves the 14-PI `shielded_swap` proof verifies on-chain.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture swap_lifecycle_on_testnet
+    #[test]
+    #[ignore = "live swap lifecycle; needs ZK container + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn swap_lifecycle_on_testnet() {
+        use crate::core::swap;
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        let notes_dir = std::env::temp_dir().join("ozky-swap-test-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().unwrap();
+        let xlm = cfg.clone().with_asset("XLM").unwrap();
+        let usdc = cfg.clone().with_asset("USDC").unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let swap_xlm: u64 = std::env::var("SWAP_XLM").ok().and_then(|s| s.parse().ok()).unwrap_or(5 * 10_000_000);
+
+        let shielded = |c: &PoolConfig| -> u64 {
+            let st = chain::pool_state(c).unwrap();
+            scan::owned_notes(&id, &st, &notes::load(&wallet).unwrap(), 0).unwrap().iter()
+                .filter(|n| n.asset_tag == c.asset_tag).map(|n| n.value).sum()
+        };
+
+        let xlm_before = shielded(&xlm);
+        let usdc_before = shielded(&usdc);
+        let res_xlm_before = chain::read_reserve(&cfg, &xlm.asset_tag).unwrap();
+        let res_usdc_before = chain::read_reserve(&cfg, &usdc.asset_tag).unwrap();
+        eprintln!("before: shielded XLM {xlm_before} USDC {usdc_before}; reserves XLM {res_xlm_before} USDC {res_usdc_before}");
+
+        let q = swap::quote("XLM", "USDC", swap_xlm).expect("quote");
+        eprintln!("quote: {} XLM -> ~{} USDC base", swap_xlm, q.dest_amount);
+        let receipt = swap::swap_with(&wallet, &cfg, "XLM", "USDC", swap_xlm, 100)
+            .expect("swap must succeed on-chain");
+        eprintln!("SWAP OK tx {} received {} USDC base", receipt.tx_hash, receipt.received);
+
+        // Rescan: a USDC note was minted, XLM shielded dropped by ~swap_xlm, reserves moved.
+        let xlm_after = shielded(&xlm);
+        let usdc_after = shielded(&usdc);
+        let res_xlm_after = chain::read_reserve(&cfg, &xlm.asset_tag).unwrap();
+        let res_usdc_after = chain::read_reserve(&cfg, &usdc.asset_tag).unwrap();
+        eprintln!("after: shielded XLM {xlm_after} USDC {usdc_after}; reserves XLM {res_xlm_after} USDC {res_usdc_after}");
+
+        assert_eq!(usdc_after, usdc_before + receipt.received, "minted B-note credited");
+        assert_eq!(xlm_after, xlm_before - swap_xlm, "A spent: swapped value left the XLM balance");
+        assert_eq!(res_xlm_after, res_xlm_before + swap_xlm as i128, "reserve_A += value_a");
+        assert_eq!(res_usdc_after, res_usdc_before - receipt.received as i128, "reserve_B -= value_b");
+        println!("SWAP LIFECYCLE OK");
+    }
+
     /// One-off: perform a REAL split on the configured (split-capable) pool. Reads
     /// `$OZKY_DEPLOY_MNEMONIC`, splits 30 XLM -> 3 self-codes (10 each) + change, then
     /// rescans and asserts the 3 outputs + change landed and the input note is spent.
@@ -1186,6 +1533,126 @@ mod tests {
 
         eprintln!("XLM shielded after escrow: {} base", shielded_xlm(&xlm));
         println!("ESCROW LIFECYCLE OK (release id={id_a}, refund id={id_b})");
+    }
+
+    /// One-off: register **EURC** (asset_tag 4) on the configured pool. The deploy scripts seed
+    /// XLM(1)+USDC(2); this adds EURC for a pool that was deployed before the script registered it
+    /// (the wallet is the pool admin, so `register_asset` is authorized by its secret). Idempotent
+    /// on the SAC (the asset deploy is `|| true`); re-registering a tag just overwrites the mapping.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture register_eurc_on_pool
+    #[test]
+    #[ignore = "one-off EURC registration; needs ZK container + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn register_eurc_on_pool() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let secret = wallet.stellar_secret().to_string();
+        let pool = PoolConfig::load().expect("ozky.config.json").pool_contract;
+        let script = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             EURC_ISSUER=GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO\n\
+             EURC_SAC=$(stellar contract id asset --asset EURC:$EURC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset EURC:$EURC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id {pool} --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 4 --sac $EURC_SAC --decimals 7 >/dev/null\n\
+             echo \"EURC_SAC=$EURC_SAC\"\n\
+             echo REGISTERED",
+            pool = pool,
+        );
+        let out = run_zk(&secret, &script);
+        assert!(out.contains("REGISTERED"), "EURC registration failed:\n{out}");
+        println!("EURC REGISTERED on pool {pool}: {}", kv(&out, "EURC_SAC"));
+    }
+
+    /// One-off: the REAL merchant-pull channel lifecycle on the configured (channel-capable) pool
+    /// (building block B phase 2). Reads `$OZKY_DEPLOY_MNEMONIC`; the one wallet plays BOTH subscriber
+    /// and merchant (a self-test: the merchant_code is the wallet's own code, so both minted notes
+    /// land back here and total XLM is conserved). Two paths:
+    ///   A) CLOSE — open(cap 10 XLM, 1 period of 6 XLM, ~1 ledger/period), wait for the period to
+    ///      elapse, close as merchant; assert status=Closed and the 6-XLM draw + 4-XLM remainder are
+    ///      ours (XLM conserved).
+    ///   B) RECLAIM — open(cap 5 XLM, short expiry), wait past expiry, reclaim as subscriber; assert
+    ///      status=Closed and the 5-XLM cap came back.
+    /// Proves the 10-PI `channel_close` (incl. the in-circuit Schnorr) verifies within the per-tx budget.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture channel_lifecycle_on_testnet
+    #[test]
+    #[ignore = "live channel lifecycle; needs ZK container + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn channel_lifecycle_on_testnet() {
+        use crate::core::channel;
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        let notes_dir = std::env::temp_dir().join("ozky-channel-test-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().unwrap();
+        let xlm = cfg.clone().with_asset("XLM").unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let code = payment_code(&id);
+        let one_xlm = 10_000_000u64;
+
+        let shielded_xlm = || -> u64 {
+            let st = chain::pool_state(&xlm).unwrap();
+            scan::owned_notes(&id, &st, &notes::load(&wallet).unwrap(), 0)
+                .unwrap()
+                .iter()
+                .filter(|n| n.asset_tag == xlm.asset_tag)
+                .map(|n| n.value)
+                .sum()
+        };
+        let before = shielded_xlm();
+        eprintln!("XLM shielded before channel: {} base", before);
+
+        // ---- Path A: CLOSE (merchant draws part of the cap, remainder refunds to subscriber) ----
+        // cap 10 XLM; 1 period of 6 XLM, ~1 ledger/period. Self-test: merchant_code = our own code.
+        let cap_a = 10 * one_xlm;
+        let id_a = channel::open(&wallet, &cfg, "XLM", cap_a, &code, 6 * one_xlm, 1, 1)
+            .expect("open channel A");
+        eprintln!("opened channel A id={id_a} (cap 10 XLM, draw 6 XLM)");
+        // Wait for period 1's valid_after_ledger (open_ledger + 1) to elapse (~3 ledgers).
+        std::thread::sleep(std::time::Duration::from_secs(18));
+        let hash_a = channel::close(&wallet, &cfg, id_a).expect("close channel A");
+        assert!(!hash_a.is_empty());
+        eprintln!("CLOSE A OK tx {hash_a}");
+        let st_a = chain::read_channel(&cfg, id_a).unwrap();
+        assert_eq!(st_a.status, 1, "channel A must be Closed");
+        // Both the 6-XLM draw and the 4-XLM remainder are ours (self-test) — XLM conserved.
+        let notes_a = {
+            let st = chain::pool_state(&xlm).unwrap();
+            scan::owned_notes(&id, &st, &notes::load(&wallet).unwrap(), 0).unwrap()
+        };
+        assert!(notes_a.iter().any(|n| n.value == 6 * one_xlm), "6-XLM merchant draw note");
+        assert!(notes_a.iter().any(|n| n.value == 4 * one_xlm), "4-XLM subscriber remainder note");
+
+        // ---- Path B: RECLAIM (channel expires unclosed; subscriber sweeps the full cap) ----
+        let cap_b = 5 * one_xlm;
+        let id_b = channel::open(&wallet, &cfg, "XLM", cap_b, &code, 5 * one_xlm, 1, 1)
+            .expect("open channel B");
+        eprintln!("opened channel B id={id_b} (cap 5 XLM, expiry ~2 ledgers out)");
+        // expiry = open_ledger + (1+1)*1; wait past it (~4 ledgers) so the reclaim guard holds.
+        std::thread::sleep(std::time::Duration::from_secs(24));
+        let hash_b = channel::reclaim(&wallet, &cfg, id_b).expect("reclaim channel B");
+        assert!(!hash_b.is_empty());
+        eprintln!("RECLAIM B OK tx {hash_b}");
+        let st_b = chain::read_channel(&cfg, id_b).unwrap();
+        assert_eq!(st_b.status, 1, "channel B must be Closed (reclaimed)");
+
+        let after = shielded_xlm();
+        eprintln!("XLM shielded after channel: {} base", after);
+        // Channels are interior accounting (mint-only close/reclaim): total shielded XLM is conserved.
+        assert_eq!(after, before, "channel lifecycle conserves total shielded XLM");
+        println!("CHANNEL LIFECYCLE OK (close id={id_a}, reclaim id={id_b})");
     }
 
     #[test]

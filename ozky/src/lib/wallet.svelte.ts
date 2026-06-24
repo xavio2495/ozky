@@ -29,6 +29,7 @@ export type Activity = {
 		| 'escrow'
 		| 'channel'
 		| 'withdraw'
+		| 'swap'
 		| 'enroll'
 		| 'disclose';
 	label: string;
@@ -106,6 +107,7 @@ class WalletStore {
 		await this.refreshSubscriptions();
 		await this.refreshEscrows();
 		await this.refreshChannels();
+		await this.refreshHistory();
 	}
 
 	async refreshPayrolls() {
@@ -356,6 +358,30 @@ class WalletStore {
 	log(entry: Omit<Activity, 'id' | 'ts'>) {
 		this.activity.unshift({ ...entry, id: this.#nextId++, ts: Date.now() });
 		this.activity = this.activity.slice(0, 50);
+		// Mirror into the durable shielded-history store so it survives lock/restart (G8).
+		void api
+			.recordActivity(entry.kind, entry.label, entry.detail, entry.hash)
+			.catch(() => {});
+	}
+
+	/** Load the durable shielded history (the wallet's own pool actions) into `activity`. */
+	async refreshHistory() {
+		if (!this.unlocked) return;
+		try {
+			const persisted = await api.shieldedHistory();
+			this.activity = persisted.slice(0, 50).map((t) => ({
+				id: t.id,
+				kind: t.kind as Activity['kind'],
+				label: t.label,
+				detail: t.detail,
+				hash: t.hash,
+				ts: t.ts
+			}));
+			// Continue ids past the highest persisted one so new in-session logs don't collide.
+			this.#nextId = persisted.reduce((m, t) => Math.max(m, t.id), 0) + 1;
+		} catch {
+			// Best-effort: an empty/locked store just leaves the in-session log.
+		}
 	}
 }
 

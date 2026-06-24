@@ -17,6 +17,7 @@ mod escrow;
 mod inputs;
 mod nullifier;
 mod poseidon;
+mod reserve;
 mod tree;
 mod verifier;
 
@@ -97,6 +98,11 @@ pub enum Error {
     /// `valid_after_ledger` public input is greater than the current ledger (drawing a future
     /// period early).
     ValidAfterNotReached = 29,
+    /// Swap source and destination assets are the same.
+    BadSwapAssets = 30,
+    /// The AMM reserve cannot deliver the proof's `value_b` (price moved / insufficient liquidity),
+    /// or a reserve-withdraw exceeds the available reserve.
+    ReserveTooLow = 31,
 }
 
 #[contract]
@@ -117,6 +123,7 @@ impl Pool {
         escrow_contribute_verifier: Address,
         escrow_payout_verifier: Address,
         channel_close_verifier: Address,
+        swap_verifier: Address,
         policy: Address,
         asp_root: U256,
         admin: Address,
@@ -136,6 +143,7 @@ impl Pool {
                 escrow_contribute_verifier,
                 escrow_payout_verifier,
                 channel_close_verifier,
+                swap_verifier,
                 policy,
                 asp_root,
                 admin,
@@ -753,6 +761,113 @@ impl Pool {
         Ok(leaf)
     }
 
+    /// Admin: seed/add AMM liquidity reserve for `asset_tag` (pulls `amount` real SAC tokens from
+    /// the admin into the pool, increasing the reserve). Roadmap 2.5 Phase 2.
+    pub fn seed_reserve(env: Env, asset_tag: U256, amount: i128) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        cfg.admin.require_auth();
+        let info = assets::get(&env, &asset_tag).ok_or(Error::AssetMismatch)?;
+        if amount <= 0 {
+            return Err(Error::AmountMismatch);
+        }
+        token::TokenClient::new(&env, &info.sac).transfer(
+            &cfg.admin,
+            &env.current_contract_address(),
+            &amount,
+        );
+        reserve::set(&env, &asset_tag, reserve::get(&env, &asset_tag) + amount);
+        Ok(())
+    }
+
+    /// Admin: withdraw `amount` of `asset_tag` reserve liquidity back out to `to`.
+    pub fn withdraw_reserve(env: Env, asset_tag: U256, amount: i128, to: Address) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        cfg.admin.require_auth();
+        let info = assets::get(&env, &asset_tag).ok_or(Error::AssetMismatch)?;
+        let bal = reserve::get(&env, &asset_tag);
+        if amount <= 0 || amount > bal {
+            return Err(Error::ReserveTooLow);
+        }
+        reserve::set(&env, &asset_tag, bal - amount);
+        token::TokenClient::new(&env, &info.sac).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+        Ok(())
+    }
+
+    /// The AMM reserve balance for `asset_tag` (base units).
+    pub fn reserve(env: Env, asset_tag: U256) -> i128 {
+        reserve::get(&env, &asset_tag)
+    }
+
+    /// In-pool shielded swap (roadmap 2.5 Phase 2 - constant-product AMM). Spends an A-note,
+    /// mints a B-note priced by the pool's reserves, and re-shields the A remainder. NO token
+    /// movement - the swap re-labels value between notes and the reserve within the pool's vaults.
+    /// Public inputs: [domain_sep, asset_a_tag, asset_b_tag, epoch, commitment_root,
+    /// nullifier_old_root, nullifier_new_root, nf0, nf1, change_commitment, out_commitment_b,
+    /// asp_root, value_a, value_b]. `enc_notes[0]/...[0]` describe the A change note, `[1]` the B note.
+    pub fn shielded_swap(
+        env: Env,
+        asset_a_tag: U256,
+        asset_b_tag: U256,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_notes: Vec<Bytes>,
+        ephemeral_pubs: Vec<BytesN<32>>,
+        view_tags: Vec<u32>,
+    ) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        let f = inputs::read_fields(&env, &public_inputs, inputs::SWAP_N)?;
+
+        // Common checks (swap layout: asset_a at 1, asset_b at 2, epoch at 3).
+        let expected_domain =
+            domain::compute_domain_sep(&env, &cfg.pool_id, &cfg.network_id, domain::SELECTOR_SWAP);
+        if f.get(0).unwrap() != expected_domain {
+            return Err(Error::BadDomainSep);
+        }
+        if f.get(1).unwrap() != asset_a_tag || f.get(2).unwrap() != asset_b_tag {
+            return Err(Error::AssetMismatch);
+        }
+        if asset_a_tag == asset_b_tag {
+            return Err(Error::BadSwapAssets);
+        }
+        // Both assets must be registered (so the SAC balance backs the reserves).
+        assets::get(&env, &asset_a_tag).ok_or(Error::AssetMismatch)?;
+        assets::get(&env, &asset_b_tag).ok_or(Error::AssetMismatch)?;
+        if f.get(3).unwrap() != U256::from_u128(&env, current_epoch(&env) as u128) {
+            return Err(Error::BadEpoch);
+        }
+        require_recent_root(&env, &f.get(4).unwrap())?;
+        require_asp_root(&cfg, &f.get(11).unwrap())?;
+        require_nullifier_base(&env, &f.get(5).unwrap())?;
+
+        verifier::verify(&env, &cfg.swap_verifier, public_inputs, proof)?;
+
+        // Constant-product pricing: the proof's `value_b` must be deliverable at the current
+        // reserves (also acts as the user's min-out floor; surplus stays with the reserve).
+        let value_a = f.get(12).unwrap();
+        let value_b = f.get(13).unwrap();
+        let reserve_a = reserve::get(&env, &asset_a_tag);
+        let reserve_b = reserve::get(&env, &asset_b_tag);
+        let quote_b = amm_quote(&env, &value_a, reserve_a, reserve_b)?;
+        if value_b > quote_b || value_b == U256::from_u32(&env, 0) {
+            return Err(Error::ReserveTooLow);
+        }
+        let value_a_i = value_a.to_u128().ok_or(Error::ReserveTooLow)? as i128;
+        let value_b_i = value_b.to_u128().ok_or(Error::ReserveTooLow)? as i128;
+        reserve::set(&env, &asset_a_tag, reserve_a + value_a_i);
+        reserve::set(&env, &asset_b_tag, reserve_b - value_b_i);
+
+        nullifier::set_root(&env, &f.get(6).unwrap());
+        emit_nullifiers(&env, &f.get(7).unwrap(), &f.get(8).unwrap());
+        append_and_emit(&env, &f.get(9).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 0)?;
+        append_and_emit(&env, &f.get(10).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 1)?;
+        emit_roots(&env);
+        Ok(())
+    }
+
     /// The current commitment-tree root.
     pub fn commitment_root(env: Env) -> U256 {
         tree::current_root(&env)
@@ -785,6 +900,25 @@ fn compute_dest_bind(env: &Env, dest: &Address) -> Result<U256, Error> {
     inputs.push_back(U256::from_u128(env, DOMAIN_DEST as u128));
     inputs.push_back(dest_field);
     Ok(poseidon::hash(env, &inputs))
+}
+
+/// Swap fee in basis points (0.30%), retained by the reserve (LP benefit).
+const SWAP_FEE_BPS: u128 = 30;
+
+/// Constant-product quote: how much B the reserves can deliver for `value_a` of A, after fee.
+/// `quote_b = reserve_b * amount_in / (reserve_a + amount_in)` with
+/// `amount_in = value_a * (10000 - fee) / 10000`. All in U256 (the product can exceed i128).
+fn amm_quote(env: &Env, value_a: &U256, reserve_a: i128, reserve_b: i128) -> Result<U256, Error> {
+    let bps = U256::from_u128(env, 10_000);
+    let fee_factor = U256::from_u128(env, 10_000 - SWAP_FEE_BPS);
+    let amount_in = value_a.mul(&fee_factor).div(&bps);
+    let res_a = U256::from_u128(env, reserve_a as u128);
+    let res_b = U256::from_u128(env, reserve_b as u128);
+    let den = res_a.add(&amount_in);
+    if den == U256::from_u32(env, 0) {
+        return Err(Error::ReserveTooLow);
+    }
+    Ok(res_b.mul(&amount_in).div(&den))
 }
 
 /// Cross-contract read of the policy contract's deposit allow-list.
@@ -1020,6 +1154,7 @@ mod entrypoint_tests {
             (
                 pool_id.clone(),
                 network_id.clone(),
+                verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
                 verifier.clone(),
@@ -1273,6 +1408,130 @@ mod entrypoint_tests {
             .pool()
             .try_withdraw(&dest, &f.asset_tag, &400, &pi, &Bytes::new(env));
         assert_eq!(res, Err(Ok(Error::BadDestBind)));
+    }
+
+    // ----------------------------- in-pool swap (roadmap 2.5 Phase 2) -----------------------------
+
+    /// Register a second asset (tag 2) + seed both reserves, returning (asset_b_tag, sac_b).
+    fn setup_swap_reserves(f: &Fixture, res_a: i128, res_b: i128) -> U256 {
+        let env = &f.env;
+        let sac_b = env.register_stellar_asset_contract_v2(f.admin.clone());
+        let asset_b = U256::from_u32(env, 2);
+        f.pool().register_asset(&asset_b, &sac_b.address(), &6);
+        // Fund the admin and seed both reserves (pulls real SAC into the pool).
+        StellarAssetClient::new(env, &f.sac).mint(&f.admin, &res_a);
+        StellarAssetClient::new(env, &sac_b.address()).mint(&f.admin, &res_b);
+        f.pool().seed_reserve(&f.asset_tag, &res_a);
+        f.pool().seed_reserve(&asset_b, &res_b);
+        asset_b
+    }
+
+    fn swap_inputs(f: &Fixture, asset_b: &U256, value_a: u128, value_b: u128) -> Bytes {
+        let env = &f.env;
+        let domain_sep =
+            domain::compute_domain_sep(env, &f.pool_id, &f.network_id, domain::SELECTOR_SWAP);
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),         // asset_a_tag
+                asset_b.clone(),             // asset_b_tag
+                U256::from_u32(env, 0),      // epoch 0
+                f.pool().commitment_root(),  // recent
+                f.pool().nullifier_root(),   // == stored base
+                U256::from_u32(env, 0xbeef), // new nullifier root
+                U256::from_u32(env, 0xa),    // nf0
+                U256::from_u32(env, 0xb),    // nf1
+                U256::from_u32(env, 0xc0ffee), // change_commitment (A)
+                U256::from_u32(env, 0xb0b),  // out_commitment_b (B)
+                U256::from_u32(env, 0),      // asp_root matches cfg
+                U256::from_u128(env, value_a),
+                U256::from_u128(env, value_b),
+            ],
+        )
+    }
+
+    fn swap_payloads(env: &Env) -> (Vec<Bytes>, Vec<BytesN<32>>, Vec<u32>) {
+        let enc = Vec::from_array(env, [Bytes::new(env), Bytes::new(env)]);
+        let eph = Vec::from_array(
+            env,
+            [BytesN::from_array(env, &[0u8; 32]), BytesN::from_array(env, &[0u8; 32])],
+        );
+        let tags = Vec::from_array(env, [0u32, 0u32]);
+        (enc, eph, tags)
+    }
+
+    #[test]
+    fn swap_prices_and_updates_reserves() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let asset_b = setup_swap_reserves(&f, 10_000, 10_000);
+
+        // amount_in = 1000*9970/10000 = 997; quote_b = 10000*997/(10000+997) = 906 (floor).
+        let pi = swap_inputs(&f, &asset_b, 1000, 900);
+        let (enc, eph, tags) = swap_payloads(env);
+        f.pool()
+            .shielded_swap(&f.asset_tag, &asset_b, &pi, &Bytes::new(env), &enc, &eph, &tags);
+
+        // reserve_A += value_a; reserve_B -= value_b.
+        assert_eq!(f.pool().reserve(&f.asset_tag), 11_000);
+        assert_eq!(f.pool().reserve(&asset_b), 9_100);
+    }
+
+    #[test]
+    fn swap_rejects_value_b_above_quote() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        let asset_b = setup_swap_reserves(&f, 10_000, 10_000);
+
+        // 950 > the 906 the reserves can deliver -> ReserveTooLow (acts as the slippage floor).
+        let pi = swap_inputs(&f, &asset_b, 1000, 950);
+        let (enc, eph, tags) = swap_payloads(env);
+        let res = f.pool().try_shielded_swap(
+            &f.asset_tag,
+            &asset_b,
+            &pi,
+            &Bytes::new(env),
+            &enc,
+            &eph,
+            &tags,
+        );
+        assert_eq!(res, Err(Ok(Error::ReserveTooLow)));
+    }
+
+    #[test]
+    fn swap_rejects_same_asset() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+        setup_swap_reserves(&f, 10_000, 10_000);
+        // asset_a_tag == asset_b_tag both = tag 1.
+        let pi = swap_inputs(&f, &f.asset_tag.clone(), 1000, 900);
+        let (enc, eph, tags) = swap_payloads(env);
+        let res = f.pool().try_shielded_swap(
+            &f.asset_tag,
+            &f.asset_tag,
+            &pi,
+            &Bytes::new(env),
+            &enc,
+            &eph,
+            &tags,
+        );
+        assert_eq!(res, Err(Ok(Error::BadSwapAssets)));
+    }
+
+    #[test]
+    fn withdraw_reserve_returns_liquidity() {
+        let f = setup();
+        let asset_b = setup_swap_reserves(&f, 5_000, 7_000);
+        assert_eq!(f.pool().reserve(&asset_b), 7_000);
+        f.pool().withdraw_reserve(&asset_b, &3_000, &f.admin);
+        assert_eq!(f.pool().reserve(&asset_b), 4_000);
+        // Over-withdraw is rejected.
+        let res = f.pool().try_withdraw_reserve(&asset_b, &9_999, &f.admin);
+        assert_eq!(res, Err(Ok(Error::ReserveTooLow)));
     }
 
     // ----------------------------- escrow (building block B) -----------------------------

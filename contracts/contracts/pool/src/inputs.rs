@@ -22,6 +22,10 @@ pub const ESCROW_PAYOUT_N: u32 = 7;
 /// channel close (building block B phase 2) = domain_sep, asset_tag, epoch, cap_hash, auth_key,
 /// valid_after_ledger, merchant_out, subscriber_out, merchant_bind, subscriber_bind.
 pub const CHANNEL_CLOSE_N: u32 = 10;
+/// shielded swap (roadmap 2.5 Phase 2) = domain_sep, asset_a_tag, asset_b_tag, epoch,
+/// commitment_root, nullifier_old_root, nullifier_new_root, nf0, nf1, change_commitment,
+/// out_commitment_b, asp_root, value_a, value_b.
+pub const SWAP_N: u32 = 14;
 
 /// Parse exactly `n` field elements (n*32 bytes, big-endian) from `pi`.
 pub fn read_fields(env: &Env, pi: &Bytes, n: u32) -> Result<Vec<U256>, Error> {

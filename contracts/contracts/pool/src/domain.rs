@@ -22,6 +22,8 @@ pub const SELECTOR_ESCROW_PAYOUT: u32 = 6;
 /// Merchant-pull subscription channel CLOSE (building block B phase 2). Open reuses the escrow
 /// contribute selector (5); reclaim reuses the escrow payout selector (6); only close is new.
 pub const SELECTOR_CHANNEL_CLOSE: u32 = 7;
+/// In-pool shielded swap (roadmap 2.5 Phase 2 - constant-product AMM).
+pub const SELECTOR_SWAP: u32 = 8;
 
 /// `domain_sep = Poseidon(pool_id, network_id, selector)` — same construction the
 /// prover uses (Poseidon2 parity with the circuit's hash is already established).

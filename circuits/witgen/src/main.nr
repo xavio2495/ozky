@@ -10,6 +10,7 @@
 use notes::deposit::{demo_witness_at as deposit_witness, DepositWitness};
 use notes::transfer::{demo_witness_at as transfer_witness, InputWitness, OutputWitness, TransferWitness};
 use notes::withdraw::{demo_witness_at as withdraw_witness, WithdrawWitness};
+use notes::swap::{demo_witness_at as swap_witness, SwapWitness};
 use poseidon::poseidon2::Poseidon2;
 
 fn dsep(pool_id: Field, network_id: Field, selector: Field) -> Field {
@@ -155,6 +156,60 @@ fn print_withdraw(w: WithdrawWitness) {
     println(f"rho = {cr}");
 }
 
+fn print_swap(w: SwapWitness) {
+    let domain_sep = w.domain_sep;
+    println(f"domain_sep = {domain_sep}");
+    let asset_a_tag = w.asset_a_tag;
+    println(f"asset_a_tag = {asset_a_tag}");
+    let asset_b_tag = w.asset_b_tag;
+    println(f"asset_b_tag = {asset_b_tag}");
+    let epoch = w.epoch;
+    println(f"epoch = {epoch}");
+    let commitment_root = w.commitment_root;
+    println(f"commitment_root = {commitment_root}");
+    let nullifier_old_root = w.nullifier_old_root;
+    println(f"nullifier_old_root = {nullifier_old_root}");
+    let nullifier_new_root = w.nullifier_new_root;
+    println(f"nullifier_new_root = {nullifier_new_root}");
+    let nullifiers = w.nullifiers;
+    println(f"nullifiers = {nullifiers}");
+    let change_commitment = w.change_commitment;
+    println(f"change_commitment = {change_commitment}");
+    let out_commitment_b = w.out_commitment_b;
+    println(f"out_commitment_b = {out_commitment_b}");
+    let asp_root = w.asp_root;
+    println(f"asp_root = {asp_root}");
+    let value_a = w.value_a;
+    println(f"value_a = {value_a}");
+    let value_b = w.value_b;
+    println(f"value_b = {value_b}");
+    let owner_sk = w.owner_sk;
+    println(f"owner_sk = {owner_sk}");
+    print_input(w.inputs[0]);
+    print_input(w.inputs[1]);
+    // `change` (A) and `out_b` (B) are single OutputWitness tables.
+    println("");
+    println("[change]");
+    let cv = w.change.value;
+    println(f"value = {cv}");
+    let cpk = w.change.owner_pk;
+    println(f"owner_pk = {cpk}");
+    let cb = w.change.blinding;
+    println(f"blinding = {cb}");
+    let cr = w.change.rho;
+    println(f"rho = {cr}");
+    println("");
+    println("[out_b]");
+    let bv = w.out_b.value;
+    println(f"value = {bv}");
+    let bpk = w.out_b.owner_pk;
+    println(f"owner_pk = {bpk}");
+    let bb = w.out_b.blinding;
+    println(f"blinding = {bb}");
+    let br = w.out_b.rho;
+    println(f"rho = {br}");
+}
+
 fn main(epoch: Field, pool_id: Field, network_id: Field) {
     let dd = dsep(pool_id, network_id, 1);
     let dt = dsep(pool_id, network_id, 2);
@@ -171,4 +226,9 @@ fn main(epoch: Field, pool_id: Field, network_id: Field) {
     println("###WITHDRAW_BEGIN###");
     print_withdraw(withdraw_witness(epoch, dw));
     println("###WITHDRAW_END###");
+
+    let ds = dsep(pool_id, network_id, 8);
+    println("###SWAP_BEGIN###");
+    print_swap(swap_witness(epoch, ds));
+    println("###SWAP_END###");
 }

@@ -14,7 +14,7 @@
 
 use super::witness::{
     ChannelCloseWitness, ContributeWitness, DepositWitness, PayoutWitness, SplitWitness,
-    SwapWitness, TransferWitness, WithdrawWitness,
+    SwapWitness, Transfer4Witness, TransferWitness, WithdrawWitness,
 };
 use super::CoreError;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ pub struct ProofBundle {
 pub enum Circuit {
     Deposit,
     Transfer,
+    Transfer4,
     Withdraw,
     Split,
     EscrowContribute,
@@ -43,6 +44,7 @@ impl Circuit {
         match self {
             Circuit::Deposit => "deposit",
             Circuit::Transfer => "transfer",
+            Circuit::Transfer4 => "transfer4",
             Circuit::Withdraw => "withdraw",
             Circuit::Split => "split",
             Circuit::EscrowContribute => "escrow_contribute",
@@ -152,6 +154,11 @@ fn prove_via_docker(root: &Path, name: &str) -> Result<(), CoreError> {
 /// Prove a transfer from a fully-built witness, verifying against the frozen VK.
 pub fn prove_transfer_witness(w: &TransferWitness) -> Result<ProofBundle, CoreError> {
     prove(Circuit::Transfer, &w.to_prover_toml())
+}
+
+/// Prove a 4-input transfer (spend up to 4 owned notes) against the frozen `transfer4` VK.
+pub fn prove_transfer4_witness(w: &Transfer4Witness) -> Result<ProofBundle, CoreError> {
+    prove(Circuit::Transfer4, &w.to_prover_toml())
 }
 
 pub fn prove_deposit_witness(w: &DepositWitness) -> Result<ProofBundle, CoreError> {
@@ -387,5 +394,55 @@ mod tests {
         );
         let bundle = prove_swap_witness(&w).expect("swap demo must verify against frozen VK");
         assert_eq!(bundle.public_inputs.len(), 448, "14 public inputs");
+    }
+
+    /// The Rust core's `Transfer4Witness` -> Prover.toml -> prove path produces a proof the FROZEN
+    /// transfer4 VK accepts (the SW-style ABI check): spend three owned notes (1000 + 500 + 300) at
+    /// leaves 0,1,2 plus one dummy, pay 1500 to a recipient with 300 change.
+    #[test]
+    #[ignore = "needs the ZK Docker container; run with --ignored"]
+    fn transfer4_demo_proof_verifies_against_frozen_vk() {
+        use crate::core::witness::{SpendNote, Transfer4Inputs, Transfer4Witness};
+        let h = Hasher::new();
+        let dsep =
+            h.domain_sep(&Fr::from_u64(7), &Fr::from_u64(42), crate::core::poseidon::SELECTOR_TRANSFER_4);
+        let asset_tag = Fr::from_u64(1);
+        let owner_sk = Fr::from_u64(12345);
+        let owner_pk = h.owner_pk(&owner_sk);
+        let epoch = Fr::from_u64(28);
+
+        // Three owned notes at leaves 0,1,2 of the commitment tree.
+        let mk = |v: u64, b: u64, rho: u64| {
+            h.commitment(&Fr::from_u64(v), &asset_tag, &owner_pk, &Fr::from_u64(b), &epoch, &Fr::from_u64(rho))
+        };
+        let commitment_leaves = vec![mk(1000, 777, 111), mk(500, 778, 112), mk(300, 779, 113)];
+        let notes = vec![
+            SpendNote { value: 1000, blinding: Fr::from_u64(777), epoch, rho: Fr::from_u64(111), leaf_index: 0 },
+            SpendNote { value: 500, blinding: Fr::from_u64(778), epoch, rho: Fr::from_u64(112), leaf_index: 1 },
+            SpendNote { value: 300, blinding: Fr::from_u64(779), epoch, rho: Fr::from_u64(113), leaf_index: 2 },
+        ];
+
+        let w = Transfer4Witness::build(
+            &h,
+            Transfer4Inputs {
+                owner_sk,
+                asset_tag,
+                epoch,
+                domain_sep: dsep,
+                commitment_leaves: &commitment_leaves,
+                asp_leaves: &[owner_pk],
+                prior_nullifiers: &[],
+                notes: &notes,
+                dummy_rhos: &[Fr::from_u64(0xdead)],
+                recipient_owner_pk: h.owner_pk(&Fr::from_u64(99)),
+                out0_value: 1500,
+                out0_blinding: Fr::from_u64(222),
+                out0_rho: Fr::from_u64(333),
+                change_blinding: Fr::from_u64(444),
+                change_rho: Fr::from_u64(555),
+            },
+        );
+        let bundle = prove_transfer4_witness(&w).expect("transfer4 demo must verify against frozen VK");
+        assert_eq!(bundle.public_inputs.len(), 416, "13 public inputs");
     }
 }

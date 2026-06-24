@@ -10,9 +10,11 @@
 
 use super::config::PoolConfig;
 use super::encrypt::{self, NotePlaintext};
-use super::poseidon::{Fr, Hasher, SELECTOR_SPLIT, SELECTOR_TRANSFER};
+use super::poseidon::{Fr, Hasher, SELECTOR_SPLIT, SELECTOR_TRANSFER, SELECTOR_TRANSFER_4};
 use super::scan::{self, OwnedNote, WalletIdentity};
-use super::witness::{self, TransferInputs, TransferWitness};
+use super::witness::{
+    self, Transfer4Inputs, Transfer4Witness, TransferInputs, TransferWitness, N_TRANSFER4_INPUTS,
+};
 use super::{chain, keys, notes, proving, CoreError};
 
 // ----------------------------- payment code -----------------------------
@@ -372,24 +374,62 @@ pub fn send_with(
     let asp_leaves = chain::approved_set(cfg)?;
     let local = notes::load(wallet)?;
 
-    // Select an owned, unspent note that covers `amount` (single-input v1); includes
-    // notes recovered from the local store (e.g. prior withdraw change).
-    let note = scan::owned_notes(&id, &state, &local, 0)?
-        .into_iter()
-        .find(|n| n.value >= amount && n.asset_tag == cfg.asset_tag)
-        .ok_or_else(|| CoreError::Proving(format!("no single owned note covers {amount}")))?;
+    // Owned, unspent notes (incl. notes recovered from the local store, e.g. withdraw change).
+    let owned = scan::owned_notes(&id, &state, &local, 0)?;
 
-    send_prepared(
+    // Fast path: a single note covers `amount` — use the cheaper 2-in `transfer`.
+    if let Some(note) = owned
+        .iter()
+        .find(|n| n.value >= amount && n.asset_tag == cfg.asset_tag)
+    {
+        return send_prepared(
+            wallet,
+            cfg,
+            recipient_code,
+            amount,
+            note,
+            &commitment_leaves,
+            &state.nullifiers,
+            &asp_leaves,
+            epoch,
+        );
+    }
+
+    // Multi-note path: spend the fewest notes (up to 4) covering `amount` via `transfer4`.
+    let selected = select_notes(&owned, cfg.asset_tag, amount).ok_or_else(|| {
+        CoreError::Proving(format!(
+            "insufficient shielded balance: no set of up to {N_TRANSFER4_INPUTS} notes covers {amount}"
+        ))
+    })?;
+    send_prepared4(
         wallet,
         cfg,
         recipient_code,
         amount,
-        &note,
+        &selected,
         &commitment_leaves,
         &state.nullifiers,
         &asp_leaves,
         epoch,
     )
+}
+
+/// Select the fewest owned notes (largest-first, up to [`N_TRANSFER4_INPUTS`]) of `asset_tag`
+/// covering `amount`. Returns `None` if even the 4 largest can't cover it.
+fn select_notes(owned: &[OwnedNote], asset_tag: Fr, amount: u64) -> Option<Vec<OwnedNote>> {
+    let mut notes: Vec<OwnedNote> =
+        owned.iter().filter(|n| n.asset_tag == asset_tag).cloned().collect();
+    notes.sort_by(|a, b| b.value.cmp(&a.value)); // largest first → fewest notes
+    let mut chosen: Vec<OwnedNote> = Vec::new();
+    let mut sum: u64 = 0;
+    for n in notes.into_iter().take(N_TRANSFER4_INPUTS) {
+        sum += n.value;
+        chosen.push(n);
+        if sum >= amount {
+            return Some(chosen);
+        }
+    }
+    None
 }
 
 /// Send against EXPLICIT live state — the state-injected core of the send flow
@@ -454,6 +494,141 @@ pub fn send_prepared(
     )
 }
 
+/// Send `amount` against EXPLICIT live state by spending MULTIPLE owned notes (1..=4) in one
+/// `transfer4` — the multi-input core (build witness → prove → encrypt → submit). `notes` must be
+/// owned notes of `cfg.asset_tag` whose values sum to `>= amount`; unused input slots are padded
+/// with dummies. out0 = `amount` to the recipient, out1 = change back to the spender.
+#[allow(clippy::too_many_arguments)]
+pub fn send_prepared4(
+    wallet: &keys::WalletKeys,
+    cfg: &PoolConfig,
+    recipient_code: &str,
+    amount: u64,
+    notes: &[OwnedNote],
+    commitment_leaves: &[Fr],
+    prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
+    epoch: u32,
+) -> Result<String, CoreError> {
+    let id = scan::wallet_identity(wallet)?;
+    let h = Hasher::new();
+    let (recipient_owner_pk, recipient_transmission_pub) = parse_payment_code(recipient_code)?;
+
+    if notes.is_empty() || notes.len() > N_TRANSFER4_INPUTS {
+        return Err(CoreError::Proving(format!(
+            "transfer4 spends 1..={N_TRANSFER4_INPUTS} notes, got {}",
+            notes.len()
+        )));
+    }
+    if notes.iter().any(|n| n.asset_tag != cfg.asset_tag) {
+        return Err(CoreError::Proving("a selected note's asset_tag != pool asset_tag".into()));
+    }
+    let total_in: u64 = notes.iter().map(|n| n.value).sum();
+    if total_in < amount {
+        return Err(CoreError::Proving(format!(
+            "selected notes ({total_in}) do not cover amount ({amount})"
+        )));
+    }
+    if !asp_leaves.contains(&id.owner_pk) {
+        return Err(CoreError::Proving(
+            "wallet not enrolled in this pool's ASP approved set (cannot prove membership)".into(),
+        ));
+    }
+    let change = total_in - amount;
+    let domain_sep = h.domain_sep(&cfg.pool_id, &cfg.network_id, SELECTOR_TRANSFER_4);
+
+    let spend: Vec<witness::SpendNote> = notes.iter().map(|n| n.as_spend_note()).collect();
+    let dummy_rhos: Vec<Fr> =
+        (0..(N_TRANSFER4_INPUTS - notes.len())).map(|_| Fr::random()).collect();
+    let rnd = OutputRandomness::random();
+
+    let witness = Transfer4Witness::build(
+        &h,
+        Transfer4Inputs {
+            owner_sk: id.owner_sk,
+            asset_tag: cfg.asset_tag,
+            epoch: Fr::from_u64(epoch as u64),
+            domain_sep,
+            commitment_leaves,
+            asp_leaves,
+            prior_nullifiers,
+            notes: &spend,
+            dummy_rhos: &dummy_rhos,
+            recipient_owner_pk,
+            out0_value: amount,
+            out0_blinding: rnd.out0_blinding,
+            out0_rho: rnd.out0_rho,
+            change_blinding: rnd.change_blinding,
+            change_rho: rnd.change_rho,
+        },
+    );
+
+    let bundle = proving::prove_transfer4_witness(&witness)?;
+    let outputs = output_payloads(
+        cfg,
+        &id,
+        epoch,
+        amount,
+        change,
+        &recipient_transmission_pub,
+        &rnd,
+    )?;
+
+    chain::submit_transfer4(
+        cfg,
+        cfg.submit_source(wallet.stellar_secret()),
+        &bundle.public_inputs,
+        &bundle.proof,
+        &outputs,
+    )
+}
+
+/// Consolidate a fragmented balance: collapse up to [`N_TRANSFER4_INPUTS`] owned notes of `asset`
+/// into ONE self-owned note (out0 = total to self, out1 = value-0 change). Uses the keychain wallet.
+pub fn consolidate(asset: &str) -> Result<String, CoreError> {
+    let wallet = keys::current_wallet()?;
+    let cfg = PoolConfig::load()?.with_asset(asset)?;
+    consolidate_with(&wallet, &cfg)
+}
+
+/// Consolidate with an explicit wallet + config (keychain-independent). Spends the wallet's
+/// smallest notes first (merging dust), collapsing up to 4 into one self note via `transfer4`.
+pub fn consolidate_with(wallet: &keys::WalletKeys, cfg: &PoolConfig) -> Result<String, CoreError> {
+    let id = scan::wallet_identity(wallet)?;
+    let epoch = chain::current_epoch(&cfg.rpc_url)?;
+    let state = chain::pool_state(cfg)?;
+    let commitment_leaves = chain::commitment_leaves_from(&state.commits)?;
+    let asp_leaves = chain::approved_set(cfg)?;
+    let local = notes::load(wallet)?;
+
+    let mut owned: Vec<OwnedNote> = scan::owned_notes(&id, &state, &local, 0)?
+        .into_iter()
+        .filter(|n| n.asset_tag == cfg.asset_tag)
+        .collect();
+    if owned.len() < 2 {
+        return Err(CoreError::Proving(
+            "nothing to consolidate (need >= 2 notes of this asset)".into(),
+        ));
+    }
+    owned.sort_by(|a, b| a.value.cmp(&b.value)); // smallest first → merge dust
+    let chosen: Vec<OwnedNote> = owned.into_iter().take(N_TRANSFER4_INPUTS).collect();
+    let total: u64 = chosen.iter().map(|n| n.value).sum();
+
+    // A self-send of the full selected total: out0 = total to self, out1 = 0 change to self.
+    let self_code = payment_code(&id);
+    send_prepared4(
+        wallet,
+        cfg,
+        &self_code,
+        total,
+        &chosen,
+        &commitment_leaves,
+        &state.nullifiers,
+        &asp_leaves,
+        epoch,
+    )
+}
+
 /// This wallet's shielded receive address (payment code).
 pub fn receive_code() -> Result<String, CoreError> {
     let wallet = keys::current_wallet()?;
@@ -515,6 +690,86 @@ mod tests {
     fn parse_rejects_bad_code() {
         assert!(parse_payment_code("ozkynothex").is_err());
         assert!(parse_payment_code("ozky00").is_err()); // wrong length
+    }
+
+    fn owned(leaf: u32, value: u64, asset_tag: Fr) -> OwnedNote {
+        OwnedNote {
+            leaf_index: leaf,
+            value,
+            asset_tag,
+            blinding: Fr::ZERO,
+            epoch: 28,
+            rho: Fr::ZERO,
+            commitment: Fr::ZERO,
+        }
+    }
+
+    #[test]
+    fn select_notes_picks_fewest_largest_first() {
+        let tag = Fr::from_u64(1);
+        let other = Fr::from_u64(2);
+        let set = vec![
+            owned(0, 100, tag),
+            owned(1, 400, tag),
+            owned(2, 50, tag),
+            owned(3, 9999, other), // different asset — never selected for `tag`
+        ];
+        // 450: largest-first picks 400 + 100 = 500 (2 notes); the other-asset note is ignored.
+        let sel = select_notes(&set, tag, 450).unwrap();
+        assert_eq!(sel.iter().map(|n| n.value).collect::<Vec<_>>(), vec![400, 100]);
+        // A single note covers 300 → 1 note (the caller's fast path handles this separately).
+        let sel1 = select_notes(&set, tag, 300).unwrap();
+        assert_eq!(sel1.len(), 1);
+        assert_eq!(sel1[0].value, 400);
+        // 600 needs all three tag notes (400+100+50 = 550 < 600) → uncoverable.
+        assert!(select_notes(&set, tag, 600).is_none());
+    }
+
+    #[test]
+    fn transfer4_witness_conserves_and_pads_dummies() {
+        let h = Hasher::new();
+        let id = test_identity(&h);
+        let asset_tag = Fr::from_u64(1);
+        let epoch = Fr::from_u64(28);
+        let mk = |v: u64, b: u64, rho: u64| {
+            h.commitment(&Fr::from_u64(v), &asset_tag, &id.owner_pk, &Fr::from_u64(b), &epoch, &Fr::from_u64(rho))
+        };
+        let leaves = vec![mk(1000, 777, 111), mk(500, 778, 112)];
+        let notes = vec![
+            witness::SpendNote { value: 1000, blinding: Fr::from_u64(777), epoch, rho: Fr::from_u64(111), leaf_index: 0 },
+            witness::SpendNote { value: 500, blinding: Fr::from_u64(778), epoch, rho: Fr::from_u64(112), leaf_index: 1 },
+        ];
+        let w = Transfer4Witness::build(
+            &h,
+            Transfer4Inputs {
+                owner_sk: id.owner_sk,
+                asset_tag,
+                epoch,
+                domain_sep: Fr::from_u64(0xabc),
+                commitment_leaves: &leaves,
+                asp_leaves: &[id.owner_pk],
+                prior_nullifiers: &[],
+                notes: &notes,
+                dummy_rhos: &[Fr::from_u64(0xdead), Fr::from_u64(0xbeef)],
+                recipient_owner_pk: h.owner_pk(&Fr::from_u64(99)),
+                out0_value: 1200,
+                out0_blinding: Fr::from_u64(1),
+                out0_rho: Fr::from_u64(2),
+                change_blinding: Fr::from_u64(3),
+                change_rho: Fr::from_u64(4),
+            },
+        );
+        // 1200 to recipient + 300 change == 1500 spent.
+        assert_eq!(w.outputs[0].value, Fr::from_u64(1200));
+        assert_eq!(w.outputs[1].value, Fr::from_u64(300));
+        // 2 real + 2 dummy inputs; reals first, dummies padded.
+        assert!(!w.inputs[0].is_dummy && !w.inputs[1].is_dummy);
+        assert!(w.inputs[2].is_dummy && w.inputs[3].is_dummy);
+        // Four distinct nullifiers.
+        let mut nfs = w.nullifiers.to_vec();
+        nfs.sort_by_key(|f| f.to_hex());
+        nfs.dedup();
+        assert_eq!(nfs.len(), 4, "nullifiers must be distinct");
     }
 
     // Fresh-pool demo inputs (epoch 28). The witness this builds must match the FROZEN
@@ -1337,6 +1592,219 @@ mod tests {
         println!("OZKY_RELAYER_SECRET={relayer_secret}");
         println!("SEEDED_XLM_RESERVE={xlm_reserve} SEEDED_USDC_RESERVE={usdc_reserve}");
         println!("REDEPOSITED_XLM_BASE={xlm_redeposit} REDEPOSITED_USDC_BASE={usdc_redeposit}");
+    }
+
+    /// One-off MIGRATION to a MULTI-INPUT-capable pool (next-build scope #1). Same flow as
+    /// `deploy_swap_pool` but deploys all **9** verifiers (the 8 current + `transfer4`) and uses the
+    /// new `--verifiers` Vec constructor (Soroban caps positional constructor args). Drains the old
+    /// pool note-by-note, seeds the XLM/USDC AMM reserves, re-deposits the remainder. Prints the new
+    /// IDs to put in `ozky.config.json`.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture deploy_multiinput_pool
+    #[test]
+    #[ignore = "one-off multi-input-pool migration; needs ZK container + network + $OZKY_DEPLOY_MNEMONIC + ozky.config.json"]
+    fn deploy_multiinput_pool() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let h = Hasher::new();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let addr = wallet.stellar_address().to_string();
+        let secret = wallet.stellar_secret().to_string();
+        let wallet_pk = id.owner_pk.to_decimal();
+        let decoy0 = h.owner_pk(&Fr::from_u64(0xDEC0)).to_decimal();
+        let decoy1 = h.owner_pk(&Fr::from_u64(0xDEC1)).to_decimal();
+
+        let xlm_reserve: u64 = std::env::var("XLM_RESERVE").ok().and_then(|s| s.parse().ok()).unwrap_or(20 * 10_000_000);
+        let usdc_reserve: u64 = std::env::var("USDC_RESERVE").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+
+        let notes_dir = std::env::temp_dir().join("ozky-mi-migrate-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+
+        // --- 1. Drain owned notes from the OLD pool note-by-note. ---
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
+        let mut old_cfg = PoolConfig::load().expect("old pool config (ozky.config.json)");
+        old_cfg.relayer_secret = None;
+        let drain = |asset: &str| -> u64 {
+            let c = old_cfg.clone().with_asset(asset).unwrap();
+            let mut total: u64 = 0;
+            let mut done: Vec<u32> = Vec::new();
+            loop {
+                let st = chain::pool_state(&c).unwrap();
+                let local = notes::load(&wallet).unwrap();
+                let mut owned: Vec<_> = scan::owned_notes(&id, &st, &local, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|n| n.asset_tag == c.asset_tag && !done.contains(&n.leaf_index))
+                    .collect();
+                if owned.is_empty() {
+                    break;
+                }
+                owned.sort_by_key(|n| std::cmp::Reverse(n.value));
+                let n = &owned[0];
+                withdraw::withdraw_with(&wallet, &c, &addr, n.value)
+                    .unwrap_or_else(|e| panic!("withdraw {asset} note {}: {e:?}", n.leaf_index));
+                eprintln!("withdrew {} {asset} base (note {})", n.value, n.leaf_index);
+                total += n.value;
+                done.push(n.leaf_index);
+                std::thread::sleep(std::time::Duration::from_secs(7));
+            }
+            total
+        };
+        let xlm_base = drain("XLM");
+        let usdc_base = drain("USDC");
+        eprintln!("OLD pool drained: {} XLM base, {} USDC base", xlm_base, usdc_base);
+        assert!(xlm_base > xlm_reserve, "need > {xlm_reserve} XLM base to seed the reserve");
+        assert!(usdc_base > usdc_reserve, "need > {usdc_reserve} USDC base to seed the reserve");
+
+        // --- 2. Deploy the NEW multi-input-capable pool (9 verifiers incl. transfer4) + seed reserves. ---
+        let setup = format!(
+            "set -e\n\
+             stellar network add testnet --rpc-url https://soroban-testnet.stellar.org --network-passphrase 'Test SDF Network ; September 2015' 2>/dev/null || true\n\
+             T=/workspace/contracts/target/wasm32v1-none/release\n\
+             VK=/workspace/contracts/frozen_vks\n\
+             V=$T/rs_soroban_ultrahonk.wasm\n\
+             VDEP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/deposit/vk)\n\
+             VTRA=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer/vk)\n\
+             VWIT=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/withdraw/vk)\n\
+             VSPL=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/split/vk)\n\
+             VECON=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_contribute/vk)\n\
+             VEPAY=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/escrow_payout/vk)\n\
+             VCHAN=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/channel_close/vk)\n\
+             VSWAP=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/shielded_swap/vk)\n\
+             VTR4=$(stellar contract deploy --wasm $V --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --vk_bytes-file-path $VK/transfer4/vk)\n\
+             VERIFIERS=\"[\\\"$VDEP\\\",\\\"$VTRA\\\",\\\"$VWIT\\\",\\\"$VSPL\\\",\\\"$VECON\\\",\\\"$VEPAY\\\",\\\"$VCHAN\\\",\\\"$VSWAP\\\",\\\"$VTR4\\\"]\"\n\
+             POLICY=$(stellar contract deploy --wasm $T/policy.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --admin {addr})\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- enroll --owner_pk {wallet_pk} --who {addr} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy0} >/dev/null\n\
+             stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- approve_member --owner_pk {decoy1} >/dev/null\n\
+             ASP=$(stellar contract invoke --id $POLICY --source \"$OZKY_SOURCE_SECRET\" --network testnet -- asp_root | tr -d '\\\"')\n\
+             SAC=$(stellar contract id asset --asset native --network testnet)\n\
+             POOL=$(stellar contract deploy --wasm $T/pool.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet -- --pool_id 7 --network_id 42 --verifiers \"$VERIFIERS\" --policy $POLICY --asp_root $ASP --admin {addr})\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 1 --sac $SAC --decimals 7 >/dev/null\n\
+             USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\n\
+             USDC_SAC=$(stellar contract id asset --asset USDC:$USDC_ISSUER --network testnet)\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 2 --sac $USDC_SAC --decimals 7 >/dev/null\n\
+             EURC_ISSUER=GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO\n\
+             EURC_SAC=$(stellar contract id asset --asset EURC:$EURC_ISSUER --network testnet)\n\
+             stellar contract asset deploy --asset EURC:$EURC_ISSUER --source \"$OZKY_SOURCE_SECRET\" --network testnet >/dev/null 2>&1 || true\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet -- register_asset --asset_tag 4 --sac $EURC_SAC --decimals 7 >/dev/null\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- seed_reserve --asset_tag 1 --amount {xlm_reserve} >/dev/null\n\
+             stellar contract invoke --id $POOL --source \"$OZKY_SOURCE_SECRET\" --network testnet --send yes -- seed_reserve --asset_tag 2 --amount {usdc_reserve} >/dev/null\n\
+             VIEWKEYS=$(stellar contract deploy --wasm $T/viewkeys.wasm --source \"$OZKY_SOURCE_SECRET\" --network testnet)\n\
+             stellar keys generate relayer --network testnet --fund --overwrite >/dev/null 2>&1\n\
+             echo \"POOL=$POOL\"\n\
+             echo \"POLICY=$POLICY\"\n\
+             echo \"VIEWKEYS=$VIEWKEYS\"\n\
+             echo \"RELAYER_SECRET=$(stellar keys secret relayer)\"",
+            addr = addr, wallet_pk = wallet_pk, decoy0 = decoy0, decoy1 = decoy1,
+            xlm_reserve = xlm_reserve, usdc_reserve = usdc_reserve,
+        );
+        let out = run_zk(&secret, &setup);
+        let pool = kv(&out, "POOL");
+        let policy = kv(&out, "POLICY");
+        let viewkeys = kv(&out, "VIEWKEYS");
+        let relayer_secret = kv(&out, "RELAYER_SECRET");
+
+        std::env::set_var("OZKY_POOL_CONTRACT", &pool);
+        std::env::set_var("OZKY_POLICY_CONTRACT", &policy);
+        std::env::set_var("OZKY_VIEWKEYS_CONTRACT", &viewkeys);
+        std::env::remove_var("OZKY_RELAYER_SECRET");
+        let new_cfg = PoolConfig::load().unwrap();
+
+        // --- 3. Re-deposit the remainder (drained - reserve) into the NEW pool, as SEVERAL notes
+        // per asset so the multi-input path has fragments to spend (and consolidate). ---
+        let redeposit_fragments = |asset: &str, total: u64| {
+            if total == 0 {
+                return;
+            }
+            let c = new_cfg.clone().with_asset(asset).unwrap();
+            // Split into up to 5 roughly-equal notes (so a later send must combine several).
+            let parts = 5u64;
+            let each = total / parts;
+            let mut left = total;
+            for i in 0..parts {
+                let amt = if i == parts - 1 { left } else { each };
+                if amt == 0 {
+                    continue;
+                }
+                deposit::deposit_with(&wallet, &c, amt).unwrap_or_else(|e| panic!("re-deposit {asset} fragment: {e:?}"));
+                left -= amt;
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        };
+        redeposit_fragments("XLM", xlm_base - xlm_reserve);
+        redeposit_fragments("USDC", usdc_base - usdc_reserve);
+
+        println!("=== MULTI-INPUT POOL DEPLOY DONE (9 verifiers) ===");
+        println!("OZKY_POOL_CONTRACT={pool}");
+        println!("OZKY_POLICY_CONTRACT={policy}");
+        println!("OZKY_VIEWKEYS_CONTRACT={viewkeys}");
+        println!("OZKY_RELAYER_SECRET={relayer_secret}");
+        println!("SEEDED_XLM_RESERVE={xlm_reserve} SEEDED_USDC_RESERVE={usdc_reserve}");
+    }
+
+    /// Live multi-input lifecycle (scope #1): on the 9-verifier pool, send an amount LARGER than any
+    /// single owned note (forcing `transfer4` to combine fragments), then consolidate the remaining
+    /// notes into one. Asserts the 13-PI `transfer4` proof verifies on-chain and value is conserved.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture multiinput_lifecycle_on_testnet
+    #[test]
+    #[ignore = "live multi-input lifecycle; needs ZK container + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn multiinput_lifecycle_on_testnet() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        std::env::set_var("OZKY_NO_POOL_CACHE", "1");
+        let notes_dir = std::env::temp_dir().join("ozky-mi-test-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().expect("ozky.config.json").with_asset("XLM").unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+
+        // Scan owned XLM notes; pick a send amount larger than the largest single note but <= the
+        // sum of the 4 largest (so transfer4 must combine, and the single-note fast path can't).
+        let st = chain::pool_state(&cfg).unwrap();
+        let local = notes::load(&wallet).unwrap();
+        let mut owned: Vec<_> = scan::owned_notes(&id, &st, &local, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.asset_tag == cfg.asset_tag)
+            .collect();
+        owned.sort_by(|a, b| b.value.cmp(&a.value));
+        assert!(owned.len() >= 2, "need a fragmented balance (>= 2 notes)");
+        let largest = owned[0].value;
+        let top_sum: u64 = owned.iter().take(N_TRANSFER4_INPUTS).map(|n| n.value).sum();
+        let amount = (largest + 1).min(top_sum);
+        assert!(amount > largest, "send amount must exceed the largest single note");
+
+        // Send to self (so the value stays recoverable) — exercises the multi-note transfer4 path.
+        let self_code = payment_code(&id);
+        let tx = send_with(&wallet, &cfg, &self_code, amount).expect("multi-note transfer4 send");
+        eprintln!("transfer4 send tx: {tx}");
+        std::thread::sleep(std::time::Duration::from_secs(8));
+
+        // Then consolidate the remaining notes into one.
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        let ctx = consolidate_with(&wallet, &cfg).expect("consolidate");
+        eprintln!("consolidate tx: {ctx}");
     }
 
     /// Roadmap 2.5 Phase 2 (SW5): the REAL in-pool swap lifecycle on the swap-capable pool. Reads

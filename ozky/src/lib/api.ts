@@ -221,6 +221,7 @@ export const api = {
 	deposit: (asset: string, amount: number) => invoke<string>('deposit', { asset, amount }),
 	send: (asset: string, recipient: string, amount: number) =>
 		invoke<string>('send', { asset, recipient, amount }),
+	consolidate: (asset: string) => invoke<string>('consolidate', { asset }),
 	split: (asset: string, recipients: { recipient: string; amount: number }[]) =>
 		invoke<string>('split', { asset, recipients }),
 

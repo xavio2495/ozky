@@ -30,6 +30,7 @@ pub fn run() {
             commands::enroll,
             commands::deposit,
             commands::send,
+            commands::consolidate,
             commands::split,
             commands::list_payrolls,
             commands::save_payroll,

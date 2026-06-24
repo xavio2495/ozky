@@ -222,6 +222,17 @@ fn build_two_insertions(
     (old_root, new_root, w0, w1)
 }
 
+/// Build the chained N-insertion witness (`nfs` in order) into the accumulator holding
+/// `prior`. Returns old root, new root, and the per-insertion witnesses (same order as `nfs`).
+/// The N-input generalization of [`build_two_insertions`] (multi-input transfer, scope #1).
+fn build_n_insertions(h: &Hasher, prior: &[Fr], nfs: &[Fr]) -> (Fr, Fr, Vec<NfInsert>) {
+    let mut tree = IndexedTree::from_nullifiers(h, prior);
+    let old_root = tree.root(h);
+    let ws: Vec<NfInsert> = nfs.iter().map(|nf| tree.insert(h, *nf)).collect();
+    let new_root = tree.root(h);
+    (old_root, new_root, ws)
+}
+
 // ----------------------------- Input / output witnesses -----------------------------
 
 pub struct InputWitness {
@@ -1003,6 +1014,149 @@ impl TransferWitness {
                 change_rho: Fr::from_u64(555),
             },
         )
+    }
+}
+
+// ----------------------------- Transfer4 (4-in / 2-out, multi-input transfer) -----------------------------
+
+/// Number of inputs in the `transfer4` circuit (up to 4 real owned notes; the rest are dummies).
+pub const N_TRANSFER4_INPUTS: usize = 4;
+
+pub struct Transfer4Witness {
+    pub domain_sep: Fr,
+    pub asset_tag: Fr,
+    pub epoch: Fr,
+    pub commitment_root: Fr,
+    pub nullifier_old_root: Fr,
+    pub nullifier_new_root: Fr,
+    pub nullifiers: [Fr; N_TRANSFER4_INPUTS],
+    pub out_commitments: [Fr; 2],
+    pub asp_root: Fr,
+    pub owner_sk: Fr,
+    pub inputs: [InputWitness; N_TRANSFER4_INPUTS],
+    pub outputs: [OutputWitness; 2],
+}
+
+/// Everything needed to build a 4-input transfer against LIVE pool state: spend 1..=4 owned notes,
+/// pay `out0_value` to `recipient_owner_pk`, return change to the spender. Unused input slots are
+/// padded with value-0 dummies (one fresh `dummy_rho` each), so the on-chain footprint is always 4
+/// inputs. Conservation requires `out0_value <= Σ notes.value`.
+pub struct Transfer4Inputs<'a> {
+    pub owner_sk: Fr,
+    pub asset_tag: Fr,
+    /// Current epoch — the public `epoch` input + output-note stamp.
+    pub epoch: Fr,
+    pub domain_sep: Fr,
+    pub commitment_leaves: &'a [Fr],
+    pub asp_leaves: &'a [Fr],
+    pub prior_nullifiers: &'a [Fr],
+    /// 1..=4 real owned notes to spend (each carries its own mint epoch + leaf index).
+    pub notes: &'a [SpendNote],
+    /// Fresh dummy rhos for the `4 - notes.len()` padding input slots.
+    pub dummy_rhos: &'a [Fr],
+    pub recipient_owner_pk: Fr,
+    pub out0_value: u64,
+    pub out0_blinding: Fr,
+    pub out0_rho: Fr,
+    pub change_blinding: Fr,
+    pub change_rho: Fr,
+}
+
+impl Transfer4Witness {
+    /// Build a 4-input transfer witness against arbitrary live state. Computes each real input's
+    /// commitment + ASP Merkle paths and the chained 4-insertion accumulator witness; pads the
+    /// remaining slots with dummies. Nullifiers (and their insertions) are ordered real-then-dummy,
+    /// matching the input-slot order the circuit checks.
+    pub fn build(h: &Hasher, p: Transfer4Inputs) -> Transfer4Witness {
+        let k = p.notes.len();
+        assert!(
+            (1..=N_TRANSFER4_INPUTS).contains(&k),
+            "transfer4 spends 1..=4 real notes"
+        );
+        assert!(
+            p.dummy_rhos.len() == N_TRANSFER4_INPUTS - k,
+            "need exactly {} dummy rhos",
+            N_TRANSFER4_INPUTS - k
+        );
+        let owner_pk = h.owner_pk(&p.owner_sk);
+
+        // Nullifiers in slot order: real notes first, then dummy padding.
+        let mut nfs: Vec<Fr> = p.notes.iter().map(|n| h.nullifier(&n.rho, &p.owner_sk)).collect();
+        for dr in p.dummy_rhos {
+            nfs.push(h.nullifier(dr, &p.owner_sk));
+        }
+        let (nf_old, nf_new, ws) = build_n_insertions(h, p.prior_nullifiers, &nfs);
+
+        // Build the 4 input witnesses (real + dummy padding) in slot order; `ws` is already in that
+        // same order, so drain it as we go.
+        let mut ws_it = ws.into_iter();
+        let mut inputs: Vec<InputWitness> = Vec::with_capacity(N_TRANSFER4_INPUTS);
+        let mut total_in: u64 = 0;
+        for note in p.notes {
+            total_in += note.value;
+            inputs.push(real_input(h, note, p.commitment_leaves, p.asp_leaves, owner_pk, ws_it.next().unwrap()));
+        }
+        for dr in p.dummy_rhos {
+            inputs.push(dummy_input(p.epoch, *dr, ws_it.next().unwrap()));
+        }
+        let inputs: [InputWitness; N_TRANSFER4_INPUTS] =
+            inputs.try_into().unwrap_or_else(|_| unreachable!("exactly 4 inputs"));
+
+        let out0 = OutputWitness {
+            value: Fr::from_u64(p.out0_value),
+            owner_pk: p.recipient_owner_pk,
+            blinding: p.out0_blinding,
+            rho: p.out0_rho,
+        };
+        let change_value = total_in - p.out0_value; // caller validates out0_value <= total_in
+        let out1 = OutputWitness {
+            value: Fr::from_u64(change_value),
+            owner_pk,
+            blinding: p.change_blinding,
+            rho: p.change_rho,
+        };
+
+        let nullifiers: [Fr; N_TRANSFER4_INPUTS] =
+            nfs.try_into().unwrap_or_else(|_| unreachable!("exactly 4 nullifiers"));
+
+        Transfer4Witness {
+            domain_sep: p.domain_sep,
+            asset_tag: p.asset_tag,
+            epoch: p.epoch,
+            commitment_root: inputs[0].cm.root,
+            nullifier_old_root: nf_old,
+            nullifier_new_root: nf_new,
+            nullifiers,
+            out_commitments: [
+                out0.commitment(h, &p.asset_tag, &p.epoch),
+                out1.commitment(h, &p.asset_tag, &p.epoch),
+            ],
+            asp_root: inputs[0].asp.root,
+            owner_sk: p.owner_sk,
+            inputs,
+            outputs: [out0, out1],
+        }
+    }
+
+    pub fn to_prover_toml(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("domain_sep = {}\n", q(&self.domain_sep)));
+        s.push_str(&format!("asset_tag = {}\n", q(&self.asset_tag)));
+        s.push_str(&format!("epoch = {}\n", q(&self.epoch)));
+        s.push_str(&format!("commitment_root = {}\n", q(&self.commitment_root)));
+        s.push_str(&format!("nullifier_old_root = {}\n", q(&self.nullifier_old_root)));
+        s.push_str(&format!("nullifier_new_root = {}\n", q(&self.nullifier_new_root)));
+        s.push_str(&format!("nullifiers = {}\n", fr_array(&self.nullifiers)));
+        s.push_str(&format!("out_commitments = {}\n", fr_array(&self.out_commitments)));
+        s.push_str(&format!("asp_root = {}\n", q(&self.asp_root)));
+        s.push_str(&format!("owner_sk = {}\n", q(&self.owner_sk)));
+        for w in &self.inputs {
+            s.push_str(&input_block(w));
+        }
+        for o in &self.outputs {
+            s.push_str(&output_block(o));
+        }
+        s
     }
 }
 

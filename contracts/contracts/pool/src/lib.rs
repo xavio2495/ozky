@@ -103,6 +103,8 @@ pub enum Error {
     /// The AMM reserve cannot deliver the proof's `value_b` (price moved / insufficient liquidity),
     /// or a reserve-withdraw exceeds the available reserve.
     ReserveTooLow = 31,
+    /// The constructor's verifier list is not exactly the 9 expected per-circuit verifiers.
+    BadVerifierCount = 32,
 }
 
 #[contract]
@@ -112,18 +114,15 @@ pub struct Pool;
 impl Pool {
     /// Deploy-time configuration (immutable identity + verifiers + policy; mutable
     /// asp_root cache).
+    /// `verifiers` is the ordered per-circuit verifier list (Soroban caps constructor-arg tuples,
+    /// so the 9 verifiers ride in one `Vec` instead of 9 positional args):
+    /// `[deposit, transfer, withdraw, split, escrow_contribute, escrow_payout, channel_close,
+    /// swap, transfer4]`.
     pub fn __constructor(
         env: Env,
         pool_id: U256,
         network_id: U256,
-        deposit_verifier: Address,
-        transfer_verifier: Address,
-        withdraw_verifier: Address,
-        split_verifier: Address,
-        escrow_contribute_verifier: Address,
-        escrow_payout_verifier: Address,
-        channel_close_verifier: Address,
-        swap_verifier: Address,
+        verifiers: Vec<Address>,
         policy: Address,
         asp_root: U256,
         admin: Address,
@@ -131,19 +130,23 @@ impl Pool {
         if config::is_set(&env) {
             return Err(Error::AlreadyInitialized);
         }
+        if verifiers.len() != 9 {
+            return Err(Error::BadVerifierCount);
+        }
         config::set(
             &env,
             &Config {
                 pool_id,
                 network_id,
-                deposit_verifier,
-                transfer_verifier,
-                withdraw_verifier,
-                split_verifier,
-                escrow_contribute_verifier,
-                escrow_payout_verifier,
-                channel_close_verifier,
-                swap_verifier,
+                deposit_verifier: verifiers.get(0).unwrap(),
+                transfer_verifier: verifiers.get(1).unwrap(),
+                withdraw_verifier: verifiers.get(2).unwrap(),
+                split_verifier: verifiers.get(3).unwrap(),
+                escrow_contribute_verifier: verifiers.get(4).unwrap(),
+                escrow_payout_verifier: verifiers.get(5).unwrap(),
+                channel_close_verifier: verifiers.get(6).unwrap(),
+                swap_verifier: verifiers.get(7).unwrap(),
+                transfer4_verifier: verifiers.get(8).unwrap(),
                 policy,
                 asp_root,
                 admin,
@@ -259,6 +262,42 @@ impl Pool {
         emit_nullifiers(&env, &f.get(6).unwrap(), &f.get(7).unwrap());
         append_and_emit(&env, &f.get(8).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 0)?;
         append_and_emit(&env, &f.get(9).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 1)?;
+        emit_roots(&env);
+        Ok(())
+    }
+
+    /// Private interior 4-input transfer: up to 4 owned notes -> 2 outputs (recipient + change),
+    /// no token movement. Same shape as `transfer` with its own selector + verifier; unused input
+    /// slots are dummies (the real input count is hidden in-proof). Powers multi-note sends and
+    /// consolidation. Public inputs: [domain_sep, asset_tag, epoch, commitment_root,
+    /// nullifier_old_root, nullifier_new_root, nf0..nf3, out_cm0, out_cm1, asp_root] (13 fields).
+    pub fn transfer4(
+        env: Env,
+        asset_tag: U256,
+        public_inputs: Bytes,
+        proof: Bytes,
+        enc_notes: Vec<Bytes>,
+        ephemeral_pubs: Vec<BytesN<32>>,
+        view_tags: Vec<u32>,
+    ) -> Result<(), Error> {
+        let cfg = config::get(&env);
+        let f = inputs::read_fields(&env, &public_inputs, inputs::TRANSFER4_N)?;
+
+        check_common(&env, &cfg, &f, domain::SELECTOR_TRANSFER_4, &asset_tag)?;
+        require_recent_root(&env, &f.get(3).unwrap())?;
+        require_asp_root(&cfg, &f.get(12).unwrap())?;
+        require_nullifier_base(&env, &f.get(4).unwrap())?;
+
+        verifier::verify(&env, &cfg.transfer4_verifier, public_inputs, proof)?;
+
+        nullifier::set_root(&env, &f.get(5).unwrap());
+        // Four nullifiers (nf0..nf3 at indices 6..10) — emitted for double-spend indexing; the
+        // accumulator non-membership/insertion is enforced in-circuit (old -> new root).
+        for k in 6..10u32 {
+            env.events().publish((symbol_short!("nullif"),), f.get(k).unwrap());
+        }
+        append_and_emit(&env, &f.get(10).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 0)?;
+        append_and_emit(&env, &f.get(11).unwrap(), &enc_notes, &ephemeral_pubs, &view_tags, 1)?;
         emit_roots(&env);
         Ok(())
     }
@@ -1149,19 +1188,26 @@ mod entrypoint_tests {
         let policy = PolicyClient::new(&env, &policy_addr);
         policy.set_allowed(&from, &true);
 
+        let verifiers = Vec::from_array(
+            &env,
+            [
+                verifier.clone(), // deposit
+                verifier.clone(), // transfer
+                verifier.clone(), // withdraw
+                verifier.clone(), // split
+                verifier.clone(), // escrow_contribute
+                verifier.clone(), // escrow_payout
+                verifier.clone(), // channel_close
+                verifier.clone(), // swap
+                verifier.clone(), // transfer4
+            ],
+        );
         let pool_addr = env.register(
             Pool,
             (
                 pool_id.clone(),
                 network_id.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
-                verifier.clone(),
+                verifiers,
                 policy_addr.clone(),
                 asp_root,
                 admin.clone(),
@@ -1532,6 +1578,95 @@ mod entrypoint_tests {
         // Over-withdraw is rejected.
         let res = f.pool().try_withdraw_reserve(&asset_b, &9_999, &f.admin);
         assert_eq!(res, Err(Ok(Error::ReserveTooLow)));
+    }
+
+    // ----------------------------- transfer4 (multi-input transfer, scope #1) -----------------------------
+
+    /// 13-field transfer4 public inputs (recent commitment root + stored nullifier base).
+    fn transfer4_inputs(f: &Fixture, new_nf_root: u32) -> Bytes {
+        let env = &f.env;
+        let domain_sep =
+            domain::compute_domain_sep(env, &f.pool_id, &f.network_id, domain::SELECTOR_TRANSFER_4);
+        field_blob(
+            env,
+            &[
+                domain_sep,
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0),        // epoch 0
+                f.pool().commitment_root(),    // recent
+                f.pool().nullifier_root(),     // == stored base
+                U256::from_u32(env, new_nf_root),
+                U256::from_u32(env, 0xa),      // nf0
+                U256::from_u32(env, 0xb),      // nf1
+                U256::from_u32(env, 0xc),      // nf2
+                U256::from_u32(env, 0xd),      // nf3
+                U256::from_u32(env, 0xc0ffee), // out_cm0
+                U256::from_u32(env, 0xb0b),    // out_cm1
+                U256::from_u32(env, 0),        // asp_root matches cfg
+            ],
+        )
+    }
+
+    #[test]
+    fn transfer4_appends_two_outputs_and_updates_nullifier_root() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+
+        let pi = transfer4_inputs(&f, 0xbeef);
+        let (enc, eph, tags) = swap_payloads(env); // two empty output payloads
+        f.pool()
+            .transfer4(&f.asset_tag, &pi, &Bytes::new(env), &enc, &eph, &tags);
+
+        // The proven new nullifier root is committed.
+        assert_eq!(f.pool().nullifier_root(), U256::from_u32(env, 0xbeef));
+
+        // Both output commitments were appended: re-deriving the tree (deposit leaf + the two
+        // transfer4 outputs, in order) reproduces the pool's commitment root.
+        let solo = crate::testutils::harness(env);
+        let solo_root = env.as_contract(&solo, || {
+            tree::append(env, &U256::from_u32(env, 0xc0ffee)).unwrap(); // prime_recent_root's deposit
+            tree::append(env, &U256::from_u32(env, 0xc0ffee)).unwrap(); // out_cm0
+            tree::append(env, &U256::from_u32(env, 0xb0b)).unwrap();    // out_cm1
+            tree::current_root(env)
+        });
+        assert_eq!(f.pool().commitment_root(), solo_root);
+    }
+
+    #[test]
+    fn transfer4_rejects_stale_nullifier_base() {
+        let f = setup();
+        let env = &f.env;
+        prime_recent_root(&f);
+
+        // First transfer4 advances the nullifier root to 0xbeef.
+        let pi = transfer4_inputs(&f, 0xbeef);
+        let (enc, eph, tags) = swap_payloads(env);
+        f.pool()
+            .transfer4(&f.asset_tag, &pi, &Bytes::new(env), &enc, &eph, &tags);
+
+        // A second proof whose old-root field reads the ORIGINAL base (0) is replay-rejected:
+        // the stored root is now 0xbeef, so the base no longer matches.
+        let pi2 = field_blob(
+            env,
+            &[
+                domain::compute_domain_sep(env, &f.pool_id, &f.network_id, domain::SELECTOR_TRANSFER_4),
+                f.asset_tag.clone(),
+                U256::from_u32(env, 0),
+                f.pool().commitment_root(),
+                U256::from_u32(env, 0), // WRONG old base (stored is 0xbeef)
+                U256::from_u32(env, 0xfeed),
+                U256::from_u32(env, 0x1),
+                U256::from_u32(env, 0x2),
+                U256::from_u32(env, 0x3),
+                U256::from_u32(env, 0x4),
+                U256::from_u32(env, 0xcafe),
+                U256::from_u32(env, 0xfee),
+                U256::from_u32(env, 0),
+            ],
+        );
+        let res = f.pool().try_transfer4(&f.asset_tag, &pi2, &Bytes::new(env), &enc, &eph, &tags);
+        assert_eq!(res, Err(Ok(Error::NullifierRootMismatch)));
     }
 
     // ----------------------------- escrow (building block B) -----------------------------

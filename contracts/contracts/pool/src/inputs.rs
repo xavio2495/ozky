@@ -26,6 +26,10 @@ pub const CHANNEL_CLOSE_N: u32 = 10;
 /// commitment_root, nullifier_old_root, nullifier_new_root, nf0, nf1, change_commitment,
 /// out_commitment_b, asp_root, value_a, value_b.
 pub const SWAP_N: u32 = 14;
+/// 4-input multi-note transfer (next-build scope #1) = transfer with 4 nullifiers: domain_sep,
+/// asset_tag, epoch, commitment_root, nullifier_old_root, nullifier_new_root, nf0..nf3,
+/// out_cm0, out_cm1, asp_root (13 fields).
+pub const TRANSFER4_N: u32 = 13;
 
 /// Parse exactly `n` field elements (n*32 bytes, big-endian) from `pi`.
 pub fn read_fields(env: &Env, pi: &Bytes, n: u32) -> Result<Vec<U256>, Error> {

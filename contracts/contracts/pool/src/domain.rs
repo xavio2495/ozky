@@ -24,6 +24,8 @@ pub const SELECTOR_ESCROW_PAYOUT: u32 = 6;
 pub const SELECTOR_CHANNEL_CLOSE: u32 = 7;
 /// In-pool shielded swap (roadmap 2.5 Phase 2 - constant-product AMM).
 pub const SELECTOR_SWAP: u32 = 8;
+/// 4-input multi-note transfer (next-build scope #1 - lifts the single-note-per-spend limit).
+pub const SELECTOR_TRANSFER_4: u32 = 9;
 
 /// `domain_sep = Poseidon(pool_id, network_id, selector)` — same construction the
 /// prover uses (Poseidon2 parity with the circuit's hash is already established).

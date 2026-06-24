@@ -22,6 +22,7 @@ pub const SCAN_ASSET_TAG: u32 = 1;
 const TRANSMISSION_EPOCH: u32 = 0;
 
 /// A discovered, decrypted note owned by this wallet (spendable input material).
+#[derive(Clone)]
 pub struct OwnedNote {
     pub leaf_index: u32,
     pub value: u64,

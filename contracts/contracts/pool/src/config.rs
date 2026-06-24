@@ -24,6 +24,7 @@ pub struct Config {
     pub escrow_payout_verifier: Address,
     pub channel_close_verifier: Address,
     pub swap_verifier: Address,
+    pub transfer4_verifier: Address,
     pub policy: Address,
     pub asp_root: U256,
     pub admin: Address,

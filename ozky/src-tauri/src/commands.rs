@@ -353,6 +353,13 @@ pub fn send(asset: String, recipient: String, amount: u64) -> Result<String, Cor
     core::send::send(&asset, &recipient, amount)
 }
 
+/// Consolidate a fragmented `asset` balance: collapse up to 4 owned notes into ONE self note via a
+/// 4-input transfer. Proves off the UI thread; returns the tx hash. (multi-input transfer, scope #1)
+#[tauri::command]
+pub async fn consolidate(asset: String) -> Result<String, CoreError> {
+    blocking(move || core::send::consolidate(&asset)).await
+}
+
 /// One recipient of a split payment: a shielded payment code + base-unit amount.
 #[derive(serde::Deserialize)]
 pub struct SplitRecipientArg {

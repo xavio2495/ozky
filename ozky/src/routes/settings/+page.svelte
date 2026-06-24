@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import Workspace from '$lib/components/layout/Workspace.svelte';
 	import AddressField from '$lib/components/shared/AddressField.svelte';
+	import AssetSelect from '$lib/components/shared/AssetSelect.svelte';
+	import ProvingOverlay from '$lib/components/shared/ProvingOverlay.svelte';
 	import CopyButton from '$lib/components/shared/CopyButton.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Spinner } from '$lib/components/ui/spinner';
@@ -14,6 +16,7 @@
 	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
 	import ZapIcon from '@lucide/svelte/icons/zap';
 	import ShieldIcon from '@lucide/svelte/icons/shield';
+	import LayersIcon from '@lucide/svelte/icons/layers';
 	import { toast } from 'svelte-sonner';
 	import { api, errMessage } from '$lib/api';
 	import { wallet, runAction } from '$lib/wallet.svelte';
@@ -24,6 +27,20 @@
 	let spendingKey = $state('');
 	let loadingKey = $state(false);
 	let enrolling = $state(false);
+	let consolidateAsset = $state('USDC');
+	let consolidating = $state(false);
+
+	async function consolidate() {
+		consolidating = true;
+		const hash = await runAction(
+			'Consolidating notes',
+			() => api.consolidate(consolidateAsset),
+			{ success: () => 'Notes consolidated' }
+		);
+		consolidating = false;
+		if (hash)
+			wallet.log({ kind: 'send', label: `Consolidated ${consolidateAsset} notes`, hash });
+	}
 
 	onMount(async () => {
 		try {
@@ -82,6 +99,27 @@
 								data-icon="inline-start"
 							/>{/if}
 						Enroll
+					</Button>
+				</Card.Content>
+			</Card.Root>
+
+			<Card.Root>
+				<Card.Header>
+					<Card.Title>Consolidate notes</Card.Title>
+					<Card.Description>
+						Merge a fragmented balance: collapse up to 4 of this asset's notes into one, so larger
+						payments don't need to combine many notes. Stays fully shielded.
+					</Card.Description>
+				</Card.Header>
+				<Card.Content class="flex items-end justify-between gap-3">
+					<div class="w-40">
+						<AssetSelect bind:value={consolidateAsset} />
+					</div>
+					<Button variant="outline" onclick={consolidate} disabled={consolidating}>
+						{#if consolidating}<Spinner data-icon="inline-start" />{:else}<LayersIcon
+								data-icon="inline-start"
+							/>{/if}
+						Consolidate
 					</Button>
 				</Card.Content>
 			</Card.Root>
@@ -155,6 +193,8 @@
 		</div>
 	</Dialog.Content>
 </Dialog.Root>
+
+<ProvingOverlay open={consolidating} title="Consolidating notes" />
 
 <style>
 	.mode {

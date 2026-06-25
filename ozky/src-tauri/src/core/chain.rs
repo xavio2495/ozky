@@ -629,6 +629,8 @@ pub fn approved_set(cfg: &PoolConfig) -> Result<Vec<Fr>, CoreError> {
 // a Docker-free prover is a separate packaging task.)
 
 /// The encrypted output payloads to publish with a transfer (one per output note).
+/// `Clone`/`Serialize` so a pre-proved spend can be queued at rest by the keeper.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OutputPayload {
     pub enc_note: Vec<u8>,
     pub ephemeral_pub: [u8; 32],

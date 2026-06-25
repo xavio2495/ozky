@@ -299,8 +299,147 @@ pub fn split_with(
     cfg: &PoolConfig,
     recipients: &[SplitRecipient],
 ) -> Result<String, CoreError> {
-    let id = scan::wallet_identity(wallet)?;
+    let prepared = prepare_split(wallet, cfg, recipients)?;
+    submit_prepared(cfg, cfg.submit_source(wallet.stellar_secret()), &prepared)
+}
+
+// ----------------------------- prove / submit split (keeper foundation, K1) -----------------------------
+
+/// Which pool entrypoint a [`PreparedTx`] submits through.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PreparedMethod {
+    Split,
+    Transfer4,
+}
+
+/// A built-and-proved spend that has NOT been submitted yet. Splitting "prove" (which needs
+/// `owner_sk`) from "submit" (which needs only a fee source) is the foundation of the headless
+/// keeper: the app pre-proves now, a relayer fires it later with no key material. The bound-state
+/// fields let a submitter pre-flight a queued proof cheaply (epoch/nullifier-root binding) before
+/// spending a fee — a stale proof fails on-chain, so this avoids a wasted submission.
+#[derive(Clone)]
+pub struct PreparedTx {
+    pub method: PreparedMethod,
+    pub asset_tag: Fr,
+    pub public_inputs: Vec<u8>,
+    pub proof: Vec<u8>,
+    pub outputs: Vec<chain::OutputPayload>,
+    pub bound_epoch: u32,
+    pub nullifier_old: Fr,
+    pub nullifier_new: Fr,
+    pub commitment_root: Fr,
+}
+
+/// A prepared split plus the state delta it will cause on submit — enough to chain the NEXT
+/// pre-proved chunk against PROJECTED state: the keeper folds `nullifiers` into the next chunk's
+/// prior-nullifier set, appends `out_commitments` to its commitment leaves, and spends `change`
+/// (this split's change note) as the next chunk's input note. `prepare_split` discards the delta.
+pub struct PreparedSplit {
+    pub tx: PreparedTx,
+    /// The two nullifiers this split publishes (real note + dummy).
+    pub nullifiers: Vec<Fr>,
+    /// The eight output commitments this split appends to the tree (recipients, change, dummies).
+    pub out_commitments: Vec<Fr>,
+    /// The change note returned to the spender, at its PROJECTED leaf index (funds the next chunk).
+    pub change: OwnedNote,
+}
+
+/// Submit a pre-proved spend via `source_secret` (the wallet itself, or a keeper relayer).
+/// Dispatches to the entrypoint the proof was built for.
+pub fn submit_prepared(
+    cfg: &PoolConfig,
+    source_secret: &str,
+    tx: &PreparedTx,
+) -> Result<String, CoreError> {
+    match tx.method {
+        PreparedMethod::Split => chain::submit_split(
+            cfg,
+            source_secret,
+            &tx.public_inputs,
+            &tx.proof,
+            &tx.outputs,
+        ),
+        PreparedMethod::Transfer4 => chain::submit_transfer4(
+            cfg,
+            source_secret,
+            &tx.public_inputs,
+            &tx.proof,
+            &tx.outputs,
+        ),
+    }
+}
+
+/// Build + prove a split against EXPLICIT state (no network, no submit) — the state-injected
+/// core. The keeper supplies *projected* state to chain pre-proved chunks; [`prepare_split`]
+/// supplies LIVE state. `parsed` is `(owner_pk, transmission_pub, amount)` per recipient.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_split_against(
+    id: &WalletIdentity,
+    cfg: &PoolConfig,
+    epoch: u32,
+    note: &OwnedNote,
+    commitment_leaves: &[Fr],
+    prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
+    parsed: &[(Fr, [u8; 32], u64)],
+) -> Result<PreparedSplit, CoreError> {
     let h = Hasher::new();
+    let (witness, meta) = build_split_witness(
+        &h,
+        id,
+        cfg,
+        epoch,
+        note,
+        commitment_leaves,
+        prior_nullifiers,
+        asp_leaves,
+        parsed,
+    )?;
+    let bundle = proving::prove_split_witness(&witness)?;
+    let outputs = split_output_payloads(cfg, epoch, &meta)?;
+
+    // The change note (output slot `parsed.len()`) lands right after this split's outputs are
+    // appended: at projected index `commitment_leaves.len() + change_slot`. It funds the next chunk.
+    let change_slot = parsed.len();
+    let change_meta = &meta[change_slot].0;
+    let change = OwnedNote {
+        leaf_index: (commitment_leaves.len() + change_slot) as u32,
+        value: change_meta.value,
+        asset_tag: cfg.asset_tag,
+        blinding: change_meta.blinding,
+        epoch,
+        rho: change_meta.rho,
+        commitment: witness.out_commitments[change_slot],
+    };
+
+    let tx = PreparedTx {
+        method: PreparedMethod::Split,
+        asset_tag: cfg.asset_tag,
+        public_inputs: bundle.public_inputs,
+        proof: bundle.proof,
+        outputs,
+        bound_epoch: epoch,
+        nullifier_old: witness.nullifier_old_root,
+        nullifier_new: witness.nullifier_new_root,
+        commitment_root: witness.commitment_root,
+    };
+    Ok(PreparedSplit {
+        tx,
+        nullifiers: witness.nullifiers.to_vec(),
+        out_commitments: witness.out_commitments.to_vec(),
+        change,
+    })
+}
+
+/// Build + prove a split against LIVE pool state, selecting one owned note covering the total.
+/// Does NOT submit — returns the [`PreparedTx`] for the caller (the keeper queues it; `split_with`
+/// submits it immediately).
+pub fn prepare_split(
+    wallet: &keys::WalletKeys,
+    cfg: &PoolConfig,
+    recipients: &[SplitRecipient],
+) -> Result<PreparedTx, CoreError> {
+    let id = scan::wallet_identity(wallet)?;
     let epoch = chain::current_epoch(&cfg.rpc_url)?;
     let state = chain::pool_state(cfg)?;
     let commitment_leaves = chain::commitment_leaves_from(&state.commits)?;
@@ -322,8 +461,7 @@ pub fn split_with(
         .find(|n| n.value >= total && n.asset_tag == cfg.asset_tag)
         .ok_or_else(|| CoreError::Proving(format!("no single owned note covers split total {total}")))?;
 
-    let (witness, meta) = build_split_witness(
-        &h,
+    Ok(prepare_split_against(
         &id,
         cfg,
         epoch,
@@ -332,18 +470,8 @@ pub fn split_with(
         &state.nullifiers,
         &asp_leaves,
         &parsed,
-    )?;
-
-    let bundle = proving::prove_split_witness(&witness)?;
-    let outputs = split_output_payloads(cfg, epoch, &meta)?;
-
-    chain::submit_split(
-        cfg,
-        cfg.submit_source(wallet.stellar_secret()),
-        &bundle.public_inputs,
-        &bundle.proof,
-        &outputs,
-    )
+    )?
+    .tx)
 }
 
 // ----------------------------- multi-send (possibly cross-asset) -----------------------------
@@ -586,6 +714,35 @@ pub fn send_prepared4(
     asp_leaves: &[Fr],
     epoch: u32,
 ) -> Result<String, CoreError> {
+    let prepared = prepare_transfer4(
+        wallet,
+        cfg,
+        recipient_code,
+        amount,
+        notes,
+        commitment_leaves,
+        prior_nullifiers,
+        asp_leaves,
+        epoch,
+    )?;
+    submit_prepared(cfg, cfg.submit_source(wallet.stellar_secret()), &prepared)
+}
+
+/// Build + prove a `transfer4` against EXPLICIT state (no submit) — the prove half of
+/// [`send_prepared4`], returning a [`PreparedTx`] the keeper can queue. out0 = `amount` to the
+/// recipient, out1 = change back to the spender.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_transfer4(
+    wallet: &keys::WalletKeys,
+    cfg: &PoolConfig,
+    recipient_code: &str,
+    amount: u64,
+    notes: &[OwnedNote],
+    commitment_leaves: &[Fr],
+    prior_nullifiers: &[Fr],
+    asp_leaves: &[Fr],
+    epoch: u32,
+) -> Result<PreparedTx, CoreError> {
     let id = scan::wallet_identity(wallet)?;
     let h = Hasher::new();
     let (recipient_owner_pk, recipient_transmission_pub) = parse_payment_code(recipient_code)?;
@@ -650,13 +807,17 @@ pub fn send_prepared4(
         &rnd,
     )?;
 
-    chain::submit_transfer4(
-        cfg,
-        cfg.submit_source(wallet.stellar_secret()),
-        &bundle.public_inputs,
-        &bundle.proof,
-        &outputs,
-    )
+    Ok(PreparedTx {
+        method: PreparedMethod::Transfer4,
+        asset_tag: cfg.asset_tag,
+        public_inputs: bundle.public_inputs,
+        proof: bundle.proof,
+        outputs,
+        bound_epoch: epoch,
+        nullifier_old: witness.nullifier_old_root,
+        nullifier_new: witness.nullifier_new_root,
+        commitment_root: witness.commitment_root,
+    })
 }
 
 /// Consolidate a fragmented balance: collapse up to [`N_TRANSFER4_INPUTS`] owned notes of `asset`

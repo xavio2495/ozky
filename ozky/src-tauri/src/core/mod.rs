@@ -29,6 +29,8 @@ pub mod encrypt;
 pub mod enroll;
 pub mod escrow;
 pub mod history;
+pub mod keeper;
+pub mod keeper_task;
 pub mod keychain;
 pub mod keys;
 pub mod notes;

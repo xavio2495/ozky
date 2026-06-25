@@ -2,7 +2,8 @@
 //! lives in [`core`]; [`commands`] exposes the `invoke` surface to the Svelte UI.
 
 mod commands;
-mod core;
+// `pub` so the `ozky-keeper` binary (src/bin/ozky-keeper.rs) can reuse the keeper submit core.
+pub mod core;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -37,6 +38,13 @@ pub fn run() {
             commands::delete_payroll,
             commands::set_payroll_enabled,
             commands::run_payroll,
+            commands::arm_payroll_keeper,
+            commands::disarm_payroll_keeper,
+            commands::keeper_status,
+            commands::keeper_endpoint,
+            commands::set_keeper_endpoint,
+            commands::set_local_keeper,
+            commands::local_keeper_status,
             commands::list_subscriptions,
             commands::save_subscription,
             commands::delete_subscription,

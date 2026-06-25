@@ -19,7 +19,8 @@
 	import CalendarClockIcon from '@lucide/svelte/icons/calendar-clock';
 	import InfoIcon from '@lucide/svelte/icons/info';
 	import { toast } from 'svelte-sonner';
-	import { api, errMessage, type Payroll } from '$lib/api';
+	import { onMount } from 'svelte';
+	import { api, errMessage, type Payroll, type KeeperRun } from '$lib/api';
 	import { wallet } from '$lib/wallet.svelte';
 	import { toBaseUnits, assetByCode, ASSETS } from '$lib/assets';
 	import { prettyAmount } from '$lib/format';
@@ -45,6 +46,45 @@
 
 	let confirmRunId = $state<number | null>(null);
 	let confirmDeleteId = $state<number | null>(null);
+
+	// Headless keeper: armed runs (pre-proved, awaiting a scheduled headless submit).
+	let keeperRuns = $state<KeeperRun[]>([]);
+	const armedFor = (id: number) => keeperRuns.find((r) => r.payroll_id === id);
+
+	async function refreshKeeper() {
+		try {
+			keeperRuns = await api.keeperStatus();
+		} catch {
+			keeperRuns = [];
+		}
+	}
+	onMount(refreshKeeper);
+
+	async function armKeeper(p: Payroll) {
+		provingTitle = `Arming headless keeper for "${p.label}"`;
+		proving = true;
+		try {
+			await api.armPayrollKeeper(p.id);
+			await refreshKeeper();
+			toast.success('Armed for a headless run', {
+				description: 'A local task can submit this run on schedule, even with ozky closed.'
+			});
+		} catch (e) {
+			toast.error('Could not arm', { description: errMessage(e) });
+		} finally {
+			proving = false;
+		}
+	}
+
+	async function disarmKeeper(p: Payroll) {
+		try {
+			await api.disarmPayrollKeeper(p.id);
+			await refreshKeeper();
+			toast.success('Headless run disarmed');
+		} catch (e) {
+			toast.error('Could not disarm', { description: errMessage(e) });
+		}
+	}
 
 	const cadenceLabel = (p: Payroll) =>
 		p.cadence === 'weekly' ? 'Weekly' : p.cadence === 'monthly' ? 'Monthly' : `Every ${p.interval_days} days`;
@@ -188,11 +228,32 @@
 									{p.payees.length} payees · {prettyAmount(String(p.total / 10 ** decimals))} {p.asset} · {cadenceLabel(p)}
 									· next {fmtDate(p.next_run_unix)}
 								</p>
+								{#if armedFor(p.id)}
+									{@const run = armedFor(p.id)!}
+									<p class="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+										<Badge variant="secondary">Headless armed</Badge>
+										<span class="text-muted-foreground">
+											epoch {run.bound_epoch} · {run.chunks} chunk{run.chunks === 1 ? '' : 's'}{run.submitted
+												? ` · ${run.submitted} submitted`
+												: ''} — until the epoch rolls or you spend manually
+										</span>
+										{#if run.error}<span class="text-destructive">· {run.error}</span>{/if}
+									</p>
+								{/if}
 							</div>
 							<div class="flex items-center gap-1.5">
 								<Button size="sm" onclick={() => (confirmRunId = p.id)} disabled={!p.enabled}>
 									<PlayIcon class="size-4" data-icon="inline-start" /> Run now
 								</Button>
+								{#if armedFor(p.id)}
+									<Button variant="ghost" size="sm" onclick={() => disarmKeeper(p)} title="Stop headless runs">
+										Disarm
+									</Button>
+								{:else}
+									<Button variant="outline" size="sm" onclick={() => armKeeper(p)} disabled={!p.enabled}>
+										Run headless
+									</Button>
+								{/if}
 								<Button variant="ghost" size="icon" onclick={() => toggle(p)} title={p.enabled ? 'Pause' : 'Resume'}>
 									{#if p.enabled}<PauseIcon class="size-4" />{:else}<PlayIcon class="size-4" />{/if}
 								</Button>
@@ -216,6 +277,7 @@
 				<ul class="mt-1 flex list-disc flex-col gap-1 pl-4 text-xs">
 					<li>Runs only while ozky is open — due payrolls are flagged for you to run.</li>
 					<li>Each run pays same-asset payees in batches of 5; cross-asset payees are individual txs.</li>
+						<li><b>Run headless</b> pre-proves the next run so a background task can submit it on schedule even with ozky closed — valid only until the epoch rolls or you spend manually (re-arm on open).</li>
 					<li>Nothing is paid without your explicit "Run now".</li>
 				</ul>
 			</Alert.Description>

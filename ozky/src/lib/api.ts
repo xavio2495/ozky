@@ -37,6 +37,17 @@ export type Payroll = {
 	total: number;
 };
 
+/** A headless-keeper armed run summary (no proof bytes). */
+export type KeeperRun = {
+	payroll_id: number;
+	chunks: number;
+	bound_epoch: number;
+	earliest_submit_unix: number;
+	submitted: number;
+	tx_hashes: string[];
+	error: string | null;
+};
+
 /** Payroll create/update input. id=0 creates. */
 export type PayrollInput = {
 	id: number;
@@ -245,6 +256,15 @@ export const api = {
 	setPayrollEnabled: (id: number, enabled: boolean) =>
 		invoke<void>('set_payroll_enabled', { id, enabled }),
 	runPayroll: (id: number) => invoke<string[]>('run_payroll', { id }),
+
+	armPayrollKeeper: (id: number) => invoke<KeeperRun>('arm_payroll_keeper', { id }),
+	disarmPayrollKeeper: (id: number) => invoke<boolean>('disarm_payroll_keeper', { id }),
+	keeperStatus: () => invoke<KeeperRun[]>('keeper_status'),
+	keeperEndpoint: () => invoke<string>('keeper_endpoint'),
+	setKeeperEndpoint: (url: string, token: string) =>
+		invoke<void>('set_keeper_endpoint', { url, token }),
+	setLocalKeeper: (enabled: boolean) => invoke<boolean>('set_local_keeper', { enabled }),
+	localKeeperStatus: () => invoke<boolean>('local_keeper_status'),
 
 	listSubscriptions: () => invoke<Subscription[]>('list_subscriptions'),
 	saveSubscription: (input: SubscriptionInput) => invoke<number>('save_subscription', { input }),

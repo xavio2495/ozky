@@ -206,6 +206,14 @@ impl IndexedTree {
     }
 }
 
+/// The indexed-accumulator root over a nullifier set (insertion order) — identical to a
+/// spend witness's `nullifier_old_root` for the same `prior`. The keeper pre-flights a queued
+/// bundle by comparing this (the LIVE pool root) to the bundle's bound `nullifier_old`: any pool
+/// spend since arming advances the root and would make the queued proof fail on submit.
+pub fn nullifier_set_root(h: &Hasher, prior: &[Fr]) -> Fr {
+    IndexedTree::from_nullifiers(h, prior).root(h)
+}
+
 /// Build the chained two-insertion witness (`nf0` then `nf1`) into the accumulator
 /// holding `prior` nullifiers. Returns old root, new root, and both witnesses.
 fn build_two_insertions(

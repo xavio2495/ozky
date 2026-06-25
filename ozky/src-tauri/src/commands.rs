@@ -530,6 +530,141 @@ pub async fn run_payroll(id: u64) -> Result<Vec<String>, CoreError> {
     .await
 }
 
+// ----------------------------- headless payroll keeper (scope #2) -----------------------------
+
+/// A UI-facing summary of one armed keeper run. (headless keeper)
+#[derive(Serialize)]
+pub struct KeeperRunView {
+    pub payroll_id: u64,
+    pub chunks: u32,
+    pub bound_epoch: u32,
+    pub earliest_submit_unix: i64,
+    pub submitted: u32,
+    pub tx_hashes: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl From<core::keeper::RunStatus> for KeeperRunView {
+    fn from(s: core::keeper::RunStatus) -> Self {
+        KeeperRunView {
+            payroll_id: s.payroll_id,
+            chunks: s.chunks,
+            bound_epoch: s.bound_epoch,
+            earliest_submit_unix: s.earliest_submit_unix,
+            submitted: s.submitted as u32,
+            tx_hashes: s.tx_hashes,
+            error: s.error,
+        }
+    }
+}
+
+/// Pre-prove a payroll's next due run and queue it for the headless keeper. Off the UI thread
+/// (it proves). Returns the armed run summary. (headless keeper)
+#[tauri::command]
+pub async fn arm_payroll_keeper(id: u64) -> Result<KeeperRunView, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        let run = core::keeper::arm(&wallet, &cfg, id)?;
+        // Summarize without shipping proof bytes to the UI.
+        let status = core::keeper::status(&core::keeper::KeeperKeys::from_wallet(&wallet))?;
+        Ok(status
+            .into_iter()
+            .find(|s| s.payroll_id == run.payroll_id)
+            .map(KeeperRunView::from)
+            .unwrap_or(KeeperRunView {
+                payroll_id: id,
+                chunks: run.bundles.len() as u32,
+                bound_epoch: 0,
+                earliest_submit_unix: 0,
+                submitted: 0,
+                tx_hashes: vec![],
+                error: None,
+            }))
+    })
+    .await
+}
+
+/// Drop a payroll's armed keeper run (revoke). Returns whether one existed. (headless keeper)
+#[tauri::command]
+pub fn disarm_payroll_keeper(id: u64) -> Result<bool, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::keeper::disarm(&core::keeper::KeeperKeys::from_wallet(&wallet), id)
+}
+
+/// The armed keeper runs + last results, for the UI. (headless keeper)
+#[tauri::command]
+pub fn keeper_status() -> Result<Vec<KeeperRunView>, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let status = core::keeper::status(&core::keeper::KeeperKeys::from_wallet(&wallet))?;
+    Ok(status.into_iter().map(KeeperRunView::from).collect())
+}
+
+/// The configured cloud-keeper endpoint URL (empty = local-task-only); the token is never
+/// returned. (headless keeper)
+#[tauri::command]
+pub fn keeper_endpoint() -> Result<String, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let ep = core::keeper::load_endpoint(&core::keeper::KeeperKeys::from_wallet(&wallet))?;
+    Ok(ep.map(|e| e.url).unwrap_or_default())
+}
+
+/// Set (or clear, with an empty url) the cloud-keeper endpoint + token. (headless keeper)
+#[tauri::command]
+pub fn set_keeper_endpoint(url: String, token: String) -> Result<(), CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    core::keeper::set_endpoint(
+        &core::keeper::KeeperKeys::from_wallet(&wallet),
+        &core::keeper::KeeperEndpoint { url, token },
+    )
+}
+
+/// Enable/disable the local OS-scheduled keeper. Enabling writes a credential file (notes_key +
+/// paths, NOT `owner_sk`) and registers a Task-Scheduler task running `ozky-keeper --once` every
+/// 15 min; disabling removes both. Returns the new enabled state. (headless keeper)
+#[tauri::command]
+pub fn set_local_keeper(enabled: bool) -> Result<bool, CoreError> {
+    let wallet = core::keys::current_wallet()?;
+    let keys = core::keeper::KeeperKeys::from_wallet(&wallet);
+    if !enabled {
+        core::keeper_task::unregister()?;
+        core::keeper::remove_local_cred(&keys)?;
+        return Ok(false);
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| CoreError::Chain(format!("locate current exe: {e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| CoreError::Chain("no parent dir for current exe".into()))?;
+    let keeper_exe = dir.join(if cfg!(windows) { "ozky-keeper.exe" } else { "ozky-keeper" });
+    if !keeper_exe.exists() {
+        return Err(CoreError::Chain(format!(
+            "ozky-keeper binary not found at {} (it ships beside the app)",
+            keeper_exe.display()
+        )));
+    }
+    // Same paths the app uses, so the scheduled binary reads the same queue + pool config.
+    let notes_dir = std::env::var("OZKY_NOTES_DIR")
+        .unwrap_or_else(|_| core::notes::data_dir().to_string_lossy().into_owned());
+    let config = std::env::var("OZKY_CONFIG").unwrap_or_else(|_| {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("ozky.config.json")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let cred = core::keeper::write_local_cred(&keys, &notes_dir, &config)?;
+    core::keeper_task::register(&keeper_exe, &cred, 15)?;
+    Ok(true)
+}
+
+/// Whether the local OS-scheduled keeper task is registered. (headless keeper)
+#[tauri::command]
+pub fn local_keeper_status() -> Result<bool, CoreError> {
+    Ok(core::keeper_task::is_registered())
+}
+
 /// Subscription create/update input from the UI. (push subscriptions)
 #[derive(serde::Deserialize)]
 pub struct SubscriptionInput {

@@ -6,6 +6,7 @@
 	import ProvingOverlay from '$lib/components/shared/ProvingOverlay.svelte';
 	import CopyButton from '$lib/components/shared/CopyButton.svelte';
 	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
 	import { Spinner } from '$lib/components/ui/spinner';
 	import { Badge } from '$lib/components/ui/badge';
 	import * as Card from '$lib/components/ui/card';
@@ -30,6 +31,42 @@
 	let consolidateAsset = $state('USDC');
 	let consolidating = $state(false);
 
+	// Headless keeper endpoint (cloud push target; empty = local-task-only).
+	let keeperUrl = $state('');
+	let keeperToken = $state('');
+	let savingKeeper = $state(false);
+	let localKeeper = $state(false);
+	let togglingLocal = $state(false);
+
+	async function toggleLocalKeeper() {
+		togglingLocal = true;
+		try {
+			localKeeper = await api.setLocalKeeper(!localKeeper);
+			toast.success(localKeeper ? 'Local keeper enabled' : 'Local keeper disabled', {
+				description: localKeeper
+					? 'A background task will submit armed payroll runs on schedule.'
+					: undefined
+			});
+		} catch (e) {
+			toast.error('Could not update local keeper', { description: errMessage(e) });
+		} finally {
+			togglingLocal = false;
+		}
+	}
+
+	async function saveKeeper() {
+		savingKeeper = true;
+		try {
+			await api.setKeeperEndpoint(keeperUrl.trim(), keeperToken.trim());
+			keeperToken = '';
+			toast.success(keeperUrl.trim() ? 'Keeper endpoint saved' : 'Keeper set to local-task-only');
+		} catch (e) {
+			toast.error('Could not save keeper endpoint', { description: errMessage(e) });
+		} finally {
+			savingKeeper = false;
+		}
+	}
+
 	async function consolidate() {
 		consolidating = true;
 		const hash = await runAction(
@@ -47,6 +84,16 @@
 			funding = await api.fundingAddress();
 		} catch (e) {
 			toast.error('Could not load address', { description: errMessage(e) });
+		}
+		try {
+			keeperUrl = await api.keeperEndpoint();
+		} catch {
+			keeperUrl = '';
+		}
+		try {
+			localKeeper = await api.localKeeperStatus();
+		} catch {
+			localKeeper = false;
 		}
 	});
 
@@ -120,6 +167,44 @@
 								data-icon="inline-start"
 							/>{/if}
 						Consolidate
+					</Button>
+				</Card.Content>
+			</Card.Root>
+
+			<Card.Root>
+				<Card.Header>
+					<Card.Title>Headless keeper</Card.Title>
+					<Card.Description>
+						Where armed payroll runs are submitted from. Leave blank for <b>local task only</b> (a
+						background task on this machine). Set a cloud endpoint + token to use the managed keeper —
+						it relays your pre-proved runs but never holds your spend key.
+					</Card.Description>
+				</Card.Header>
+				<Card.Content class="flex flex-col gap-3">
+					<div class="flex items-center justify-between gap-3">
+						<div class="text-sm">
+							<div class="font-medium">Run keeper locally</div>
+							<p class="text-xs text-muted-foreground">
+								A background task on this machine submits armed runs on schedule.
+							</p>
+						</div>
+						<div class="flex items-center gap-2">
+							{#if localKeeper}<Badge variant="secondary">On</Badge>{/if}
+							<Button variant="outline" onclick={toggleLocalKeeper} disabled={togglingLocal}>
+								{#if togglingLocal}<Spinner data-icon="inline-start" />{/if}
+								{localKeeper ? 'Disable' : 'Enable'}
+							</Button>
+						</div>
+					</div>
+					<Input bind:value={keeperUrl} placeholder="https://keeper.example/submit (blank = local only)" />
+					<Input
+						bind:value={keeperToken}
+						type="password"
+						placeholder="Per-user token (write-only; leave blank to keep)"
+					/>
+					<Button variant="outline" class="self-start" onclick={saveKeeper} disabled={savingKeeper}>
+						{#if savingKeeper}<Spinner data-icon="inline-start" />{/if}
+						Save cloud endpoint
 					</Button>
 				</Card.Content>
 			</Card.Root>

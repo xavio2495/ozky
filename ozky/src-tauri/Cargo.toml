@@ -50,6 +50,9 @@ base32 = "0.5"
 # so the wallet reconstructs any pool's commitments/nullifiers from raw chain data
 # (the indexer is only an optional accelerator; raw RPC is the correctness path).
 ureq = { version = "2", features = ["json"] }
+# Minimal blocking HTTP server for the cloud keeper (`ozky-keeper --serve`, K7). The client side
+# (push-on-arm + RPC) reuses ureq above; only the serve binary needs a server.
+tiny_http = "0.12"
 stellar-xdr = { version = "23", features = ["std", "base64", "curr"] }
 # A2 — circuit-matching Poseidon2 (BN254). Reuse the EXACT host-function wrapper the
 # contract/indexer use (proven parity) so witnesses are byte-for-byte acceptable to

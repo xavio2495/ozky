@@ -15,15 +15,18 @@
 	import { toast } from 'svelte-sonner';
 	import { api, errMessage } from '$lib/api';
 	import { wallet, runAction } from '$lib/wallet.svelte';
-	import { toBaseUnits } from '$lib/assets';
+	import * as Select from '$lib/components/ui/select';
+	import { toBaseUnits, assetByCode, ASSETS } from '$lib/assets';
 	import { prettyAmount } from '$lib/format';
 
 	const MAX_RECIPIENTS = 5;
+	const assetCodes = ASSETS.map((a) => a.code);
 
 	let asset = $state('USDC');
-	let rows = $state<{ recipient: string; amount: string }[]>([
-		{ recipient: '', amount: '' },
-		{ recipient: '', amount: '' }
+	// `recv` is the receive asset; '' (or equal to `asset`) = same-asset, bundled into the split.
+	let rows = $state<{ recipient: string; amount: string; recv: string }[]>([
+		{ recipient: '', amount: '', recv: '' },
+		{ recipient: '', amount: '', recv: '' }
 	]);
 	let confirmOpen = $state(false);
 	let proving = $state(false);
@@ -36,10 +39,12 @@
 	const validRows = $derived(
 		rows.filter((r) => r.recipient.trim() && Number(r.amount) > 0)
 	);
+	// Any recipient receiving a different asset → cross-asset legs (separate in-pool pay txs).
+	const hasCrossAsset = $derived(validRows.some((r) => r.recv && r.recv !== asset));
 
 	function addRow() {
 		if (rows.length >= MAX_RECIPIENTS) return;
-		rows = [...rows, { recipient: '', amount: '' }];
+		rows = [...rows, { recipient: '', amount: '', recv: '' }];
 	}
 	function removeRow(i: number) {
 		rows = rows.filter((_, idx) => idx !== i);
@@ -55,14 +60,17 @@
 				toast.error('Each recipient must be a valid ozky… code');
 				return;
 			}
+			const recvAsset = r.recv && r.recv !== asset ? r.recv : undefined;
 			try {
-				toBaseUnits(r.amount, decimals);
+				toBaseUnits(r.amount, recvAsset ? (assetByCode(recvAsset)?.decimals ?? 7) : decimals);
 			} catch (e) {
 				toast.error(errMessage(e));
 				return;
 			}
 		}
-		if (bal && totalDisplay > Number(bal.display)) {
+		// Only the same-asset total can be checked against the balance up front (cross-asset cost is
+		// quoted in `asset` at submit time); the backend rejects an over-spend either way.
+		if (!hasCrossAsset && bal && totalDisplay > Number(bal.display)) {
 			toast.error('Split total exceeds your shielded balance');
 			return;
 		}
@@ -71,25 +79,36 @@
 
 	async function submit() {
 		confirmOpen = false;
-		const recipients = validRows.map((r) => ({
-			recipient: r.recipient.trim(),
-			amount: toBaseUnits(r.amount, decimals)
-		}));
-		proving = true;
-		const hash = await runAction('Splitting payment', () => api.split(asset, recipients), {
-			success: () => 'Split sent'
+		const recipients = validRows.map((r) => {
+			const recvAsset = r.recv && r.recv !== asset ? r.recv : undefined;
+			const dec = recvAsset ? (assetByCode(recvAsset)?.decimals ?? 7) : decimals;
+			return { recipient: r.recipient.trim(), amount: toBaseUnits(r.amount, dec), recv_asset: recvAsset };
 		});
+		proving = true;
+		// Pure same-asset → one shielded split tx (unchanged). Any cross-asset recipient → multi_send
+		// (same-asset bundled into a split, each cross-asset recipient an individual in-pool pay).
+		const hash = await runAction(
+			'Splitting payment',
+			() =>
+				hasCrossAsset
+					? api.multiSend(asset, recipients).then((hs) => hs[0])
+					: api.split(
+							asset,
+							recipients.map(({ recipient, amount }) => ({ recipient, amount }))
+						),
+			{ success: () => 'Split sent' }
+		);
 		proving = false;
 		if (hash) {
 			wallet.log({
 				kind: 'split',
 				label: `Split ${totalDisplay} ${asset}`,
-				detail: `${recipients.length} recipients`,
+				detail: `${recipients.length} recipients${hasCrossAsset ? ' (cross-asset)' : ''}`,
 				hash
 			});
 			rows = [
-				{ recipient: '', amount: '' },
-				{ recipient: '', amount: '' }
+				{ recipient: '', amount: '', recv: '' },
+				{ recipient: '', amount: '', recv: '' }
 			];
 		}
 	}
@@ -120,8 +139,16 @@
 										bind:value={row.amount}
 										inputmode="decimal"
 										placeholder="0.00"
-										class="w-32 font-mono"
+										class="w-28 font-mono"
 									/>
+									<Select.Root type="single" value={row.recv || asset} onValueChange={(v) => (row.recv = v)}>
+										<Select.Trigger class="h-9 w-20" title="Receive asset">{row.recv || asset}</Select.Trigger>
+										<Select.Content>
+											{#each assetCodes as code (code)}
+												<Select.Item value={code} label={code}>{code}</Select.Item>
+											{/each}
+										</Select.Content>
+									</Select.Root>
 									<Button
 										variant="ghost"
 										size="icon"
@@ -134,6 +161,11 @@
 								</div>
 							{/each}
 						</div>
+						<Field.Description>
+							Each recipient receives {asset} by default. Pick a different asset to pay them across
+							assets in-pool (amount = what they receive); cross-asset recipients are paid as separate
+							transactions.
+						</Field.Description>
 						<Button
 							variant="outline"
 							size="sm"
@@ -179,7 +211,8 @@
 			<AlertDialog.Title>Confirm split</AlertDialog.Title>
 			<AlertDialog.Description>
 				Send <b>{prettyAmount(String(totalDisplay))} {asset}</b> across
-				<b>{validRows.length}</b> recipients in one shielded transaction?
+				<b>{validRows.length}</b> recipients{#if hasCrossAsset}, with cross-asset recipients paid as
+				separate in-pool transactions{:else} in one shielded transaction{/if}?
 			</AlertDialog.Description>
 		</AlertDialog.Header>
 		<AlertDialog.Footer>

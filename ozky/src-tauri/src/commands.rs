@@ -382,11 +382,14 @@ pub async fn split(asset: String, recipients: Vec<SplitRecipientArg>) -> Result<
     .await
 }
 
-/// A payee row for a payroll (shielded code + base-unit amount).
+/// A payee row for a payroll (shielded code + base-unit amount, optional cross-asset receive).
 #[derive(serde::Deserialize)]
 pub struct PayeeArg {
     pub code: String,
     pub amount: u64,
+    /// Asset the payee receives (cross-asset pay); omitted/equal to the payroll asset = same-asset.
+    #[serde(default)]
+    pub recv_asset: Option<String>,
 }
 
 /// Payroll create/update input from the UI.
@@ -425,6 +428,7 @@ pub struct PayrollView {
 pub struct PayeeView {
     pub code: String,
     pub amount: u64,
+    pub recv_asset: Option<String>,
 }
 
 fn cadence_to_str(c: core::payroll::Cadence) -> (String, u32) {
@@ -449,7 +453,11 @@ fn view(p: core::payroll::Payroll, now: i64) -> PayrollView {
         id: p.id,
         label: p.label.clone(),
         asset: p.asset.clone(),
-        payees: p.payees.iter().map(|x| PayeeView { code: x.code.clone(), amount: x.amount }).collect(),
+        payees: p
+            .payees
+            .iter()
+            .map(|x| PayeeView { code: x.code.clone(), amount: x.amount, recv_asset: x.recv_asset.clone() })
+            .collect(),
         cadence,
         interval_days,
         next_run_unix: p.next_run_unix,
@@ -483,7 +491,11 @@ pub fn save_payroll(input: PayrollInput) -> Result<u64, CoreError> {
         id: input.id,
         label: input.label,
         asset: input.asset,
-        payees: input.payees.into_iter().map(|x| core::payroll::Payee { code: x.code, amount: x.amount }).collect(),
+        payees: input
+            .payees
+            .into_iter()
+            .map(|x| core::payroll::Payee { code: x.code, amount: x.amount, recv_asset: x.recv_asset })
+            .collect(),
         cadence,
         next_run_unix: start,
         last_run_unix,
@@ -983,6 +995,63 @@ pub async fn swap(
     slippage_bps: u32,
 ) -> Result<core::swap::SwapReceipt, CoreError> {
     blocking(move || core::swap::swap(&from, &to, amount, slippage_bps)).await
+}
+
+/// Quote the source (X) cost to deliver `dest_amount` of `to` (Y) paying in `from` (X), against the
+/// pool's live reserves. Read-only. (cross-asset pay)
+#[tauri::command]
+pub async fn pay_quote(
+    from: String,
+    to: String,
+    dest_amount: u64,
+) -> Result<core::swap::PayQuote, CoreError> {
+    blocking(move || core::swap::pay_quote(&from, &to, dest_amount)).await
+}
+
+/// Cross-asset pay: deliver exactly `dest_amount` of `to` (Y) to the holder of `recipient_code`,
+/// paying in `from` (X). One atomic in-pool swap; the Y-note goes to the recipient, X change back to
+/// the sender. Proves off the UI thread; returns a receipt. (cross-asset pay)
+#[tauri::command]
+pub async fn pay(
+    recipient_code: String,
+    from: String,
+    to: String,
+    dest_amount: u64,
+    slippage_bps: u32,
+) -> Result<core::swap::SwapReceipt, CoreError> {
+    blocking(move || core::swap::pay(&recipient_code, &from, &to, dest_amount, slippage_bps)).await
+}
+
+/// One recipient of a multi-send: a shielded payment code, base-unit amount, and optionally the
+/// asset they should receive (a different asset = cross-asset pay; then `amount` is the destination
+/// amount). (cross-asset pay)
+#[derive(serde::Deserialize)]
+pub struct MultiRecipientArg {
+    pub recipient: String,
+    pub amount: u64,
+    #[serde(default)]
+    pub recv_asset: Option<String>,
+}
+
+/// Multi-send paying in `pay_asset`: same-asset recipients bundle into `split` txs; each cross-asset
+/// recipient is an individual `pay`. Proves off the UI thread; returns every tx hash. (cross-asset pay)
+#[tauri::command]
+pub async fn multi_send(
+    pay_asset: String,
+    recipients: Vec<MultiRecipientArg>,
+) -> Result<Vec<String>, CoreError> {
+    blocking(move || {
+        let rs: Vec<core::send::MultiRecipient> = recipients
+            .into_iter()
+            .map(|r| core::send::MultiRecipient {
+                code: r.recipient,
+                amount: r.amount,
+                recv_asset: r.recv_asset,
+            })
+            .collect();
+        core::send::multi_send(&pay_asset, &rs)
+    })
+    .await
 }
 
 /// This wallet's **public Stellar funding address** (`G…`). Give this to any wallet or

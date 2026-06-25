@@ -9,7 +9,7 @@
 use super::config::PoolConfig;
 use super::keys::WalletKeys;
 use super::notes::data_dir;
-use super::send::{self, SplitRecipient};
+use super::send;
 use super::CoreError;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
@@ -18,15 +18,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-/// Max recipients in one split tx (matches `witness::N_SPLIT_OUTPUTS - 1`).
-const SPLIT_CHUNK: usize = 5;
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Payee {
     /// Recipient shielded payment code (`ozky…`).
     pub code: String,
     /// Amount in base units.
     pub amount: u64,
+    /// Asset the recipient receives. `None` (or equal to the payroll asset) = a same-asset payment
+    /// bundled into a split; a different code = a cross-asset `pay` (then `amount` is the
+    /// DESTINATION amount). `#[serde(default)]` so existing encrypted stores deserialize unchanged.
+    #[serde(default)]
+    pub recv_asset: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -172,17 +174,23 @@ pub fn run(wallet: &WalletKeys, cfg_base: &PoolConfig, id: u64) -> Result<Vec<St
     if payroll.payees.is_empty() {
         return Err(CoreError::Crypto("payroll has no payees".into()));
     }
-    let cfg = cfg_base.with_asset(&payroll.asset)?;
-
-    let mut hashes = Vec::new();
-    for chunk in payroll.payees.chunks(SPLIT_CHUNK) {
-        let recipients: Vec<SplitRecipient> = chunk
-            .iter()
-            .map(|p| SplitRecipient { code: p.code.clone(), amount: p.amount })
-            .collect();
-        let hash = send::split_with(wallet, &cfg, &recipients)?;
-        hashes.push(hash);
-    }
+    // Same-asset payees bundle into split txs; cross-asset payees are individual `pay` txs.
+    let recipients: Vec<send::MultiRecipient> = payroll
+        .payees
+        .iter()
+        .map(|p| send::MultiRecipient {
+            code: p.code.clone(),
+            amount: p.amount,
+            recv_asset: p.recv_asset.clone(),
+        })
+        .collect();
+    let hashes = send::multi_send_with(
+        wallet,
+        cfg_base,
+        &payroll.asset,
+        &recipients,
+        send::MULTI_SEND_SLIPPAGE_BPS,
+    )?;
 
     // All chunks paid: advance the schedule from the later of (due time, now) so a
     // late run doesn't bunch the next period, then persist.
@@ -253,7 +261,7 @@ mod tests {
             id: 1,
             label: "Team".into(),
             asset: "USDC".into(),
-            payees: vec![Payee { code: "ozkyA".into(), amount: 100 }],
+            payees: vec![Payee { code: "ozkyA".into(), amount: 100, recv_asset: None }],
             cadence,
             next_run_unix: next,
             last_run_unix: None,
@@ -334,7 +342,8 @@ mod tests {
         let one = 10_000_000u64; // 1 XLM
 
         // Create a payroll: 6 payees x 1 XLM to self -> 2 split txs (5 + 1).
-        let payees: Vec<Payee> = (0..6).map(|_| Payee { code: code.clone(), amount: one }).collect();
+        let payees: Vec<Payee> =
+            (0..6).map(|_| Payee { code: code.clone(), amount: one, recv_asset: None }).collect();
         let id = upsert(
             &wallet,
             Payroll {

@@ -16,12 +16,18 @@
 	import { api, errMessage } from '$lib/api';
 	import { wallet, runAction } from '$lib/wallet.svelte';
 	import { settings, type PrivacyMode } from '$lib/settings.svelte';
-	import { toBaseUnits } from '$lib/assets';
+	import { toBaseUnits, assetByCode } from '$lib/assets';
 	import { truncate } from '$lib/format';
 
+	// Default cross-asset slippage tolerance (1%) — the sender over-spends X by this much so the
+	// in-pool quote still covers the recipient's amount if reserves move before submit.
+	const PAY_SLIPPAGE_BPS = 100;
+
 	let asset = $state('USDC');
+	let recvAsset = $state('USDC');
 	let recipient = $state('');
 	let amount = $state('');
+	let payCost = $state<number | null>(null);
 	let confirmOpen = $state(false);
 	let proving = $state(false);
 	// Per-send privacy mode, defaulting to the saved preference. Client-side strategy only.
@@ -57,6 +63,41 @@
 	}
 
 	const bal = $derived(wallet.balances.find((b) => b.code === asset));
+	// The amount is always denominated in the RECEIVE asset (= pay asset for a normal send).
+	const recvDecimals = $derived(
+		wallet.balances.find((b) => b.code === recvAsset)?.decimals ??
+			assetByCode(recvAsset)?.decimals ??
+			7
+	);
+	const isCrossAsset = $derived(recvAsset !== asset);
+	const payDecimals = $derived(bal?.decimals ?? assetByCode(asset)?.decimals ?? 7);
+	const payCostDisplay = $derived(
+		payCost === null ? null : (payCost / 10 ** payDecimals).toLocaleString('en-US', { maximumFractionDigits: payDecimals })
+	);
+
+	// Live reverse-quote: the X the sender spends to deliver `amount` of the receive asset.
+	$effect(() => {
+		const a = amount;
+		const from = asset;
+		const to = recvAsset;
+		if (!isCrossAsset || !a) {
+			payCost = null;
+			return;
+		}
+		let cancelled = false;
+		(async () => {
+			try {
+				const units = toBaseUnits(a, recvDecimals);
+				const q = await api.payQuote(from, to, units);
+				if (!cancelled) payCost = q.source_cost;
+			} catch {
+				if (!cancelled) payCost = null;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	function review() {
 		if (!recipient.trim().startsWith('ozky')) {
@@ -64,7 +105,7 @@
 			return;
 		}
 		try {
-			toBaseUnits(amount, bal?.decimals ?? 7);
+			toBaseUnits(amount, recvDecimals);
 		} catch (e) {
 			toast.error(errMessage(e));
 			return;
@@ -74,7 +115,7 @@
 
 	async function submit() {
 		confirmOpen = false;
-		const units = toBaseUnits(amount, bal?.decimals ?? 7);
+		const units = toBaseUnits(amount, recvDecimals);
 		// Maximum-privacy mode: hold the submission for a randomized client-side delay first.
 		const delayMs = settings.privacyDelayMs(mode);
 		if (delayMs > 0) {
@@ -85,12 +126,21 @@
 			}
 		}
 		proving = true;
-		const hash = await runAction('Sending payment', () => api.send(asset, recipient.trim(), units), {
-			success: () => 'Payment sent'
-		});
+		const dest = recipient.trim();
+		const hash = await runAction(
+			'Sending payment',
+			() =>
+				isCrossAsset
+					? api.pay(dest, asset, recvAsset, units, PAY_SLIPPAGE_BPS).then((r) => r.tx_hash)
+					: api.send(asset, dest, units),
+			{ success: () => 'Payment sent' }
+		);
 		proving = false;
 		if (hash) {
-			wallet.log({ kind: 'send', label: `Sent ${amount} ${asset}`, detail: truncate(recipient), hash });
+			const label = isCrossAsset
+				? `Paid ${amount} ${recvAsset} (in ${asset})`
+				: `Sent ${amount} ${asset}`;
+			wallet.log({ kind: 'send', label, detail: truncate(recipient), hash });
 			amount = '';
 			recipient = '';
 		}
@@ -116,9 +166,31 @@
 						<Field.Description>The recipient's shielded payment code.</Field.Description>
 					</Field.Field>
 					<Field.Field>
-						<Field.Label>Amount</Field.Label>
-						<AmountInput bind:value={amount} code={asset} decimals={bal?.decimals ?? 7} max={bal?.raw} />
-						{#if bal}<Field.Description>Available: {bal.display} {asset}</Field.Description>{/if}
+						<Field.Label>Recipient receives</Field.Label>
+						<AssetSelect bind:value={recvAsset} />
+						<Field.Description>
+							{#if isCrossAsset}
+								You pay in {asset}; they receive {recvAsset}, converted in-pool at the live rate.
+							{:else}
+								Same asset you pay in. Pick a different one to pay across assets.
+							{/if}
+						</Field.Description>
+					</Field.Field>
+					<Field.Field>
+						<Field.Label>{isCrossAsset ? `Amount (${recvAsset} they receive)` : 'Amount'}</Field.Label>
+						<AmountInput
+							bind:value={amount}
+							code={recvAsset}
+							decimals={recvDecimals}
+							max={isCrossAsset ? undefined : bal?.raw}
+						/>
+						{#if isCrossAsset}
+							<Field.Description>
+								{#if payCostDisplay}≈ {payCostDisplay} {asset} to send · {/if}Available: {bal?.display ?? '0'} {asset}
+							</Field.Description>
+						{:else if bal}
+							<Field.Description>Available: {bal.display} {asset}</Field.Description>
+						{/if}
 					</Field.Field>
 					<Field.Field>
 						<Field.Label>Privacy</Field.Label>
@@ -170,7 +242,13 @@
 		<AlertDialog.Header>
 			<AlertDialog.Title>Confirm payment</AlertDialog.Title>
 			<AlertDialog.Description>
-				Send <b>{amount} {asset}</b> to <span class="font-mono">{truncate(recipient)}</span>?
+				{#if isCrossAsset}
+					Pay <span class="font-mono">{truncate(recipient)}</span> so they receive
+					<b>{amount} {recvAsset}</b>{#if payCostDisplay}, costing about <b>{payCostDisplay} {asset}</b>{/if}.
+					The amount is public on-chain (priced by the in-pool AMM); the recipient stays hidden.
+				{:else}
+					Send <b>{amount} {asset}</b> to <span class="font-mono">{truncate(recipient)}</span>?
+				{/if}
 			</AlertDialog.Description>
 		</AlertDialog.Header>
 		<AlertDialog.Footer>

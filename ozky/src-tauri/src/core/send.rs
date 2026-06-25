@@ -346,6 +346,82 @@ pub fn split_with(
     )
 }
 
+// ----------------------------- multi-send (possibly cross-asset) -----------------------------
+
+/// Max same-asset recipients bundled into one `split` tx (`N_SPLIT_OUTPUTS - 1` slots, change is
+/// the remaining slot).
+pub const SPLIT_CHUNK: usize = witness::N_SPLIT_OUTPUTS - 1;
+
+/// Default slippage (1%) for the cross-asset legs of a multi-send / payroll run.
+pub const MULTI_SEND_SLIPPAGE_BPS: u32 = 100;
+
+/// A recipient in a (possibly cross-asset) multi-send: shielded code + amount, plus the asset the
+/// recipient receives. `recv_asset = None` (or equal to the pay asset) means a same-asset payment
+/// bundled into a `split`; a different `recv_asset` is delivered by an individual cross-asset `pay`
+/// (then `amount` is the DESTINATION amount, in `recv_asset` base units).
+pub struct MultiRecipient {
+    pub code: String,
+    pub amount: u64,
+    pub recv_asset: Option<String>,
+}
+
+impl MultiRecipient {
+    /// The cross-asset receive code, if this recipient wants an asset other than `pay_asset`.
+    fn cross_asset<'a>(&'a self, pay_asset: &str) -> Option<&'a str> {
+        self.recv_asset.as_deref().filter(|a| *a != pay_asset)
+    }
+}
+
+/// Pay many recipients, paying in `pay_asset`: same-asset recipients are bundled into `ceil(N/5)`
+/// `split` transactions; each cross-asset recipient is an individual `pay` (cross-asset) transaction
+/// at `slippage_bps`. Returns every tx hash. Keychain-independent (payroll + the live driver use it).
+pub fn multi_send_with(
+    wallet: &keys::WalletKeys,
+    cfg_base: &PoolConfig,
+    pay_asset: &str,
+    recipients: &[MultiRecipient],
+    slippage_bps: u32,
+) -> Result<Vec<String>, CoreError> {
+    if recipients.is_empty() {
+        return Err(CoreError::Proving("multi-send needs at least one recipient".into()));
+    }
+    let cfg = cfg_base.with_asset(pay_asset)?;
+    let mut hashes = Vec::new();
+
+    // Same-asset recipients → bundled split txs.
+    let same: Vec<&MultiRecipient> =
+        recipients.iter().filter(|r| r.cross_asset(pay_asset).is_none()).collect();
+    for chunk in same.chunks(SPLIT_CHUNK) {
+        let rs: Vec<SplitRecipient> =
+            chunk.iter().map(|r| SplitRecipient { code: r.code.clone(), amount: r.amount }).collect();
+        hashes.push(split_with(wallet, &cfg, &rs)?);
+    }
+
+    // Cross-asset recipients → individual pay txs.
+    for r in recipients.iter() {
+        if let Some(recv_asset) = r.cross_asset(pay_asset) {
+            let receipt = super::swap::pay_with(
+                wallet,
+                cfg_base,
+                &r.code,
+                pay_asset,
+                recv_asset,
+                r.amount,
+                slippage_bps,
+            )?;
+            hashes.push(receipt.tx_hash);
+        }
+    }
+    Ok(hashes)
+}
+
+/// Multi-send via the keychain wallet (one-off, default slippage on cross-asset legs).
+pub fn multi_send(pay_asset: &str, recipients: &[MultiRecipient]) -> Result<Vec<String>, CoreError> {
+    let wallet = keys::current_wallet()?;
+    let cfg = PoolConfig::load()?;
+    multi_send_with(&wallet, &cfg, pay_asset, recipients, MULTI_SEND_SLIPPAGE_BPS)
+}
+
 // ----------------------------- orchestration -----------------------------
 
 /// Send `amount` of `asset` (a v1 code, e.g. "USDC") privately to the holder of
@@ -1866,6 +1942,68 @@ mod tests {
         assert_eq!(res_xlm_after, res_xlm_before + swap_xlm as i128, "reserve_A += value_a");
         assert_eq!(res_usdc_after, res_usdc_before - receipt.received as i128, "reserve_B -= value_b");
         println!("SWAP LIFECYCLE OK");
+    }
+
+    /// One-off: a REAL cross-asset PAY on the configured AMM pool. Pays the wallet's OWN code so the
+    /// minted Y-note is self-recoverable: deliver `PAY_USDC` base of USDC, paying in XLM. Asserts the
+    /// recipient (self) gained exactly the USDC delivered, XLM shielded dropped by the receipt's
+    /// source cost, and the reserves moved by (value_a, value_b). Indistinguishable on-chain from a
+    /// self-swap (same `shielded_swap` entrypoint).
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture pay_lifecycle_on_testnet
+    #[test]
+    #[ignore = "live cross-asset pay lifecycle; needs ZK container + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
+    fn pay_lifecycle_on_testnet() {
+        use crate::core::swap;
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        let notes_dir = std::env::temp_dir().join("ozky-pay-test-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().unwrap();
+        let xlm = cfg.clone().with_asset("XLM").unwrap();
+        let usdc = cfg.clone().with_asset("USDC").unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let self_code = payment_code(&id);
+        // Default 0.2 USDC delivered to self.
+        let dest_usdc: u64 = std::env::var("PAY_USDC").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
+
+        let shielded = |c: &PoolConfig| -> u64 {
+            let st = chain::pool_state(c).unwrap();
+            scan::owned_notes(&id, &st, &notes::load(&wallet).unwrap(), 0).unwrap().iter()
+                .filter(|n| n.asset_tag == c.asset_tag).map(|n| n.value).sum()
+        };
+
+        let xlm_before = shielded(&xlm);
+        let usdc_before = shielded(&usdc);
+        let res_xlm_before = chain::read_reserve(&cfg, &xlm.asset_tag).unwrap();
+        let res_usdc_before = chain::read_reserve(&cfg, &usdc.asset_tag).unwrap();
+        let q = swap::pay_quote("XLM", "USDC", dest_usdc).expect("pay quote");
+        eprintln!("pay quote: ~{} XLM base to deliver {} USDC base", q.source_cost, dest_usdc);
+
+        let receipt = swap::pay_with(&wallet, &cfg, &self_code, "XLM", "USDC", dest_usdc, 100)
+            .expect("cross-asset pay must succeed on-chain");
+        eprintln!("PAY OK tx {} spent {} XLM base, delivered {} USDC base", receipt.tx_hash, receipt.sent, receipt.received);
+
+        let xlm_after = shielded(&xlm);
+        let usdc_after = shielded(&usdc);
+        let res_xlm_after = chain::read_reserve(&cfg, &xlm.asset_tag).unwrap();
+        let res_usdc_after = chain::read_reserve(&cfg, &usdc.asset_tag).unwrap();
+
+        assert_eq!(receipt.received, dest_usdc, "recipient receives exactly the requested Y");
+        assert_eq!(usdc_after, usdc_before + dest_usdc, "minted Y-note credited to the recipient (self)");
+        assert_eq!(xlm_after, xlm_before - receipt.sent, "X spent equals the receipt's source cost");
+        assert_eq!(res_xlm_after, res_xlm_before + receipt.sent as i128, "reserve_X += value_a");
+        assert_eq!(res_usdc_after, res_usdc_before - dest_usdc as i128, "reserve_Y -= value_b");
+        println!("PAY LIFECYCLE OK");
     }
 
     /// One-off: perform a REAL split on the configured (split-capable) pool. Reads

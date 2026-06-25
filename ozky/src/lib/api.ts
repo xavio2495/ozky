@@ -19,8 +19,8 @@ export const MAX_ACCOUNTS = 5;
 /** A public (unshielded) balance on the wallet's classic Stellar account. */
 export type PublicBalance = { code: string; balance: string; issuer: string | null };
 
-/** A payroll payee (shielded code + base-unit amount). */
-export type Payee = { code: string; amount: number };
+/** A payroll payee (shielded code + base-unit amount, optional cross-asset receive). */
+export type Payee = { code: string; amount: number; recv_asset?: string };
 
 /** A payroll as returned by the backend (+ computed `due`). */
 export type Payroll = {
@@ -160,6 +160,20 @@ export type SwapReceipt = {
 	received: number;
 };
 
+/** A cross-asset-pay quote: the source (X) cost to deliver the requested Y, at live reserves. */
+export type PayQuote = {
+	/** Estimated source (X) cost in base units (before the slippage buffer). */
+	source_cost: number;
+	/** Source reserve (base units). */
+	reserve_from: number;
+	/** Destination reserve (base units). */
+	reserve_to: number;
+};
+
+/** One recipient of a multi-send: shielded code, base-unit amount, and optional receive-asset
+ * (a different asset = cross-asset pay, then `amount` is the destination amount). */
+export type MultiRecipient = { recipient: string; amount: number; recv_asset?: string };
+
 /** Current USD spot price for an asset. */
 export type Spot = { code: string; usd: number; change_24h: number };
 /** One point on a price history series (t = unix ms). */
@@ -276,6 +290,18 @@ export const api = {
 		invoke<SwapQuote>('swap_quote', { from, to, amount }),
 	swap: (from: string, to: string, amount: number, slippageBps: number) =>
 		invoke<SwapReceipt>('swap', { from, to, amount, slippageBps }),
+
+	payQuote: (from: string, to: string, destAmount: number) =>
+		invoke<PayQuote>('pay_quote', { from, to, destAmount }),
+	pay: (
+		recipientCode: string,
+		from: string,
+		to: string,
+		destAmount: number,
+		slippageBps: number
+	) => invoke<SwapReceipt>('pay', { recipientCode, from, to, destAmount, slippageBps }),
+	multiSend: (payAsset: string, recipients: MultiRecipient[]) =>
+		invoke<string[]>('multi_send', { payAsset, recipients }),
 
 	fundingAddress: () => invoke<string>('funding_address'),
 	receiveAddress: () => invoke<string>('receive_address'),

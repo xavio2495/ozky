@@ -21,8 +21,10 @@
 	import { toast } from 'svelte-sonner';
 	import { api, errMessage, type Payroll } from '$lib/api';
 	import { wallet } from '$lib/wallet.svelte';
-	import { toBaseUnits } from '$lib/assets';
+	import { toBaseUnits, assetByCode, ASSETS } from '$lib/assets';
 	import { prettyAmount } from '$lib/format';
+
+	const assetCodes = ASSETS.map((a) => a.code);
 
 	const MAX_PAYEES = 25; // ceil(25/5) = 5 split txs — a generous cap.
 
@@ -36,7 +38,10 @@
 	let asset = $state('USDC');
 	let cadence = $state('weekly');
 	let intervalDays = $state('14');
-	let rows = $state<{ code: string; amount: string }[]>([{ code: '', amount: '' }]);
+	// `recv` is the receive asset; '' (or equal to the payroll asset) = same-asset payment.
+	let rows = $state<{ code: string; amount: string; recv: string }[]>([
+		{ code: '', amount: '', recv: '' }
+	]);
 
 	let confirmRunId = $state<number | null>(null);
 	let confirmDeleteId = $state<number | null>(null);
@@ -54,7 +59,7 @@
 		asset = 'USDC';
 		cadence = 'weekly';
 		intervalDays = '14';
-		rows = [{ code: '', amount: '' }];
+		rows = [{ code: '', amount: '', recv: '' }];
 		editOpen = true;
 	}
 
@@ -64,17 +69,17 @@
 		asset = p.asset;
 		cadence = p.cadence;
 		intervalDays = String(p.interval_days || 14);
-		rows = p.payees.map((x) => ({
-			code: x.code,
-			amount: String(x.amount / 10 ** decimals)
-		}));
-		if (rows.length === 0) rows = [{ code: '', amount: '' }];
+		rows = p.payees.map((x) => {
+			const dec = x.recv_asset ? (assetByCode(x.recv_asset)?.decimals ?? 7) : decimals;
+			return { code: x.code, amount: String(x.amount / 10 ** dec), recv: x.recv_asset ?? '' };
+		});
+		if (rows.length === 0) rows = [{ code: '', amount: '', recv: '' }];
 		editOpen = true;
 	}
 
 	function addRow() {
 		if (rows.length >= MAX_PAYEES) return;
-		rows = [...rows, { code: '', amount: '' }];
+		rows = [...rows, { code: '', amount: '', recv: '' }];
 	}
 	function removeRow(i: number) {
 		rows = rows.filter((_, idx) => idx !== i);
@@ -88,7 +93,9 @@
 		try {
 			payees = valid.map((r) => {
 				if (!r.code.trim().startsWith('ozky')) throw new Error('Each payee needs a valid ozky… code');
-				return { code: r.code.trim(), amount: toBaseUnits(r.amount, decimals) };
+				const recvAsset = r.recv && r.recv !== asset ? r.recv : undefined;
+				const dec = recvAsset ? (assetByCode(recvAsset)?.decimals ?? 7) : decimals;
+				return { code: r.code.trim(), amount: toBaseUnits(r.amount, dec), recv_asset: recvAsset };
 			});
 		} catch (e) {
 			return toast.error(errMessage(e));
@@ -208,7 +215,7 @@
 			<Alert.Description>
 				<ul class="mt-1 flex list-disc flex-col gap-1 pl-4 text-xs">
 					<li>Runs only while ozky is open — due payrolls are flagged for you to run.</li>
-					<li>Each run pays everyone in batches of 5 (one shielded split per batch).</li>
+					<li>Each run pays same-asset payees in batches of 5; cross-asset payees are individual txs.</li>
 					<li>Nothing is paid without your explicit "Run now".</li>
 				</ul>
 			</Alert.Description>
@@ -257,13 +264,25 @@
 					{#each rows as row, i (i)}
 						<div class="flex items-center gap-2">
 							<Input bind:value={row.code} placeholder="ozky…" class="flex-1 font-mono text-sm" />
-							<Input bind:value={row.amount} inputmode="decimal" placeholder="0.00" class="w-28 font-mono" />
+							<Input bind:value={row.amount} inputmode="decimal" placeholder="0.00" class="w-24 font-mono" />
+							<Select.Root type="single" value={row.recv || asset} onValueChange={(v) => (row.recv = v)}>
+								<Select.Trigger class="h-9 w-20" title="Receive asset">{row.recv || asset}</Select.Trigger>
+								<Select.Content>
+									{#each assetCodes as code (code)}
+										<Select.Item value={code} label={code}>{code}</Select.Item>
+									{/each}
+								</Select.Content>
+							</Select.Root>
 							<Button variant="ghost" size="icon" onclick={() => removeRow(i)} disabled={rows.length <= 1} aria-label="Remove">
 								<Trash2Icon class="size-4" />
 							</Button>
 						</div>
 					{/each}
 				</div>
+				<Field.Description>
+					Pay each payee in {asset}. Pick a different "receives" asset to pay them across assets in-pool
+					(then the amount is what they receive).
+				</Field.Description>
 				<Button variant="outline" size="sm" class="mt-1 gap-2 self-start" onclick={addRow} disabled={rows.length >= MAX_PAYEES}>
 					<PlusIcon class="size-4" /> Add payee
 				</Button>

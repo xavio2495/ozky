@@ -1,0 +1,4 @@
+# Exclude local build artifacts from the source upload to Cloud Build.
+target/
+*.log
+.git/

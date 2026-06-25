@@ -1073,6 +1073,55 @@ mod tests {
         println!("KEEPER E2E OK (headless submit, no owner_sk)");
     }
 
+    /// One-off: arm a self-paying payroll and print the resulting `KeeperRun` as JSON (between
+    /// markers). Used to feed the standalone cloud keeper (`keeper-service`) a real run to push +
+    /// submit. Pre-prove only; NO submit here.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture core::keeper::tests::print_armed_run_json
+    #[test]
+    #[ignore = "prints a live armed run as JSON for the cloud keeper; needs prover sidecar + network"]
+    fn print_armed_run_json() {
+        use crate::core::payroll::{self, Cadence, Payee, Payroll};
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => return,
+        };
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo.join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", &repo);
+        let notes_dir = std::env::temp_dir().join("ozky-keeper-printjson-notes");
+        let _ = std::fs::remove_dir_all(&notes_dir);
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let wallet = crate::core::keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let cfg = PoolConfig::load().unwrap();
+        let id = scan::wallet_identity(&wallet).unwrap();
+        let code = send::payment_code(&id);
+        let one = 10_000_000u64;
+        let payees: Vec<Payee> =
+            (0..8).map(|_| Payee { code: code.clone(), amount: one, recv_asset: None }).collect();
+        let pid = payroll::upsert(
+            &wallet,
+            Payroll {
+                id: 0,
+                label: "Cloud keeper test".into(),
+                asset: "XLM".into(),
+                payees,
+                cadence: Cadence::Weekly,
+                next_run_unix: payroll::now(),
+                last_run_unix: None,
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let run = arm(&wallet, &cfg, pid).expect("arm");
+        println!("ARMED_RUN_JSON_BEGIN");
+        println!("{}", serde_json::to_string(&run).unwrap());
+        println!("ARMED_RUN_JSON_END");
+    }
+
     /// The queue persists encrypted (not plaintext) and reloads identically.
     #[test]
     fn queue_roundtrips_encrypted() {

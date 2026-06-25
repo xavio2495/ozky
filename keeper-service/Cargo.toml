@@ -1,0 +1,27 @@
+[package]
+name = "ozky-keeper-service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Cloud keeper (scope #2, K7): a standalone Cloud Run service that stores pushed payroll runs and,
+# on a Cloud Scheduler /tick, submits due bundles' proofs via the user's relayer. Holds NO owner_sk
+# / notes_key. Lean deps (no soroban-sdk / tauri) so the image builds fast like the indexer.
+
+[[bin]]
+name = "ozky-keeper-service"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+stellar-xdr = { version = "23", features = ["std", "base64", "curr"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+stellar-strkey = "0.0.13"
+hex = "0.4"
+
+[profile.release]
+opt-level = 2

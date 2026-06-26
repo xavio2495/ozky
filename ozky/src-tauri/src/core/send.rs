@@ -2609,7 +2609,7 @@ mod tests {
         // notes (verified against on-chain commitments) with no spend authority. ---
         use crate::core::disclose;
         let epoch = chain::current_epoch(&cfg.rpc_url).unwrap();
-        let pkg = disclose::share_with_auditor_with(&wallet, &cfg, &auditor, epoch)
+        let pkg = disclose::share_with_auditor_with(&wallet, &cfg, &auditor, epoch, epoch)
             .expect("share_with_auditor builds the package + records the on-chain grant");
         let disclosed = disclose::audit(&pkg).expect("auditor re-derives the disclosed notes");
         let total = disclose::disclosed_total(&disclosed);

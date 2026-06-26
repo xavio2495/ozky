@@ -16,7 +16,8 @@
 
 	// Share
 	let auditor = $state('');
-	let epoch = $state('');
+	let fromEpoch = $state('');
+	let toEpoch = $state('');
 	let sharing = $state(false);
 	let pkg = $state('');
 
@@ -30,16 +31,26 @@
 			toast.error('Enter the auditor’s Stellar G… address');
 			return;
 		}
+		const from = Number(fromEpoch) || 0;
+		const to = Number(toEpoch) || from;
+		if (to < from) {
+			toast.error('“To epoch” must be ≥ “From epoch”');
+			return;
+		}
 		sharing = true;
 		const out = await runAction(
 			'Creating disclosure',
-			() => api.shareWithAuditor(auditor.trim(), Number(epoch) || 0),
+			() => api.shareWithAuditor(auditor.trim(), from, to),
 			{ success: () => 'Disclosure created', refresh: false }
 		);
 		sharing = false;
 		if (out) {
 			pkg = out;
-			wallet.log({ kind: 'disclose', label: `Shared with auditor`, detail: epoch ? `epoch ${epoch}` : undefined });
+			wallet.log({
+				kind: 'disclose',
+				label: `Shared with auditor`,
+				detail: from === to ? `epoch ${from}` : `epochs ${from}–${to}`
+			});
 		}
 	}
 
@@ -79,11 +90,20 @@
 								<Field.Label for="auditor">Auditor address</Field.Label>
 								<Input id="auditor" bind:value={auditor} placeholder="G…" class="font-mono" />
 							</Field.Field>
-							<Field.Field>
-								<Field.Label for="epoch">Epoch</Field.Label>
-								<Input id="epoch" bind:value={epoch} type="number" min="0" placeholder="0" />
-								<Field.Description>The epoch to disclose. Leave 0 for the current scope.</Field.Description>
-							</Field.Field>
+							<div class="grid grid-cols-2 gap-3">
+								<Field.Field>
+									<Field.Label for="fromEpoch">From epoch</Field.Label>
+									<Input id="fromEpoch" bind:value={fromEpoch} type="number" min="0" placeholder="0" />
+								</Field.Field>
+								<Field.Field>
+									<Field.Label for="toEpoch">To epoch</Field.Label>
+									<Input id="toEpoch" bind:value={toEpoch} type="number" min="0" placeholder="(same)" />
+								</Field.Field>
+							</div>
+							<Field.Description>
+								Discloses only notes in this epoch range. Other epochs stay shielded — the auditor
+								gets no key to them. Leave “to” blank to disclose a single epoch.
+							</Field.Description>
 							{#if pkg}
 								<Field.Field>
 									<Field.Label>Disclosure package</Field.Label>
@@ -121,7 +141,12 @@
 								<Alert.Root>
 									<ScaleIcon />
 									<Alert.Title>Verified · {result.notes.length} note(s)</Alert.Title>
-									<Alert.Description>Disclosed total: <b>{result.total}</b> base units.</Alert.Description>
+									<Alert.Description>
+										Epochs {result.fromEpoch === result.toEpoch
+											? result.fromEpoch
+											: `${result.fromEpoch}–${result.toEpoch}`} · disclosed total:
+										<b>{result.total}</b> base units.
+									</Alert.Description>
 								</Alert.Root>
 							{/if}
 						</Field.Group>

@@ -346,6 +346,14 @@ pub fn deposit(asset: String, amount: u64) -> Result<String, CoreError> {
     core::deposit::deposit(&asset, amount)
 }
 
+/// Establish the USDC + EURC trustlines on the active account so it can receive/deposit
+/// those assets, with the reserves SPONSORED by the relayer (no XLM needed). Creates the
+/// account if it doesn't exist yet. Idempotent — only adds what's missing. (scope #6)
+#[tauri::command]
+pub fn ensure_trustlines() -> Result<core::trustline::TrustlineReport, CoreError> {
+    core::trustline::ensure_trustlines()
+}
+
 /// Send `amount` of `asset` privately to `recipient` (a shielded payment code). Builds +
 /// proves the transfer against live pool state and submits it; returns the tx hash. (A3/G6)
 #[tauri::command]
@@ -1206,22 +1214,30 @@ pub fn receive_address() -> Result<String, CoreError> {
     core::send::receive_code()
 }
 
-/// Export a scoped, read-only disclosure for an auditor (a Stellar `G…`) and record the
-/// auditable on-chain grant. Returns the disclosure package (JSON) to hand the auditor
-/// out-of-band: it lets them re-derive + verify this wallet's notes for the scope, with
-/// no spend authority. (A3 / G5)
+/// Export a TIME-BOUNDED, read-only disclosure for an auditor (a Stellar `G…`) over the
+/// epoch range `[from_epoch, to_epoch]` and record the auditable on-chain grant. Returns
+/// the disclosure package (JSON) to hand the auditor out-of-band: it lets them re-derive +
+/// verify this wallet's notes for those epochs, with no spend authority and no key to
+/// other epochs. (G5)
 #[tauri::command]
-pub fn share_with_auditor(auditor: String, epoch: u32) -> Result<String, CoreError> {
-    core::disclose::share_with_auditor(&auditor, epoch)
+pub fn share_with_auditor(auditor: String, from_epoch: u32, to_epoch: u32) -> Result<String, CoreError> {
+    core::disclose::share_with_auditor(&auditor, from_epoch, to_epoch)
 }
 
-/// Auditor side: given a disclosure package (JSON from [`share_with_auditor`]), scan the
-/// disclosed pool and return the owner's notes it reveals (each verified against its
-/// on-chain commitment), as JSON. Read-only; needs no wallet. (A3 / G5)
+/// Auditor side: given a disclosure package (JSON from [`share_with_auditor`]), verify each
+/// disclosed opening against its on-chain commitment and the granted epoch range; return
+/// the revealed notes + the range, as JSON. Read-only; needs no wallet. (G5)
 #[tauri::command]
 pub fn audit_disclosure(package: String) -> Result<String, CoreError> {
     let notes = core::disclose::audit(&package)?;
     let total = core::disclose::disclosed_total(&notes);
-    serde_json::to_string(&serde_json::json!({ "total": total, "notes": notes }))
-        .map_err(|e| CoreError::Crypto(format!("serialize audit: {e}")))
+    let pkg: serde_json::Value = serde_json::from_str(&package)
+        .map_err(|e| CoreError::Crypto(format!("parse disclosure: {e}")))?;
+    serde_json::to_string(&serde_json::json!({
+        "total": total,
+        "notes": notes,
+        "fromEpoch": pkg["from_epoch"].as_u64().unwrap_or(0),
+        "toEpoch": pkg["to_epoch"].as_u64().unwrap_or(0),
+    }))
+    .map_err(|e| CoreError::Crypto(format!("serialize audit: {e}")))
 }

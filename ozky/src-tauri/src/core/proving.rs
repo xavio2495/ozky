@@ -66,31 +66,15 @@ fn repo_root() -> PathBuf {
         .join("..")
 }
 
-/// Generate (and verify) a proof for `circuit` from a `Prover.toml` body.
+/// Generate (and verify) a proof for `circuit` from a `Prover.toml` body. The native
+/// sidecar (the shippable path) is preferred; Docker is the dev-only fallback.
 fn prove(circuit: Circuit, prover_toml: &str) -> Result<ProofBundle, CoreError> {
     let name = circuit.name();
     let root = repo_root();
-    let circuit_dir = root.join("circuits").join(name);
-    if !circuit_dir.exists() {
-        return Err(CoreError::Proving(format!(
-            "circuit dir not found: {} (set OZKY_REPO_ROOT)",
-            circuit_dir.display()
-        )));
-    }
-    std::fs::write(circuit_dir.join("Prover.toml"), prover_toml)
-        .map_err(|e| CoreError::Proving(format!("write Prover.toml: {e}")))?;
-
     match sidecar_bin() {
-        Some(bin) => prove_via_sidecar(&bin, &circuit_dir, &root, name)?,
-        None => prove_via_docker(&root, name)?,
+        Some(bin) => prove_via_sidecar(&bin, &root, name, prover_toml),
+        None => prove_via_docker(&root, name, prover_toml),
     }
-
-    let target = circuit_dir.join("target");
-    let proof = std::fs::read(target.join("proof"))
-        .map_err(|e| CoreError::Proving(format!("read proof: {e}")))?;
-    let public_inputs = std::fs::read(target.join("public_inputs"))
-        .map_err(|e| CoreError::Proving(format!("read public_inputs: {e}")))?;
-    Ok(ProofBundle { proof, public_inputs })
 }
 
 /// The native prover sidecar binary, if configured. `OZKY_PROVER_BIN` points at the
@@ -101,31 +85,106 @@ fn sidecar_bin() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-/// Prove + verify via the native sidecar (no Docker). It reads `<circuit>/Prover.toml`
-/// and `target/<name>.json`, writes `target/{proof,public_inputs}`, and exits non-zero
-/// unless the proof verified AND its VK matches the frozen one.
-fn prove_via_sidecar(bin: &Path, circuit_dir: &Path, root: &Path, name: &str) -> Result<(), CoreError> {
+/// The dir holding the sidecar's WASM/worker blobs: `OZKY_PROVER_ASSETS` if set (the
+/// bundled app points it at the prover resource dir), else beside the binary.
+fn sidecar_assets(bin: &Path) -> PathBuf {
+    super::config::cfg_var("OZKY_PROVER_ASSETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| bin.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())
+}
+
+/// A unique writable scratch dir for one prove. The sidecar reads `Prover.toml` +
+/// `target/<name>.json` and writes `target/{proof,public_inputs}` here, so the source
+/// circuit artifacts can live in a read-only bundle (Program Files / the app bundle).
+/// The work dir's *last segment* must be the circuit `name` — the sidecar derives the
+/// circuit name from it — so the circuit dir is nested under a unique parent.
+fn staging_dir(name: &str) -> Result<PathBuf, CoreError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let unique = format!("ozky-prove-{}-{}", std::process::id(), nanos as u64 ^ SEQ.fetch_add(1, Ordering::Relaxed));
+    let work = std::env::temp_dir().join(unique).join(name);
+    std::fs::create_dir_all(work.join("target"))
+        .map_err(|e| CoreError::Proving(format!("create staging dir: {e}")))?;
+    Ok(work)
+}
+
+/// Remove a [`staging_dir`] (and its unique parent) — best-effort cleanup.
+fn cleanup_staging(work: &Path) {
+    let _ = std::fs::remove_dir_all(work.parent().unwrap_or(work));
+}
+
+/// Prove + verify via the native sidecar (no Docker). Inputs/outputs are staged in a
+/// writable temp dir so the compiled circuit + frozen VK can be read-only bundle
+/// resources; the sidecar exits non-zero unless the proof verified AND its VK matches
+/// the frozen one.
+fn prove_via_sidecar(bin: &Path, root: &Path, name: &str, prover_toml: &str) -> Result<ProofBundle, CoreError> {
+    let circuit_json = root.join("circuits").join(name).join("target").join(format!("{name}.json"));
+    if !circuit_json.exists() {
+        return Err(CoreError::Proving(format!(
+            "compiled circuit not found: {} (set OZKY_REPO_ROOT)",
+            circuit_json.display()
+        )));
+    }
     let frozen_vk = root.join("contracts").join("frozen_vks").join(name).join("vk");
-    // The WASM blobs ship beside the binary; point the sidecar at them explicitly.
-    let assets_dir = bin.parent().unwrap_or_else(|| Path::new("."));
+
+    let work = staging_dir(name)?;
+    let target = work.join("target");
+    std::fs::copy(&circuit_json, target.join(format!("{name}.json")))
+        .map_err(|e| CoreError::Proving(format!("stage circuit json: {e}")))?;
+    std::fs::write(work.join("Prover.toml"), prover_toml)
+        .map_err(|e| CoreError::Proving(format!("write Prover.toml: {e}")))?;
+
     let out = Command::new(bin)
-        .arg(circuit_dir)
+        .arg(&work)
         .arg(&frozen_vk)
-        .env("OZKY_PROVER_ASSETS", assets_dir)
-        .output()
-        .map_err(|e| CoreError::Proving(format!("spawn prover sidecar: {e}")))?;
+        .env("OZKY_PROVER_ASSETS", sidecar_assets(bin))
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup_staging(&work);
+            return Err(CoreError::Proving(format!("spawn prover sidecar: {e}")));
+        }
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail: String = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        cleanup_staging(&work);
         return Err(CoreError::Proving(format!("prover sidecar failed for {name}:\n{tail}")));
     }
-    Ok(())
+
+    let bundle = read_bundle(&target);
+    let _ = std::fs::remove_dir_all(&work);
+    bundle
 }
 
-/// Prove + verify in the ZK Docker container. One run: solve the witness, prove (keccak
-/// oracle = on-chain format), verify against the frozen VK. `set -e` ⇒ a failed verify
-/// fails the run.
-fn prove_via_docker(root: &Path, name: &str) -> Result<(), CoreError> {
+/// Read the `proof` + `public_inputs` files a prover backend wrote into `target`.
+fn read_bundle(target: &Path) -> Result<ProofBundle, CoreError> {
+    let proof = std::fs::read(target.join("proof"))
+        .map_err(|e| CoreError::Proving(format!("read proof: {e}")))?;
+    let public_inputs = std::fs::read(target.join("public_inputs"))
+        .map_err(|e| CoreError::Proving(format!("read public_inputs: {e}")))?;
+    Ok(ProofBundle { proof, public_inputs })
+}
+
+/// Prove + verify in the ZK Docker container (dev-only fallback). One run: solve the
+/// witness, prove (keccak oracle = on-chain format), verify against the frozen VK.
+/// `set -e` ⇒ a failed verify fails the run. Writes in-place under the repo's circuit
+/// dir (the container needs the Noir source to `nargo compile`).
+fn prove_via_docker(root: &Path, name: &str, prover_toml: &str) -> Result<ProofBundle, CoreError> {
+    let circuit_dir = root.join("circuits").join(name);
+    if !circuit_dir.exists() {
+        return Err(CoreError::Proving(format!(
+            "circuit dir not found: {} (set OZKY_REPO_ROOT)",
+            circuit_dir.display()
+        )));
+    }
+    std::fs::write(circuit_dir.join("Prover.toml"), prover_toml)
+        .map_err(|e| CoreError::Proving(format!("write Prover.toml: {e}")))?;
     let script = format!(
         "set -e; cd circuits/{name}; nargo compile; nargo execute; \
          bb prove --scheme ultra_honk --oracle_hash keccak \
@@ -148,7 +207,7 @@ fn prove_via_docker(root: &Path, name: &str) -> Result<(), CoreError> {
         let tail: String = stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(CoreError::Proving(format!("prove/verify failed for {name}:\n{tail}")));
     }
-    Ok(())
+    read_bundle(&circuit_dir.join("target"))
 }
 
 /// Prove a transfer from a fully-built witness, verifying against the frozen VK.

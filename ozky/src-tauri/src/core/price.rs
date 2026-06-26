@@ -8,13 +8,12 @@ use serde_json::Value;
 
 const CG: &str = "https://api.coingecko.com/api/v3";
 
-/// CoinGecko coin id for an ozky asset code. USDC/USDT/EURC track fiat but still have a
+/// CoinGecko coin id for an ozky asset code. USDC/EURC track fiat but still have a
 /// real (≈1) market price; XLM floats.
 fn coin_id(code: &str) -> Option<&'static str> {
     match code {
         "XLM" => Some("stellar"),
         "USDC" => Some("usd-coin"),
-        "USDT" => Some("tether"),
         "EURC" => Some("euro-coin"),
         _ => None,
     }

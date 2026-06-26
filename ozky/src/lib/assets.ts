@@ -1,7 +1,8 @@
 // Front-end asset metadata, mirroring `core::config::ASSETS` (in-circuit asset tags
-// XLM=1, USDC=2, USDT=3, EURC=4). Stellar classic assets use 7 decimals. The `balance`
-// command is authoritative for *display* decimals; this table drives the asset picker and
-// converts user-entered decimal amounts into the base-unit `u64` the commands expect.
+// XLM=1, USDC=2, EURC=4 — USDT dropped, no official Stellar issuer). Stellar classic
+// assets use 7 decimals. The `balance` command is authoritative for *display* decimals;
+// this table drives the asset picker and converts user-entered decimal amounts into the
+// base-unit `u64` the commands expect.
 
 export type AssetMeta = {
 	code: string;
@@ -15,7 +16,6 @@ export type AssetMeta = {
 export const ASSETS: AssetMeta[] = [
 	{ code: 'USDC', tag: 2, decimals: 7, name: 'USD Coin', accent: 'oklch(0.62 0.17 250)' },
 	{ code: 'EURC', tag: 4, decimals: 7, name: 'Euro Coin', accent: 'oklch(0.7 0.16 150)' },
-	{ code: 'USDT', tag: 3, decimals: 7, name: 'Tether USD', accent: 'oklch(0.72 0.15 165)' },
 	{ code: 'XLM', tag: 1, decimals: 7, name: 'Stellar Lumens', accent: 'oklch(0.75 0.04 250)' }
 ];
 

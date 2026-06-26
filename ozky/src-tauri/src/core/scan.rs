@@ -186,9 +186,34 @@ pub fn scan_state(
     owned_notes(id, state, &[], from_leaf)
 }
 
-/// The wallet's UNSPENT owned notes in `state` from `from_leaf` on: for each on-chain
-/// commitment, recover the opening either by decrypting its published ciphertext OR by
-/// matching a `local` store opening (notes with no ciphertext); exclude spent notes.
+/// ALL of the wallet's owned notes in `state` from `from_leaf` on, INCLUDING spent ones:
+/// for each on-chain commitment, recover the opening either by decrypting its published
+/// ciphertext OR by matching a `local` store opening (notes with no ciphertext). Used by
+/// selective disclosure, which reveals an owner's full activity in a scope (spent +
+/// unspent), not just the spendable balance.
+pub fn scan_all(
+    id: &WalletIdentity,
+    state: &chain::PoolState,
+    local: &[NotePlaintext],
+    from_leaf: u32,
+) -> Result<Vec<OwnedNote>, CoreError> {
+    let h = Hasher::new();
+    let mut owned = Vec::new();
+    for entry in &state.commits {
+        if entry.leaf_index < from_leaf {
+            continue;
+        }
+        if let Some(note) = match_owned(&h, entry, &id.transmission_sk, &id.owner_pk)
+            .or_else(|| match_local(&h, entry, &id.owner_pk, local))
+        {
+            owned.push(note);
+        }
+    }
+    Ok(owned)
+}
+
+/// The wallet's UNSPENT owned notes in `state` from `from_leaf` on (the spendable set):
+/// [`scan_all`] minus notes whose nullifier is already published.
 pub fn owned_notes(
     id: &WalletIdentity,
     state: &chain::PoolState,
@@ -197,23 +222,10 @@ pub fn owned_notes(
 ) -> Result<Vec<OwnedNote>, CoreError> {
     let h = Hasher::new();
     let spent: HashSet<[u8; 32]> = state.nullifiers.iter().map(|n| n.0).collect();
-
-    let mut owned = Vec::new();
-    for entry in &state.commits {
-        if entry.leaf_index < from_leaf {
-            continue;
-        }
-        let note = match_owned(&h, entry, &id.transmission_sk, &id.owner_pk)
-            .or_else(|| match_local(&h, entry, &id.owner_pk, local));
-        if let Some(note) = note {
-            // Exclude already-spent notes (nullifier published).
-            let nf = h.nullifier(&note.rho, &id.owner_sk);
-            if !spent.contains(&nf.0) {
-                owned.push(note);
-            }
-        }
-    }
-    Ok(owned)
+    Ok(scan_all(id, state, local, from_leaf)?
+        .into_iter()
+        .filter(|n| !spent.contains(&h.nullifier(&n.rho, &id.owner_sk).0))
+        .collect())
 }
 
 #[cfg(test)]

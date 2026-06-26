@@ -40,23 +40,42 @@ pub fn cfg_var(key: &str) -> Option<String> {
 
 /// A v1 asset the wallet can transact. `tag` is the in-circuit `asset_tag` (bound into
 /// every note commitment and matched against the pool's `register_asset` registry);
-/// `decimals` is for display only. Each asset must be `register_asset`'d on the pool
-/// (tag → SAC) before its flows work on-chain.
+/// `decimals` is for display only. `issuer` is the classic Stellar issuer (`G…`) for a
+/// non-native asset (`None` for XLM) — used to establish trustlines. Each asset must be
+/// `register_asset`'d on the pool (tag → SAC) before its flows work on-chain.
 pub struct AssetInfo {
     pub code: &'static str,
     pub tag: u64,
     pub decimals: u32,
+    pub issuer: Option<&'static str>,
 }
 
-/// The v1 asset set (spec: USDC/USDT/EURC stablecoins; native XLM is the testnet
-/// default at `asset_tag 1`, the frozen-VK round-trip value). Tags are the canonical
-/// `asset_tag` field values; they must agree with the pool's `register_asset` calls.
+/// The v1 asset set: native XLM + the USDC/EURC stablecoins (USDT dropped — no official
+/// Stellar issuer). XLM is `asset_tag 1` (the frozen-VK round-trip value); tags are the
+/// canonical `asset_tag` field values and must agree with the pool's `register_asset`
+/// calls (so EURC stays tag 4 — tags are NOT renumbered when USDT is removed). Issuers are
+/// the Circle TESTNET issuers; mainnet uses different ones (override before mainnet).
 pub const ASSETS: &[AssetInfo] = &[
-    AssetInfo { code: "XLM", tag: 1, decimals: 7 },
-    AssetInfo { code: "USDC", tag: 2, decimals: 7 },
-    AssetInfo { code: "USDT", tag: 3, decimals: 7 },
-    AssetInfo { code: "EURC", tag: 4, decimals: 7 },
+    AssetInfo { code: "XLM", tag: 1, decimals: 7, issuer: None },
+    AssetInfo {
+        code: "USDC",
+        tag: 2,
+        decimals: 7,
+        issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+    },
+    AssetInfo {
+        code: "EURC",
+        tag: 4,
+        decimals: 7,
+        issuer: Some("GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO"),
+    },
 ];
+
+/// The non-native assets to auto-trust on a new account (everything with an issuer):
+/// `(code, issuer)` pairs. Drives the sponsored-trustline onboarding.
+pub fn auto_trust_assets() -> Vec<(&'static str, &'static str)> {
+    ASSETS.iter().filter_map(|a| a.issuer.map(|iss| (a.code, iss))).collect()
+}
 
 /// Look up a known asset by its code (case-insensitive, e.g. "usdc").
 pub fn asset_by_code(code: &str) -> Option<&'static AssetInfo> {
@@ -170,7 +189,7 @@ impl PoolConfig {
     /// the note's `asset_tag` (the pool's `register_asset` registry maps tag → SAC).
     pub fn with_asset(&self, code: &str) -> Result<PoolConfig, CoreError> {
         let info = asset_by_code(code).ok_or_else(|| {
-            CoreError::Chain(format!("unknown asset '{code}' (known: XLM, USDC, USDT, EURC)"))
+            CoreError::Chain(format!("unknown asset '{code}' (known: XLM, USDC, EURC)"))
         })?;
         let mut cfg = self.clone();
         cfg.asset_tag = Fr::from_u64(info.tag);

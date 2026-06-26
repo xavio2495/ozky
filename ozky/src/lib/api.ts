@@ -202,10 +202,21 @@ export type AssetBalance = {
 	decimals: number;
 };
 
-/** Result of `audit_disclosure`: a verified, read-only view of an owner's notes. */
+/** Result of `ensure_trustlines`: which sponsored trustlines were established. */
+export type TrustlineReport = {
+	account_created: boolean;
+	added: string[];
+	already: boolean;
+	tx: string | null;
+};
+
+/** Result of `audit_disclosure`: a verified, read-only view of an owner's notes for a
+ * time-bounded epoch range. */
 export type AuditResult = {
 	total: number;
 	notes: unknown[];
+	fromEpoch: number;
+	toEpoch: number;
 };
 
 export const api = {
@@ -323,11 +334,13 @@ export const api = {
 	multiSend: (payAsset: string, recipients: MultiRecipient[]) =>
 		invoke<string[]>('multi_send', { payAsset, recipients }),
 
+	ensureTrustlines: () => invoke<TrustlineReport>('ensure_trustlines'),
+
 	fundingAddress: () => invoke<string>('funding_address'),
 	receiveAddress: () => invoke<string>('receive_address'),
 
-	shareWithAuditor: (auditor: string, epoch: number) =>
-		invoke<string>('share_with_auditor', { auditor, epoch }),
+	shareWithAuditor: (auditor: string, fromEpoch: number, toEpoch: number) =>
+		invoke<string>('share_with_auditor', { auditor, fromEpoch, toEpoch }),
 	auditDisclosure: (pkg: string) =>
 		invoke<string>('audit_disclosure', { package: pkg }).then(
 			(s) => JSON.parse(s) as AuditResult

@@ -18,6 +18,20 @@
 	let amount = $state('');
 	let proving = $state(false);
 	let funding = $state('');
+	let trusting = $state(false);
+
+	async function setupTrustlines() {
+		trusting = true;
+		const r = await runAction('Setting up trustlines', () => api.ensureTrustlines(), {
+			success: (res) =>
+				res.already
+					? 'Trustlines already set up'
+					: `Trustlines ready${res.added.length ? `: ${res.added.join(', ')}` : ''}`,
+			refresh: true
+		});
+		trusting = false;
+		if (r?.tx) wallet.log({ kind: 'deposit', label: 'Set up USDC/EURC trustlines', hash: r.tx });
+	}
 
 	const bal = $derived(wallet.balances.find((b) => b.code === asset));
 
@@ -86,6 +100,16 @@
 				hint="Send public funds here from any wallet or exchange, then deposit to shield them."
 				qr
 			/>
+			<div class="flex flex-col gap-2 border-t pt-3">
+				<h2 class="text-sm font-medium text-muted-foreground">Receiving USDC or EURC?</h2>
+				<p class="text-xs text-muted-foreground">
+					A new account needs a trustline before it can hold USDC/EURC. Set them up here — the
+					reserves are sponsored, so you need no XLM.
+				</p>
+				<Button variant="outline" size="sm" onclick={setupTrustlines} disabled={trusting}>
+					{trusting ? 'Setting up…' : 'Set up USDC + EURC trustlines'}
+				</Button>
+			</div>
 		</div>
 	{/snippet}
 </Workspace>

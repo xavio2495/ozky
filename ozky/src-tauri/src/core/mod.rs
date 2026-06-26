@@ -46,6 +46,7 @@ pub mod sign;
 pub mod subscriptions;
 pub mod swap;
 pub mod totp;
+pub mod trustline;
 pub mod vault;
 pub mod withdraw;
 pub mod witness;

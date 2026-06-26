@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use stellar_xdr::curr::{
-    AccountId, BytesM, ContractId, DecoratedSignature, Hash, HostFunction, Int128Parts,
-    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits,
-    Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress,
-    ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber, SorobanAuthorizationEntry,
-    SorobanTransactionData, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionV1Envelope, UInt256Parts, Uint256, VecM, WriteXdr,
+    AccountId, AlphaNum4, AssetCode4, BeginSponsoringFutureReservesOp, BytesM,
+    ChangeTrustAsset, ChangeTrustOp, ContractId, CreateAccountOp, DecoratedSignature, Hash,
+    HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntryData, LedgerKey,
+    LedgerKeyAccount, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec,
+    SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
+    TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt256Parts, Uint256, VecM,
+    WriteXdr,
 };
 
 /// Ledgers per epoch (FROZEN, matches the pool contract's `LEDGER_PER_EPOCH`).
@@ -955,6 +957,112 @@ pub fn submit_deposit(
         ScVal::U32(out.view_tag),
     ];
     invoke_contract(cfg, source_secret, &cfg.pool_contract, "deposit", args)
+}
+
+/// Parse a classic account address (`G…`) into an `AccountId`.
+fn account_id(g: &str) -> Result<AccountId, CoreError> {
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(g)
+        .map_err(|e| CoreError::Chain(format!("bad account address {g}: {e}")))?;
+    Ok(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0))))
+}
+
+/// A 4-char asset code (e.g. "USDC") as an `AssetCode4` (right-padded with NULs).
+fn asset_code4(code: &str) -> Result<AssetCode4, CoreError> {
+    let b = code.as_bytes();
+    if b.is_empty() || b.len() > 4 {
+        return Err(CoreError::Chain(format!("asset code '{code}' must be 1..=4 chars")));
+    }
+    let mut c = [0u8; 4];
+    c[..b.len()].copy_from_slice(b);
+    Ok(AssetCode4(c))
+}
+
+/// Establish classic trustlines on `user_addr` for `assets` (`(code, issuer)`), with the
+/// reserves SPONSORED by the relayer so the user needs no XLM. The single transaction is:
+/// `BeginSponsoringFutureReserves{user}` (relayer) · [`CreateAccount{user, 0}` if the
+/// account doesn't exist yet] · one `ChangeTrust` per asset (sourced by the user) ·
+/// `EndSponsoringFutureReserves` (user). It is co-signed by the relayer (tx source + the
+/// sponsoring/create ops) and the user (the trustline ops). Returns the tx hash.
+///
+/// `relayer_secret`/`user_secret` are signed natively and never leave this process.
+pub fn submit_sponsored_trustlines(
+    cfg: &PoolConfig,
+    relayer_secret: &str,
+    user_secret: &str,
+    user_addr: &str,
+    create_account: bool,
+    assets: &[(&str, &str)],
+) -> Result<String, CoreError> {
+    if assets.is_empty() {
+        return Err(CoreError::Chain("no trustlines to establish".into()));
+    }
+    let relayer = super::sign::Signer::from_secret(relayer_secret)?;
+    let user = super::sign::Signer::from_secret(user_secret)?;
+    let user_id = account_id(user_addr)?;
+    let user_muxed = user.muxed();
+
+    let mut ops: Vec<Operation> = Vec::new();
+    // Begin sponsoring: sponsor = relayer (tx source), sponsored = user.
+    ops.push(Operation {
+        source_account: None,
+        body: OperationBody::BeginSponsoringFutureReserves(BeginSponsoringFutureReservesOp {
+            sponsored_id: user_id.clone(),
+        }),
+    });
+    // Create the user account (sponsored base reserve) when it doesn't exist yet.
+    if create_account {
+        ops.push(Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: user_id.clone(),
+                starting_balance: 0,
+            }),
+        });
+    }
+    // One ChangeTrust per asset, sourced by the user (its reserve is the sponsored entry).
+    for (code, issuer) in assets {
+        ops.push(Operation {
+            source_account: Some(user_muxed.clone()),
+            body: OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: asset_code4(code)?,
+                    issuer: account_id(issuer)?,
+                }),
+                limit: i64::MAX,
+            }),
+        });
+    }
+    // End sponsoring: performed by the sponsored (user) account.
+    ops.push(Operation {
+        source_account: Some(user_muxed.clone()),
+        body: OperationBody::EndSponsoringFutureReserves,
+    });
+
+    let fee = BASE_FEE.saturating_mul(ops.len() as u32);
+    let operations: VecM<Operation, 100> =
+        ops.try_into().map_err(|_| CoreError::Chain("too many trustline ops".into()))?;
+    let seq = account_seq(&cfg.rpc_url, &relayer.account_id())? + 1;
+    let tx = Transaction {
+        source_account: relayer.muxed(),
+        fee,
+        seq_num: SequenceNumber(seq),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations,
+        ext: TransactionExt::V0,
+    };
+
+    // Co-sign: relayer (tx source + sponsor/create ops) + user (trustline ops).
+    let sig_relayer = super::sign::sign_transaction(&relayer, &cfg.network_passphrase, &tx)?;
+    let sig_user = super::sign::sign_transaction(&user, &cfg.network_passphrase, &tx)?;
+    let signatures: VecM<DecoratedSignature, 20> = vec![sig_relayer, sig_user]
+        .try_into()
+        .map_err(|_| CoreError::Chain("signatures".into()))?;
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures });
+    let env_b64 = env
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr envelope: {e}")))?;
+    submit_and_poll(&cfg.rpc_url, "trustlines", &env_b64)
 }
 
 /// Submit a `transfer` to the pool. Returns the transaction hash.

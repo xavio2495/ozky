@@ -70,6 +70,12 @@ if (process.argv.includes('--sea')) {
   const exe = join(dist, process.platform === 'win32' ? 'ozky-prover.exe' : 'ozky-prover');
   copyFileSync(process.execPath, exe);
 
+  const isMac = process.platform === 'darwin';
+  // macOS ships a signed `node`; its signature must be stripped before postject
+  // mutates the binary and re-applied (ad-hoc) afterwards, and postject needs an
+  // explicit Mach-O segment name. No-ops on Windows/Linux.
+  if (isMac) execFileSync('codesign', ['--remove-signature', exe], { stdio: 'inherit' });
+
   const postject = join('node_modules', 'postject', 'dist', 'cli.js');
   if (!existsSync(postject)) {
     console.error('postject not installed; run: npm i -D postject');
@@ -80,8 +86,10 @@ if (process.argv.includes('--sea')) {
     [
       postject, exe, 'NODE_SEA_BLOB', join(dist, 'prove.blob'),
       '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+      ...(isMac ? ['--macho-segment-name', 'NODE_SEA'] : []),
     ],
     { stdio: 'inherit' },
   );
+  if (isMac) execFileSync('codesign', ['--sign', '-', exe], { stdio: 'inherit' });
   console.log('built ' + exe);
 }

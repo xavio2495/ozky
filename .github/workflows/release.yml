@@ -1,0 +1,118 @@
+name: Release (Tauri build)
+
+# Builds the ozky shielded-wallet desktop app for Windows, macOS (Apple Silicon)
+# and Linux whenever a `v*` tag is pushed (e.g. `v0.1.0`), and attaches the
+# installers to a DRAFT GitHub Release named after the version in
+# ozky/src-tauri/tauri.conf.json. Push the tag whose name matches `v<version>`
+# (so tag `v0.1.0` ↔ tauri.conf.json "version": "0.1.0").
+#
+# Unlike a plain template, ozky ships a no-Docker prover: each runner builds the
+# Node SEA prover binary (prover-sidecar/build.mjs --sea), then tauri-action's
+# beforeBuildCommand stages it together with the committed circuit JSONs + frozen
+# VKs into src-tauri/prover-bundle/ and bundles that as a Tauri resource.
+#
+# Builds are unsigned, except macOS which uses free ad-hoc signing
+# (APPLE_SIGNING_IDENTITY: "-"). Windows installers are unsigned and will show a
+# SmartScreen warning until a real Authenticode certificate is wired in.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+# tauri-action needs write access to create/update the GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # Apple Silicon (M-series) runner
+            rust-target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - platform: ubuntu-latest
+            rust-target: ""
+            args: ""
+          - platform: windows-latest
+            rust-target: ""
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            prover-sidecar/package-lock.json
+            ozky/package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./ozky/src-tauri -> target
+          key: ${{ matrix.platform }}
+
+      # Build the no-Docker prover SEA binary + WASM/worker blobs for THIS runner's
+      # platform. Pure Node (esbuild + postject + Node SEA) — no Docker/Noir needed.
+      # Emits prover-sidecar/dist/, which stage-prover-bundle.mjs copies during the
+      # Tauri beforeBuildCommand below. On macOS the SEA is ad-hoc re-signed inside
+      # build.mjs so postject doesn't leave an invalid signature.
+      - name: Build prover sidecar (SEA)
+        working-directory: prover-sidecar
+        run: |
+          npm ci
+          node build.mjs --sea
+
+      # tauri-action does NOT reliably install ozky's own deps, so install them
+      # explicitly. Without this the `tauri` CLI (an ozky devDependency) is absent
+      # and `npm run tauri build` fails with "tauri: not found" (exit 127).
+      - name: Install ozky dependencies
+        working-directory: ozky
+        run: npm ci
+
+      # tauri-action runs the beforeBuildCommand (`npm run build` then
+      # stage-prover-bundle.mjs, which assembles src-tauri/prover-bundle/ from the
+      # SEA dist above + the committed circuit JSONs + frozen VKs), then
+      # `tauri build`, and uploads the bundles to the draft release.
+      - name: Build Tauri app and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Free ad-hoc signing on macOS (no Apple Developer cert required).
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          projectPath: ozky
+          tagName: v__VERSION__
+          releaseName: "ozky v__VERSION__"
+          releaseBody: "Automated build from tag. See assets below."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

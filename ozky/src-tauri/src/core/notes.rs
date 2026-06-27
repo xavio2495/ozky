@@ -43,6 +43,21 @@ pub(crate) fn data_dir() -> PathBuf {
     PathBuf::from(base.unwrap_or_else(|| ".".into())).join("ozky")
 }
 
+/// Remove every per-wallet encrypted data file (`*.enc`: notes, payroll, history,
+/// escrow, channel, keeper stores) in the data dir. Used by logout to wipe the device.
+/// Best-effort — a missing dir or unremovable file is ignored.
+pub(crate) fn wipe_data_files() {
+    let Ok(entries) = std::fs::read_dir(data_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("enc") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// `notes-<16 hex of sha256(stellar_address)>.enc` — keyed by the public address so
 /// multiple wallets on one machine don't collide. The address is public (not secret).
 fn store_path(wallet: &WalletKeys) -> PathBuf {

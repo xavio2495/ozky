@@ -8,11 +8,16 @@
   let { children }: { children: Snippet } = $props();
 </script>
 
-<div class="w-full max-w-3xl">
+<div class="w-full min-w-[750px]">
   <Card.Root class="overflow-hidden p-0 shadow-2xl">
-    <Card.Content class="grid min-h-[460px] p-0 md:grid-cols-2">
-      <div class="flex flex-col justify-center p-8 md:p-10">
-        {@render children()}
+    <Card.Content class="grid h-[600px] p-0 md:grid-cols-2">
+      <div class="flex flex-col overflow-hidden p-8">
+        <!-- Fixed-size frame: m-auto vertically centers each page's content and
+             overflow-hidden keeps the card from ever growing a scrollbar. Pages are
+             kept short enough (multi-step flow) to fit without clipping. -->
+        <div class="m-auto w-full">
+          {@render children()}
+        </div>
       </div>
       <div class="brand-panel hidden md:flex items-center">
         <img src="/brand/icon_nobg.svg" alt="" class="mb-11 size-36" />

@@ -412,19 +412,27 @@ pub fn arm(
         .into_iter()
         .find(|p| p.id == payroll_id)
         .ok_or_else(|| CoreError::Crypto("no such payroll".into()))?;
-    if pr.payees.is_empty() {
-        return Err(CoreError::Crypto("payroll has no payees".into()));
-    }
-    if pr
+    // The headless keeper pre-proves a single-asset spend chain. A multi-token payroll (more
+    // than one funding group) must be run with the app open.
+    let group = match pr.groups.as_slice() {
+        [g] if !g.payees.is_empty() => g.clone(),
+        [] | [_] => return Err(CoreError::Crypto("payroll has no payees".into())),
+        _ => {
+            return Err(CoreError::Crypto(
+                "headless keeper supports single-asset payrolls only; run a multi-token payroll with the app open".into(),
+            ))
+        }
+    };
+    if group
         .payees
         .iter()
-        .any(|pe| pe.recv_asset.as_deref().is_some_and(|a| a != pr.asset))
+        .any(|pe| pe.recv_asset.as_deref().is_some_and(|a| a != group.asset))
     {
         return Err(CoreError::Crypto(
             "headless keeper v1 supports same-asset payrolls only; a cross-asset payee needs a swap bundle (deferred)".into(),
         ));
     }
-    let cfg = cfg_base.with_asset(&pr.asset)?;
+    let cfg = cfg_base.with_asset(&group.asset)?;
     let id = scan::wallet_identity(wallet)?;
 
     // One live read: ledger seq (epoch + window) and pool state.
@@ -445,7 +453,7 @@ pub fn arm(
     let local = notes::load(wallet)?;
 
     // Parse payees → (owner_pk, transmission_pub, amount); chunk into <= SPLIT_CHUNK groups.
-    let parsed_all: Vec<(Fr, [u8; 32], u64)> = pr
+    let parsed_all: Vec<(Fr, [u8; 32], u64)> = group
         .payees
         .iter()
         .map(|pe| {
@@ -486,7 +494,7 @@ pub fn arm(
         input = prepared.change.clone();
         bundles.push(KeeperBundle::from_prepared(
             payroll_id,
-            &pr.asset,
+            &group.asset,
             &cfg.pool_contract,
             &prepared.tx,
             fire,
@@ -905,7 +913,7 @@ mod tests {
     #[test]
     #[ignore = "live keeper arm; needs prover sidecar + network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC"]
     fn arm_two_chunk_chain_on_testnet() {
-        use crate::core::payroll::{self, Cadence, Payee, Payroll};
+        use crate::core::payroll::{self, Cadence, PayGroup, Payee, Payroll};
         let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
             Ok(m) if !m.trim().is_empty() => m,
             _ => return,
@@ -933,11 +941,16 @@ mod tests {
             Payroll {
                 id: 0,
                 label: "Keeper arm test".into(),
-                asset: "XLM".into(),
-                payees,
+                groups: vec![PayGroup { asset: "XLM".into(), payees }],
+                asset: String::new(),
+                payees: Vec::new(),
                 cadence: Cadence::Weekly,
                 next_run_unix: payroll::now(),
                 last_run_unix: None,
+                end_unix: None,
+                auditor: None,
+                approval: None,
+                run_location: None,
                 enabled: true,
             },
         )
@@ -971,7 +984,7 @@ mod tests {
     #[test]
     #[ignore = "live keeper arm+submit; needs prover sidecar + network + ozky.config.json + built ozky-keeper + $OZKY_DEPLOY_MNEMONIC"]
     fn keeper_arm_then_submit_on_testnet() {
-        use crate::core::payroll::{self, Cadence, Payee, Payroll};
+        use crate::core::payroll::{self, Cadence, PayGroup, Payee, Payroll};
         let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
             Ok(m) if !m.trim().is_empty() => m,
             _ => return,
@@ -999,11 +1012,16 @@ mod tests {
             Payroll {
                 id: 0,
                 label: "Keeper e2e".into(),
-                asset: "XLM".into(),
-                payees,
+                groups: vec![PayGroup { asset: "XLM".into(), payees }],
+                asset: String::new(),
+                payees: Vec::new(),
                 cadence: Cadence::Weekly,
                 next_run_unix: payroll::now(),
                 last_run_unix: None,
+                end_unix: None,
+                auditor: None,
+                approval: None,
+                run_location: None,
                 enabled: true,
             },
         )
@@ -1081,7 +1099,7 @@ mod tests {
     #[test]
     #[ignore = "prints a live armed run as JSON for the cloud keeper; needs prover sidecar + network"]
     fn print_armed_run_json() {
-        use crate::core::payroll::{self, Cadence, Payee, Payroll};
+        use crate::core::payroll::{self, Cadence, PayGroup, Payee, Payroll};
         let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
             Ok(m) if !m.trim().is_empty() => m,
             _ => return,

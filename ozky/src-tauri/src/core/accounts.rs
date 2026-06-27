@@ -67,6 +67,26 @@ pub fn add(label: Option<String>) -> Result<(), CoreError> {
     save(&meta)
 }
 
+/// Rename an existing account. Empty/whitespace labels fall back to "Account N".
+pub fn rename(index: u32, label: String) -> Result<(), CoreError> {
+    let mut meta = load()?;
+    if index as usize >= meta.labels.len() {
+        return Err(CoreError::Crypto("no such account".into()));
+    }
+    let label = if label.trim().is_empty() {
+        format!("Account {}", index + 1)
+    } else {
+        label.trim().to_string()
+    };
+    meta.labels[index as usize] = label;
+    save(&meta)
+}
+
+/// Remove the account-metadata entry entirely (logout / device wipe).
+pub fn wipe() -> Result<(), CoreError> {
+    super::keychain::delete(META_ACCOUNT)
+}
+
 /// Set the active account index.
 pub fn set_active(index: u32) -> Result<(), CoreError> {
     let mut meta = load()?;

@@ -39,27 +39,75 @@ pub enum Cadence {
     EveryDays(u32),
 }
 
+/// One funding group of a payroll: a set of payees all paid FROM `asset`. A multi-token
+/// payroll holds one group per funding asset (each a tab in the UI). A run pays each group
+/// independently (its own [`super::send::multi_send_with`]).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PayGroup {
+    /// Funding asset code (e.g. "USDC").
+    pub asset: String,
+    pub payees: Vec<Payee>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Payroll {
     pub id: u64,
     pub label: String,
-    /// Asset code (e.g. "USDC").
+    /// One group per funding asset. (Canonical since multi-token; legacy single-asset stores
+    /// migrate into a single group on load — see [`Payroll::migrate`].)
+    #[serde(default)]
+    pub groups: Vec<PayGroup>,
+    /// LEGACY single-asset fields — present only to deserialize pre-multi-token encrypted
+    /// stores; migrated into `groups` on load and never written back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub asset: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payees: Vec<Payee>,
     pub cadence: Cadence,
     /// Unix seconds when the next run is due.
     pub next_run_unix: i64,
     /// Unix seconds of the last successful run (None if never run).
     pub last_run_unix: Option<i64>,
+    /// Unix seconds after which the payroll stops (None = no end).
+    #[serde(default)]
+    pub end_unix: Option<i64>,
+    /// Stellar `G…` auditor address. When set, a selective-disclosure grant for the current
+    /// epoch is recorded to it after each successful run.
+    #[serde(default)]
+    pub auditor: Option<String>,
+    /// How a due run is approved: `"auto"` = the headless keeper submits when due; `"manual"`
+    /// = notify only, the user runs it. `None`/empty defaults to `"manual"`.
+    #[serde(default)]
+    pub approval: Option<String>,
+    /// Where a headless run executes: `"local"` = an OS-scheduled task on this machine;
+    /// `"cloud"` = the ozky cloud keeper. `None`/empty defaults to `"local"`.
+    #[serde(default)]
+    pub run_location: Option<String>,
     pub enabled: bool,
 }
 
 impl Payroll {
+    /// Fold a legacy single-asset payroll into the `groups` model in place. Idempotent.
+    fn migrate(&mut self) {
+        if self.groups.is_empty() && !self.payees.is_empty() {
+            self.groups = vec![PayGroup {
+                asset: std::mem::take(&mut self.asset),
+                payees: std::mem::take(&mut self.payees),
+            }];
+        }
+        self.asset.clear();
+        self.payees.clear();
+    }
     pub fn total(&self) -> u64 {
-        self.payees.iter().map(|p| p.amount).sum()
+        self.groups.iter().flat_map(|g| &g.payees).map(|p| p.amount).sum()
+    }
+    pub fn payee_count(&self) -> usize {
+        self.groups.iter().map(|g| g.payees.len()).sum()
     }
     pub fn is_due(&self, now_unix: i64) -> bool {
-        self.enabled && now_unix >= self.next_run_unix
+        self.enabled
+            && now_unix >= self.next_run_unix
+            && self.end_unix.map_or(true, |end| self.next_run_unix <= end)
     }
     /// Advance `next_run_unix` by one cadence period from `from` (its current next_run).
     pub fn advance_from(&mut self, from: i64) {
@@ -111,7 +159,12 @@ pub fn load(wallet: &WalletKeys) -> Result<Vec<Payroll>, CoreError> {
     let plain = cipher(wallet)
         .decrypt(Nonce::from_slice(nonce), ct)
         .map_err(|_| CoreError::Crypto("payroll store decrypt failed".into()))?;
-    serde_json::from_slice(&plain).map_err(|e| CoreError::Crypto(format!("payroll decode: {e}")))
+    let mut list: Vec<Payroll> = serde_json::from_slice(&plain)
+        .map_err(|e| CoreError::Crypto(format!("payroll decode: {e}")))?;
+    for p in &mut list {
+        p.migrate();
+    }
+    Ok(list)
 }
 
 fn save(wallet: &WalletKeys, payrolls: &[Payroll]) -> Result<(), CoreError> {
@@ -171,33 +224,58 @@ pub fn run(wallet: &WalletKeys, cfg_base: &PoolConfig, id: u64) -> Result<Vec<St
         .position(|p| p.id == id)
         .ok_or_else(|| CoreError::Crypto("no such payroll".into()))?;
     let payroll = list[idx].clone();
-    if payroll.payees.is_empty() {
+    if payroll.groups.iter().all(|g| g.payees.is_empty()) {
         return Err(CoreError::Crypto("payroll has no payees".into()));
     }
-    // Same-asset payees bundle into split txs; cross-asset payees are individual `pay` txs.
-    let recipients: Vec<send::MultiRecipient> = payroll
-        .payees
-        .iter()
-        .map(|p| send::MultiRecipient {
-            code: p.code.clone(),
-            amount: p.amount,
-            recv_asset: p.recv_asset.clone(),
-        })
-        .collect();
-    let hashes = send::multi_send_with(
-        wallet,
-        cfg_base,
-        &payroll.asset,
-        &recipients,
-        send::MULTI_SEND_SLIPPAGE_BPS,
-    )?;
+    // Pay each funding group independently: same-asset payees bundle into split txs,
+    // cross-asset payees are individual `pay` txs (all funded from the group's asset).
+    let mut hashes = Vec::new();
+    for group in &payroll.groups {
+        if group.payees.is_empty() {
+            continue;
+        }
+        let recipients: Vec<send::MultiRecipient> = group
+            .payees
+            .iter()
+            .map(|p| send::MultiRecipient {
+                code: p.code.clone(),
+                amount: p.amount,
+                recv_asset: p.recv_asset.clone(),
+            })
+            .collect();
+        hashes.extend(send::multi_send_with(
+            wallet,
+            cfg_base,
+            &group.asset,
+            &recipients,
+            send::MULTI_SEND_SLIPPAGE_BPS,
+        )?);
+    }
 
-    // All chunks paid: advance the schedule from the later of (due time, now) so a
-    // late run doesn't bunch the next period, then persist.
+    // Auditor disclosure: if an auditor is configured, record a selective-disclosure grant
+    // for the current epoch (the one this run's outputs land in). Best-effort — the payment
+    // already settled, so a disclosure failure must not fail the run.
+    if let Some(auditor) = payroll.auditor.as_deref().filter(|a| !a.is_empty()) {
+        if let Ok(epoch) = super::chain::current_epoch(&cfg_base.rpc_url) {
+            if let Err(e) =
+                super::disclose::share_with_auditor_with(wallet, cfg_base, auditor, epoch, epoch)
+            {
+                eprintln!("[ozky-payroll] auditor disclosure after run failed: {e}");
+            }
+        }
+    }
+
+    // All groups paid: advance the schedule from the later of (due time, now) so a
+    // late run doesn't bunch the next period. If the new next run is past the end date,
+    // the payroll is finished (disabled). Then persist.
     let t = now();
     list[idx].last_run_unix = Some(t);
     let base = payroll.next_run_unix.max(t);
-    list[idx].next_run_unix = next_after(base, payroll.cadence);
+    let next = next_after(base, payroll.cadence);
+    list[idx].next_run_unix = next;
+    if payroll.end_unix.map_or(false, |end| next > end) {
+        list[idx].enabled = false;
+    }
     save(wallet, &list)?;
     Ok(hashes)
 }
@@ -260,11 +338,19 @@ mod tests {
         Payroll {
             id: 1,
             label: "Team".into(),
-            asset: "USDC".into(),
-            payees: vec![Payee { code: "ozkyA".into(), amount: 100, recv_asset: None }],
+            groups: vec![PayGroup {
+                asset: "USDC".into(),
+                payees: vec![Payee { code: "ozkyA".into(), amount: 100, recv_asset: None }],
+            }],
+            asset: String::new(),
+            payees: Vec::new(),
             cadence,
             next_run_unix: next,
             last_run_unix: None,
+            end_unix: None,
+            auditor: None,
+            approval: None,
+            run_location: None,
             enabled: true,
         }
     }
@@ -349,11 +435,16 @@ mod tests {
             Payroll {
                 id: 0,
                 label: "Live test".into(),
-                asset: "XLM".into(),
-                payees,
+                groups: vec![PayGroup { asset: "XLM".into(), payees }],
+                asset: String::new(),
+                payees: Vec::new(),
                 cadence: Cadence::Weekly,
                 next_run_unix: now(),
                 last_run_unix: None,
+                end_unix: None,
+                auditor: None,
+                approval: None,
+                run_location: None,
                 enabled: true,
             },
         )

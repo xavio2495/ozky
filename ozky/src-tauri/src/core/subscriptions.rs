@@ -38,6 +38,16 @@ pub struct Subscription {
     pub last_run_unix: Option<i64>,
     /// Unix seconds after which the subscription stops (None = no end).
     pub end_unix: Option<i64>,
+    /// Stellar `G…` auditor address. When set, a selective-disclosure grant for the current
+    /// epoch is recorded to it after each successful charge.
+    #[serde(default)]
+    pub auditor: Option<String>,
+    /// `"auto"` = headless keeper charges when due; `"manual"` = notify only. Default `"manual"`.
+    #[serde(default)]
+    pub approval: Option<String>,
+    /// `"local"` = OS-scheduled task on this machine; `"cloud"` = ozky cloud keeper. Default `"local"`.
+    #[serde(default)]
+    pub run_location: Option<String>,
     pub enabled: bool,
 }
 
@@ -142,6 +152,18 @@ pub fn run(wallet: &WalletKeys, cfg_base: &PoolConfig, id: u64) -> Result<String
 
     let hash = send::send_with(wallet, &cfg, &sub.code, sub.amount)?;
 
+    // Auditor disclosure (best-effort — the charge already settled): record a current-epoch
+    // selective-disclosure grant to the configured auditor.
+    if let Some(auditor) = sub.auditor.as_deref().filter(|a| !a.is_empty()) {
+        if let Ok(epoch) = super::chain::current_epoch(&cfg_base.rpc_url) {
+            if let Err(e) =
+                super::disclose::share_with_auditor_with(wallet, cfg_base, auditor, epoch, epoch)
+            {
+                eprintln!("[ozky-subscription] auditor disclosure after charge failed: {e}");
+            }
+        }
+    }
+
     // Paid: advance from the later of (due time, now) so a late run doesn't bunch the next
     // cycle. If the new next run is past the end date, the subscription is finished.
     let t = now();
@@ -171,6 +193,9 @@ mod tests {
             next_run_unix: next,
             last_run_unix: None,
             end_unix: end,
+            auditor: None,
+            approval: None,
+            run_location: None,
             enabled: true,
         }
     }
@@ -259,6 +284,9 @@ mod tests {
                 next_run_unix: now(),
                 last_run_unix: None,
                 end_unix: None,
+                auditor: None,
+                approval: None,
+                run_location: None,
                 enabled: true,
             },
         )

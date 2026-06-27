@@ -25,6 +25,37 @@ fn lock_guard() -> std::sync::MutexGuard<'static, Option<Session>> {
     SESSION.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A staged (not-yet-committed) wallet setup. Created at sign-up/restore but only written
+/// to the vault + opened as a session once the user confirms their 2FA code. Holding it
+/// here — instead of committing immediately — means an abandoned or reloaded onboarding
+/// leaves NO usable wallet, so a user can't get locked out by skipping the authenticator
+/// step (the vault would otherwise demand a TOTP they never finished setting up).
+pub struct PendingSetup {
+    pub password: Zeroizing<String>,
+    pub content: VaultContent,
+}
+
+static PENDING: Mutex<Option<PendingSetup>> = Mutex::new(None);
+
+fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingSetup>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Stage a wallet setup pending 2FA confirmation (overwrites any prior staged setup).
+pub fn set_pending(p: PendingSetup) {
+    *pending_guard() = Some(p);
+}
+
+/// The staged setup's TOTP secret — to verify the confirmation code without consuming it.
+pub fn pending_totp_secret() -> Option<[u8; super::totp::SECRET_LEN]> {
+    pending_guard().as_ref().map(|p| p.content.totp_secret)
+}
+
+/// Consume the staged setup (on successful 2FA confirmation, to commit it).
+pub fn take_pending() -> Option<PendingSetup> {
+    pending_guard().take()
+}
+
 /// Establish the unlocked session from decrypted vault contents + derived key.
 pub fn set(content: VaultContent, key: VaultKey, active: u32) {
     let active = active.min(content.accounts.len().saturating_sub(1) as u32);

@@ -185,7 +185,10 @@
 				cadence,
 				interval_days: cadence === 'days' ? Math.max(1, Number(intervalDays) || 1) : 0,
 				start_unix: 0, // default: now → immediately due, so a fresh subscription can be run
-				end_unix: endDate ? Math.floor(new Date(endDate).getTime() / 1000) : 0
+				end_unix: endDate ? Math.floor(new Date(endDate).getTime() / 1000) : 0,
+				auditor: '',
+				approval: '',
+				run_location: ''
 			});
 			editOpen = false;
 			await wallet.refreshSubscriptions();

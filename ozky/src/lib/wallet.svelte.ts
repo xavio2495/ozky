@@ -14,6 +14,7 @@ import {
 	type NewAccount,
 	type Payroll,
 	type PublicBalance,
+	type Spot,
 	type Subscription,
 	type WalletStatus
 } from './api';
@@ -42,6 +43,8 @@ class WalletStore {
 	status = $state<WalletStatus | null>(null);
 	balances = $state<AssetBalance[]>([]);
 	publicBalances = $state<PublicBalance[]>([]);
+	/** Spot USD prices per asset (optional — Dashboard totals degrade gracefully if empty). */
+	prices = $state<Spot[]>([]);
 	accounts = $state<AccountInfo[]>([]);
 	payrolls = $state<Payroll[]>([]);
 	subscriptions = $state<Subscription[]>([]);
@@ -89,6 +92,23 @@ class WalletStore {
 		await api.lock();
 		this.balances = [];
 		this.publicBalances = [];
+		this.prices = [];
+		this.accounts = [];
+		this.payrolls = [];
+		this.subscriptions = [];
+		this.escrows = [];
+		this.channels = [];
+		this.activity = [];
+		await this.refreshStatus();
+	}
+
+	/** Sign out of this device: wipe the wallet (vault + data) and return to onboarding.
+	 * Unlike {@link lock}, this is irreversible without the recovery phrases. */
+	async logout() {
+		await api.logout();
+		this.balances = [];
+		this.publicBalances = [];
+		this.prices = [];
 		this.accounts = [];
 		this.payrolls = [];
 		this.subscriptions = [];
@@ -108,6 +128,21 @@ class WalletStore {
 		await this.refreshEscrows();
 		await this.refreshChannels();
 		await this.refreshHistory();
+		await this.refreshPrices();
+	}
+
+	/** Spot USD prices — optional; failures are swallowed so the Dashboard still loads. */
+	async refreshPrices() {
+		try {
+			this.prices = await api.assetPrices();
+		} catch {
+			/* prices are a nice-to-have; the Dashboard falls back to base-unit amounts */
+		}
+	}
+
+	/** USD spot for an asset code, or 0 when prices aren't loaded. */
+	priceOf(code: string): number {
+		return this.prices.find((s) => s.code === code)?.usd ?? 0;
 	}
 
 	async refreshPayrolls() {
@@ -134,7 +169,7 @@ class WalletStore {
 			this.log({
 				kind: 'payroll',
 				label: `Payroll "${p.label}"`,
-				detail: `${p.payees.length} payees`,
+				detail: `${p.payee_count} payees`,
 				hash: hashes[0]
 			});
 		}
@@ -330,6 +365,12 @@ class WalletStore {
 		await this.refreshAccounts();
 		await this.refreshBalances();
 		await this.refreshPublicBalances();
+	}
+
+	/** Rename an account's display label (no seed/balance change). */
+	async renameAccount(index: number, label: string) {
+		await api.renameAccount(index, label);
+		await this.refreshAccounts();
 	}
 
 	async refreshStatus() {

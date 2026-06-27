@@ -86,6 +86,66 @@ pub fn ensure_trustlines_with(
     })
 }
 
+/// Onboarding provisioning for a brand-new wallet: (1) ask the funder service to create +
+/// fund the account (10 XLM), (2) wait for it to appear on-chain, (3) establish the missing
+/// USDC/EURC trustlines LOCALLY — signed + fee-paid by the now-funded account (no relayer,
+/// no pool config needed). Idempotent: an already-funded/trusted account just reports what
+/// was (not) done. Errors if the account doesn't exist and no funder is configured.
+pub fn provision_new_account() -> Result<TrustlineReport, CoreError> {
+    let wallet = keys::current_wallet()?;
+    let addr = wallet.stellar_address();
+
+    // 1. Create + fund the account via the server funder, unless it already exists.
+    let mut balances = chain::public_balances(addr)?;
+    let mut account_created = false;
+    if balances.is_empty() {
+        if !super::funder::request_funding(addr)? {
+            return Err(CoreError::Chain(
+                "no funder configured (OZKY_FUNDER_URL) — a new account can't be created".into(),
+            ));
+        }
+        account_created = true;
+        balances = wait_for_account(addr)?; // 2. CreateAccount settles in a few seconds.
+    }
+
+    // 3. Add the missing auto-trust trustlines, paid by the user's own account.
+    let present: Vec<(String, Option<String>)> =
+        balances.into_iter().map(|b| (b.code, b.issuer)).collect();
+    let missing: Vec<(&'static str, &'static str)> = config::auto_trust_assets()
+        .into_iter()
+        .filter(|(code, issuer)| {
+            !present.iter().any(|(c, iss)| c == code && iss.as_deref() == Some(*issuer))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(TrustlineReport { account_created, added: vec![], already: true, tx: None });
+    }
+
+    let rpc_url = config::cfg_var("OZKY_RPC_URL").unwrap_or_else(|| chain::DEFAULT_RPC_URL.to_string());
+    let passphrase = config::cfg_var("OZKY_NETWORK_PASSPHRASE")
+        .unwrap_or_else(|| "Test SDF Network ; September 2015".to_string());
+    let tx = chain::submit_local_trustlines(&rpc_url, &passphrase, wallet.stellar_secret(), &missing)?;
+    Ok(TrustlineReport {
+        account_created,
+        added: missing.iter().map(|(c, _)| c.to_string()).collect(),
+        already: false,
+        tx: Some(tx),
+    })
+}
+
+/// Poll Horizon until the freshly-funded account exists (returns its balances), up to a
+/// short timeout (~30s) to cover ledger close + propagation.
+fn wait_for_account(addr: &str) -> Result<Vec<chain::PublicBalance>, CoreError> {
+    for _ in 0..20 {
+        let b = chain::public_balances(addr)?;
+        if !b.is_empty() {
+            return Ok(b);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    Err(CoreError::Chain("funded account did not appear on-chain in time".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

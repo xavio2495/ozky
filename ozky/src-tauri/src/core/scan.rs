@@ -171,9 +171,27 @@ pub fn scan(from_leaf: u32) -> Result<Vec<OwnedNote>, CoreError> {
     let wallet = keys::current_wallet()?;
     let cfg = PoolConfig::load()?;
     let id = wallet_identity(&wallet)?;
+    // Timing so a "hang" can be attributed to the network drain (pool_state) vs the per-commit
+    // ownership match (owned_notes). On by default in dev builds; release needs `OZKY_SCAN_LOG`.
+    let log = cfg!(debug_assertions) || std::env::var("OZKY_SCAN_LOG").is_ok();
+    let t0 = std::time::Instant::now();
     let state = chain::pool_state(&cfg)?;
+    let t_pool = t0.elapsed();
     let local = notes::load(&wallet)?;
-    owned_notes(&id, &state, &local, from_leaf)
+    let t1 = std::time::Instant::now();
+    let out = owned_notes(&id, &state, &local, from_leaf)?;
+    if log {
+        eprintln!(
+            "[ozky-scan] pool_state {} commits / {} nullifiers in {:?}; owned_notes {} owned in {:?}; total {:?}",
+            state.commits.len(),
+            state.nullifiers.len(),
+            t_pool,
+            out.len(),
+            t1.elapsed(),
+            t0.elapsed()
+        );
+    }
+    Ok(out)
 }
 
 /// Match owned notes against already-fetched pool state via on-chain ciphertexts only

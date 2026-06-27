@@ -49,44 +49,71 @@ pub async fn create_wallet(password: String) -> Result<WalletSetup, CoreError> {
     blocking(move || {
         let phrase = core::keys::generate_mnemonic()?;
         let keys = core::keys::derive_from_mnemonic(&phrase)?; // validate + label
-        setup_vault_and_session(&password, &phrase, keys.stellar_address(), phrase.clone())
+        stage_setup(&password, &phrase, keys.stellar_address(), phrase.clone())
     })
     .await
 }
 
 /// Restore a wallet from a 12-word phrase: validate it, set a new `password`, provision a
-/// fresh TOTP secret, encrypt at rest, and open the session. Off-thread (Argon2). (auth)
+/// fresh TOTP secret, and STAGE it pending 2FA confirmation. Off-thread. (auth)
 #[tauri::command]
 pub async fn restore_wallet(phrase: String, password: String) -> Result<WalletSetup, CoreError> {
     blocking(move || {
         let phrase = phrase.trim().to_string();
         let keys = core::keys::derive_from_mnemonic(&phrase)?; // validates the phrase
-        setup_vault_and_session(&password, &phrase, keys.stellar_address(), String::new())
+        stage_setup(&password, &phrase, keys.stellar_address(), String::new())
     })
     .await
 }
 
-/// Shared create/restore tail: provision TOTP, write the encrypted vault (one account),
-/// open the session, and return the setup payload.
-fn setup_vault_and_session(
+/// Shared create/restore tail: provision TOTP and STAGE the setup (password + the one
+/// account) pending 2FA confirmation. The vault is NOT written and no session is opened
+/// until [`finish_setup`] — so abandoning/reloading onboarding leaves no half-made wallet
+/// (and no lock-out from skipping the authenticator step).
+fn stage_setup(
     password: &str,
     phrase: &str,
     account_label: &str,
     mnemonic_out: String,
 ) -> Result<WalletSetup, CoreError> {
     let totp_secret = core::totp::generate_secret();
+    let setup = WalletSetup {
+        mnemonic: mnemonic_out,
+        totp_secret: core::totp::secret_base32(&totp_secret),
+        totp_uri: core::totp::provisioning_uri(&totp_secret, account_label, "ozky"),
+    };
     let content = core::vault::VaultContent {
         totp_secret,
         accounts: vec![zeroize::Zeroizing::new(phrase.to_string())],
     };
-    let key = core::vault::create(password, &content)?;
-    core::accounts::reset()?; // fresh wallet starts with a single account
-    core::session::set(content, key, 0);
-    Ok(WalletSetup {
-        mnemonic: mnemonic_out,
-        totp_secret: core::totp::secret_base32(&totp_secret),
-        totp_uri: core::totp::provisioning_uri(&totp_secret, account_label, "ozky"),
+    core::session::set_pending(core::session::PendingSetup {
+        password: zeroize::Zeroizing::new(password.to_string()),
+        content,
+    });
+    Ok(setup)
+}
+
+/// Confirm the sign-up/restore 2FA code and COMMIT the staged wallet: verify `code`
+/// against the pending TOTP secret, then write the encrypted vault (Argon2id) and open
+/// the session. Returns `false` on a wrong code — the staged setup is kept so the user can
+/// retry. Off-thread (Argon2). Funding + trustlines are a separate best-effort step the UI
+/// runs after this returns. (auth)
+#[tauri::command]
+pub async fn finish_setup(code: String) -> Result<bool, CoreError> {
+    blocking(move || {
+        let secret = core::session::pending_totp_secret()
+            .ok_or_else(|| CoreError::Crypto("no wallet setup in progress".into()))?;
+        if !core::totp::verify(&secret, &code, core::totp::now()) {
+            return Ok(false);
+        }
+        let pending = core::session::take_pending()
+            .ok_or_else(|| CoreError::Crypto("no wallet setup in progress".into()))?;
+        let key = core::vault::create(&pending.password, &pending.content)?;
+        core::accounts::reset()?; // fresh wallet starts with a single account
+        core::session::set(pending.content, key, 0);
+        Ok(true)
     })
+    .await
 }
 
 /// Unlock the wallet for this session: decrypt the vault with `password` (first factor)
@@ -196,6 +223,16 @@ pub fn switch_account(index: u32) -> Result<(), CoreError> {
     core::accounts::set_active(index)?;
     core::session::set_active_account(index);
     Ok(())
+}
+
+/// Rename an existing account's display label. (auth)
+#[tauri::command]
+pub fn rename_account(index: u32, label: String) -> Result<(), CoreError> {
+    core::session::mnemonic()?; // must be unlocked
+    if index >= core::session::account_count() {
+        return Err(CoreError::Crypto("no such account".into()));
+    }
+    core::accounts::rename(index, label)
 }
 
 /// The active account's PUBLIC (unshielded) Stellar balances — XLM + any trustline assets.
@@ -331,6 +368,52 @@ pub fn spending_key() -> Result<String, CoreError> {
     core::enroll::spending_key()
 }
 
+/// One account's recovery material, for the "export all recovery codes" backup flow.
+/// Secret-bearing — only crosses the boundary on explicit user action behind a confirm.
+#[derive(Serialize)]
+pub struct RecoveryExport {
+    pub index: u32,
+    pub label: String,
+    pub mnemonic: String,
+}
+
+/// Export every account's 12-word recovery phrase (with its label) for offline backup.
+/// The wallet is global to the app, so this returns all accounts on this device.
+/// Requires unlock. (auth)
+#[tauri::command]
+pub fn export_recovery_phrases() -> Result<Vec<RecoveryExport>, CoreError> {
+    let count = core::session::account_count();
+    if count == 0 {
+        return Err(CoreError::Locked);
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let phrase = core::session::mnemonic_at(index)?;
+        out.push(RecoveryExport {
+            index,
+            label: core::accounts::label(index)?,
+            mnemonic: phrase.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Sign out of this device: irreversibly wipe the encrypted vault, the account metadata,
+/// and every per-wallet data file, then clear the session. The wallet returns to
+/// onboarding. Unrecoverable without the recovery phrases — the UI gates this behind an
+/// export + typed confirmation. (auth)
+#[tauri::command]
+pub async fn logout() -> Result<(), CoreError> {
+    blocking(|| {
+        core::vault::delete()?;
+        core::accounts::wipe()?;
+        core::notes::wipe_data_files();
+        core::session::clear();
+        Ok(())
+    })
+    .await
+}
+
 /// Enroll this wallet into the configured pool's ASP approved set + deposit allow-list
 /// (testnet/dev: the wallet must be the policy admin). Returns the tx hash. (A3)
 #[tauri::command]
@@ -352,6 +435,15 @@ pub fn deposit(asset: String, amount: u64) -> Result<String, CoreError> {
 #[tauri::command]
 pub fn ensure_trustlines() -> Result<core::trustline::TrustlineReport, CoreError> {
     core::trustline::ensure_trustlines()
+}
+
+/// Onboarding: create + fund the active account's Stellar account via the server funder
+/// (10 XLM), then establish its USDC/EURC trustlines LOCALLY (paid by the now-funded
+/// account). Idempotent; errors only if there's no funder and the account doesn't exist.
+/// Off-thread (funds, then polls + submits chain txs). (onboarding)
+#[tauri::command]
+pub async fn provision_account() -> Result<core::trustline::TrustlineReport, CoreError> {
+    blocking(core::trustline::provision_new_account).await
 }
 
 /// Send `amount` of `asset` privately to `recipient` (a shielded payment code). Builds +
@@ -390,6 +482,47 @@ pub async fn split(asset: String, recipients: Vec<SplitRecipientArg>) -> Result<
     .await
 }
 
+/// Send `amount` of `asset` from the active account's PUBLIC (classic) balance to a public
+/// `dest` (`G…` address): an ordinary, NON-private Stellar payment (no pool, no proof).
+/// Fee is relayer-sponsored. (public → public)
+#[tauri::command]
+pub async fn public_send(asset: String, dest: String, amount: u64) -> Result<String, CoreError> {
+    blocking(move || {
+        let wallet = core::keys::current_wallet()?;
+        let cfg = core::config::PoolConfig::load()?;
+        let relayer = cfg.relayer_secret.as_deref().unwrap_or_else(|| wallet.stellar_secret());
+        let info = core::config::asset_by_code(&asset)
+            .ok_or_else(|| CoreError::Crypto(format!("unknown asset {asset}")))?;
+        core::chain::submit_public_payment(
+            &cfg,
+            relayer,
+            wallet.stellar_secret(),
+            dest.trim(),
+            info.code,
+            info.issuer,
+            amount,
+        )
+    })
+    .await
+}
+
+/// Move `amount` of `asset` from the active account's PUBLIC balance into another wallet's
+/// SHIELDED account: shields into our own pool (deposit), then privately sends to `recipient`
+/// (an `ozky…` code). Two transactions; if the send fails the funds remain in our shielded
+/// balance (recoverable). (public → shielded)
+#[tauri::command]
+pub async fn public_to_shielded(
+    asset: String,
+    recipient: String,
+    amount: u64,
+) -> Result<String, CoreError> {
+    blocking(move || {
+        core::deposit::deposit(&asset, amount)?;
+        core::send::send(&asset, recipient.trim(), amount)
+    })
+    .await
+}
+
 /// A payee row for a payroll (shielded code + base-unit amount, optional cross-asset receive).
 #[derive(serde::Deserialize)]
 pub struct PayeeArg {
@@ -400,20 +533,35 @@ pub struct PayeeArg {
     pub recv_asset: Option<String>,
 }
 
+/// One funding group of a payroll (a funding asset + its payees).
+#[derive(serde::Deserialize)]
+pub struct PayGroupArg {
+    pub asset: String,
+    pub payees: Vec<PayeeArg>,
+}
+
 /// Payroll create/update input from the UI.
 #[derive(serde::Deserialize)]
 pub struct PayrollInput {
     /// 0 to create; an existing id to update.
     pub id: u64,
     pub label: String,
-    pub asset: String,
-    pub payees: Vec<PayeeArg>,
+    /// One group per funding asset (multi-token).
+    pub groups: Vec<PayGroupArg>,
     /// "weekly" | "monthly" | "days".
     pub cadence: String,
     /// interval days when cadence == "days".
     pub interval_days: u32,
     /// Unix seconds for the first run (defaults to now if 0).
     pub start_unix: i64,
+    /// Unix seconds to stop after (0 = no end).
+    pub end_unix: i64,
+    /// Stellar `G…` auditor address; empty = none.
+    pub auditor: String,
+    /// "auto" | "manual" (empty = manual).
+    pub approval: String,
+    /// "local" | "cloud" (empty = local).
+    pub run_location: String,
 }
 
 /// A payroll as shown in the UI (+ a computed `due` flag).
@@ -421,14 +569,28 @@ pub struct PayrollInput {
 pub struct PayrollView {
     pub id: u64,
     pub label: String,
-    pub asset: String,
-    pub payees: Vec<PayeeView>,
+    pub groups: Vec<PayGroupView>,
     pub cadence: String,
     pub interval_days: u32,
     pub next_run_unix: i64,
     pub last_run_unix: Option<i64>,
+    pub end_unix: Option<i64>,
+    pub auditor: Option<String>,
+    pub approval: Option<String>,
+    pub run_location: Option<String>,
     pub enabled: bool,
     pub due: bool,
+    /// Cross-group base-unit sum (rough; assets may differ).
+    pub total: u64,
+    /// First group's funding asset (or "USDC"), for compact list/calendar display.
+    pub primary_asset: String,
+    pub payee_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct PayGroupView {
+    pub asset: String,
+    pub payees: Vec<PayeeView>,
     pub total: u64,
 }
 
@@ -457,22 +619,44 @@ fn cadence_from(cadence: &str, interval_days: u32) -> core::payroll::Cadence {
 
 fn view(p: core::payroll::Payroll, now: i64) -> PayrollView {
     let (cadence, interval_days) = cadence_to_str(p.cadence);
+    let total = p.total();
+    let payee_count = p.payee_count() as u32;
+    let due = p.is_due(now);
+    let primary_asset = p.groups.first().map(|g| g.asset.clone()).unwrap_or_else(|| "USDC".into());
+    let groups = p
+        .groups
+        .iter()
+        .map(|g| PayGroupView {
+            asset: g.asset.clone(),
+            payees: g
+                .payees
+                .iter()
+                .map(|x| PayeeView {
+                    code: x.code.clone(),
+                    amount: x.amount,
+                    recv_asset: x.recv_asset.clone(),
+                })
+                .collect(),
+            total: g.payees.iter().map(|x| x.amount).sum(),
+        })
+        .collect();
     PayrollView {
         id: p.id,
         label: p.label.clone(),
-        asset: p.asset.clone(),
-        payees: p
-            .payees
-            .iter()
-            .map(|x| PayeeView { code: x.code.clone(), amount: x.amount, recv_asset: x.recv_asset.clone() })
-            .collect(),
+        groups,
         cadence,
         interval_days,
         next_run_unix: p.next_run_unix,
         last_run_unix: p.last_run_unix,
+        end_unix: p.end_unix,
+        auditor: p.auditor.clone(),
+        approval: p.approval.clone(),
+        run_location: p.run_location.clone(),
         enabled: p.enabled,
-        due: p.is_due(now),
-        total: p.total(),
+        due,
+        total,
+        primary_asset,
+        payee_count,
     }
 }
 
@@ -495,18 +679,35 @@ pub fn save_payroll(input: PayrollInput) -> Result<u64, CoreError> {
         .into_iter()
         .find(|p| p.id == input.id)
         .and_then(|p| p.last_run_unix);
+    let groups = input
+        .groups
+        .into_iter()
+        .map(|g| core::payroll::PayGroup {
+            asset: g.asset,
+            payees: g
+                .payees
+                .into_iter()
+                .map(|x| core::payroll::Payee {
+                    code: x.code,
+                    amount: x.amount,
+                    recv_asset: x.recv_asset,
+                })
+                .collect(),
+        })
+        .collect();
     let p = core::payroll::Payroll {
         id: input.id,
         label: input.label,
-        asset: input.asset,
-        payees: input
-            .payees
-            .into_iter()
-            .map(|x| core::payroll::Payee { code: x.code, amount: x.amount, recv_asset: x.recv_asset })
-            .collect(),
+        groups,
+        asset: String::new(),
+        payees: Vec::new(),
         cadence,
         next_run_unix: start,
         last_run_unix,
+        end_unix: if input.end_unix > 0 { Some(input.end_unix) } else { None },
+        auditor: if input.auditor.trim().is_empty() { None } else { Some(input.auditor) },
+        approval: if input.approval.trim().is_empty() { None } else { Some(input.approval) },
+        run_location: if input.run_location.trim().is_empty() { None } else { Some(input.run_location) },
         enabled: true,
     };
     core::payroll::upsert(&wallet, p)
@@ -690,6 +891,12 @@ pub struct SubscriptionInput {
     pub start_unix: i64,
     /// Unix seconds to stop after (0 = no end).
     pub end_unix: i64,
+    /// Stellar `G…` auditor address; empty = none.
+    pub auditor: String,
+    /// "auto" | "manual" (empty = manual).
+    pub approval: String,
+    /// "local" | "cloud" (empty = local).
+    pub run_location: String,
 }
 
 /// A subscription as shown in the UI (+ a computed `due` flag). (push subscriptions)
@@ -705,6 +912,9 @@ pub struct SubscriptionView {
     pub next_run_unix: i64,
     pub last_run_unix: Option<i64>,
     pub end_unix: Option<i64>,
+    pub auditor: Option<String>,
+    pub approval: Option<String>,
+    pub run_location: Option<String>,
     pub enabled: bool,
     pub due: bool,
 }
@@ -722,6 +932,9 @@ fn sub_view(s: core::subscriptions::Subscription, now: i64) -> SubscriptionView 
         next_run_unix: s.next_run_unix,
         last_run_unix: s.last_run_unix,
         end_unix: s.end_unix,
+        auditor: s.auditor.clone(),
+        approval: s.approval.clone(),
+        run_location: s.run_location.clone(),
         due: s.is_due(now),
         enabled: s.enabled,
     }
@@ -756,6 +969,9 @@ pub fn save_subscription(input: SubscriptionInput) -> Result<u64, CoreError> {
         next_run_unix: start,
         last_run_unix,
         end_unix: if input.end_unix > 0 { Some(input.end_unix) } else { None },
+        auditor: if input.auditor.trim().is_empty() { None } else { Some(input.auditor) },
+        approval: if input.approval.trim().is_empty() { None } else { Some(input.approval) },
+        run_location: if input.run_location.trim().is_empty() { None } else { Some(input.run_location) },
         enabled: true,
     };
     core::subscriptions::upsert(&wallet, s)
@@ -1240,4 +1456,12 @@ pub fn audit_disclosure(package: String) -> Result<String, CoreError> {
         "toEpoch": pkg["to_epoch"].as_u64().unwrap_or(0),
     }))
     .map_err(|e| CoreError::Crypto(format!("serialize audit: {e}")))
+}
+
+/// Forward a frontend log/error line to the dev terminal (stderr) so UI errors — Svelte
+/// reactive-loop aborts, render throws, unhandled rejections — are visible alongside the
+/// backend logs instead of only in the webview console. Dev aid; cheap and infallible.
+#[tauri::command]
+pub fn frontend_log(level: String, message: String) {
+    eprintln!("[ozky-ui:{level}] {message}");
 }

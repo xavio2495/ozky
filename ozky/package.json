@@ -9,12 +9,15 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev:services": "node scripts/dev-stack.mjs --no-app",
+    "dev:stack": "node scripts/dev-stack.mjs"
   },
   "license": "MIT",
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@xyflow/svelte": "^1.6.1",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
@@ -34,6 +37,7 @@
     "@types/qrcode": "^1.5.6",
     "bits-ui": "^2.18.1",
     "clsx": "^2.1.1",
+    "embla-carousel-svelte": "^8.6.0",
     "layerchart": "^2.0.0-next.48",
     "mode-watcher": "^1.1.0",
     "shadcn-svelte": "^1.3.0",

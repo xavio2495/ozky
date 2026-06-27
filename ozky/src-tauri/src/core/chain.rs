@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use stellar_xdr::curr::{
-    AccountId, AlphaNum4, AssetCode4, BeginSponsoringFutureReservesOp, BytesM,
+    AccountId, AlphaNum4, Asset, AssetCode4, BeginSponsoringFutureReservesOp, BytesM,
     ChangeTrustAsset, ChangeTrustOp, ContractId, CreateAccountOp, DecoratedSignature, Hash,
+    PaymentOp,
     HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntryData, LedgerKey,
     LedgerKeyAccount, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec,
@@ -21,6 +22,27 @@ use stellar_xdr::curr::{
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt256Parts, Uint256, VecM,
     WriteXdr,
 };
+
+/// Shared HTTP agent with bounded timeouts. ureq's default (the global `ureq::get`/`ureq::post`)
+/// has NO connect/read timeout, so a stalled RPC or Horizon socket blocks the calling thread —
+/// and therefore the Tauri `spawn_blocking` task driving a command — *forever*. That is the one
+/// path that can leave the UI's proving overlay open indefinitely (a panic or a clean `Err`
+/// both resolve the IPC; an unbounded socket read does not). Bounding the timeouts turns a stall
+/// into a clean transport error so the command always returns and the overlay always closes.
+fn http_agent() -> ureq::Agent {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(30))
+                .timeout_write(Duration::from_secs(30))
+                .build()
+        })
+        .clone()
+}
 
 /// Ledgers per epoch (FROZEN, matches the pool contract's `LEDGER_PER_EPOCH`).
 pub const LEDGER_PER_EPOCH: u64 = 110_000;
@@ -51,7 +73,7 @@ pub fn public_balances(addr: &str) -> Result<Vec<PublicBalance>, CoreError> {
         super::config::cfg_var("OZKY_HORIZON_URL").unwrap_or_else(|| DEFAULT_HORIZON_URL.into()),
         addr
     );
-    let resp = match ureq::get(&url).call() {
+    let resp = match http_agent().get(&url).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Ok(vec![]), // account not yet funded
         Err(e) => return Err(CoreError::Chain(format!("horizon: {e}"))),
@@ -104,30 +126,35 @@ pub struct PublicTx {
 /// withdraw legs are recorded on the shielded side (the wallet initiates and logs them), so this
 /// tab stays the "classic Stellar account" view. An unfunded account (404) returns an empty list.
 pub fn public_payments(addr: &str) -> Result<Vec<PublicTx>, CoreError> {
-    let url = format!(
-        "{}/accounts/{}/payments?order=desc&limit=50&join=transactions",
-        super::config::cfg_var("OZKY_HORIZON_URL").unwrap_or_else(|| DEFAULT_HORIZON_URL.into()),
-        addr
-    );
-    let resp = match ureq::get(&url).call() {
-        Ok(r) => r,
-        Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
-        Err(e) => return Err(CoreError::Chain(format!("horizon payments: {e}"))),
-    };
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| CoreError::Chain(format!("horizon payments decode: {e}")))?;
-    let records = v
-        .pointer("/_embedded/records")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let base = super::config::cfg_var("OZKY_HORIZON_URL").unwrap_or_else(|| DEFAULT_HORIZON_URL.into());
+    // Horizon caps a page at 200 records; follow `_links.next.href` so accounts with
+    // many payment ops (deposits/withdraws/swaps across sessions) return ALL of them,
+    // not just the first page. Cap pages so a huge account can't hang the UI.
+    const MAX_PAGES: usize = 25;
+    let mut url = format!("{base}/accounts/{addr}/payments?order=desc&limit=200&join=transactions");
 
     let str_at = |o: &serde_json::Value, k: &str| -> String {
         o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     let mut out = Vec::new();
-    for r in &records {
+    for _ in 0..MAX_PAGES {
+        let resp = match http_agent().get(&url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(404, _)) => return Ok(out),
+            Err(e) => return Err(CoreError::Chain(format!("horizon payments: {e}"))),
+        };
+        let v: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| CoreError::Chain(format!("horizon payments decode: {e}")))?;
+        let records = v
+            .pointer("/_embedded/records")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if records.is_empty() {
+            break;
+        }
+        for r in &records {
         let kind = str_at(r, "type");
         let hash = str_at(r, "transaction_hash");
         let ts = chrono_ms(&str_at(r, "created_at"));
@@ -165,6 +192,12 @@ pub fn public_payments(addr: &str) -> Result<Vec<PublicTx>, CoreError> {
                 });
             }
             _ => {} // skip non-payment operation types
+        }
+        }
+        // Follow the next-page link; Horizon embeds an absolute href.
+        match v.pointer("/_links/next/href").and_then(|h| h.as_str()) {
+            Some(next) if next != url && !next.is_empty() => url = next.to_string(),
+            _ => break,
         }
     }
     Ok(out)
@@ -222,7 +255,7 @@ pub struct PoolState {
 /// so callers like [`resolve_start`] can parse the RPC's retention floor out of it).
 fn rpc_call(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
     let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-    let resp: Value = ureq::post(rpc_url)
+    let resp: Value = http_agent().post(rpc_url)
         .send_json(body)
         .map_err(|e| format!("rpc {method} transport: {e}"))?
         .into_json()
@@ -262,12 +295,16 @@ struct RawEvent {
 }
 
 /// One `getEvents` page: (events, next cursor).
+/// Returns `(events, next_cursor, latest_ledger)`. `latest_ledger` is the RPC's current tip
+/// (its `latestLedger` field) — the highest ledger this page is known to cover. Resuming the
+/// scan from the tip (not just the highest *event* ledger) keeps the cached cursor inside the
+/// retention window even when the pool is briefly quiet, avoiding a full-window re-drain.
 fn get_events_page(
     rpc_url: &str,
     pool: &str,
     start_ledger: Option<u32>,
     cursor: Option<&str>,
-) -> Result<(Vec<RawEvent>, Option<String>), String> {
+) -> Result<(Vec<RawEvent>, Option<String>, u32), String> {
     let mut pagination = json!({ "limit": 200 });
     let mut params = json!({ "filters": [{ "type": "contract", "contractIds": [pool] }] });
     if let Some(c) = cursor {
@@ -279,6 +316,7 @@ fn get_events_page(
 
     let r = rpc_call(rpc_url, "getEvents", params)?;
     let cursor = r.get("cursor").and_then(|v| v.as_str()).map(String::from);
+    let latest_ledger = r.get("latestLedger").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let mut events = Vec::new();
     if let Some(arr) = r.get("events").and_then(|v| v.as_array()) {
         for e in arr {
@@ -294,7 +332,7 @@ fn get_events_page(
             });
         }
     }
-    Ok((events, cursor))
+    Ok((events, cursor, latest_ledger))
 }
 
 /// A start ledger inside the RPC's retention window: `latest - lookback`, or the
@@ -306,7 +344,7 @@ fn resolve_start(rpc_url: &str, pool: &str) -> Result<u32, String> {
         .ok_or("getLatestLedger: no sequence")? as u32;
     let want = latest.saturating_sub(SCAN_LOOKBACK).max(2);
     match get_events_page(rpc_url, pool, Some(want), None) {
-        Ok(_) => Ok(want),
+        Ok(..) => Ok(want),
         Err(e) => e
             .split("range:")
             .nth(1)
@@ -444,6 +482,13 @@ fn save_cache(pool: &str, c: &PoolCache) {
 /// (the Z6 drain: keep paging while the cursor advances; stop after a few empty windows
 /// once events have been seen).
 pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
+    // Serialize scans process-wide. Two pages mounting at once (e.g. dashboard + payroll)
+    // would otherwise drain CONCURRENTLY: double RPC load, a race writing the same cache
+    // file, and — observed — one request stalling the other. The second caller blocks here,
+    // then resumes from the cache the first just wrote (a fast no-op drain).
+    static SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _scan_guard = SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let pool = &cfg.pool_contract;
     let use_cache = std::env::var("OZKY_NO_POOL_CACHE").is_err();
 
@@ -468,15 +513,22 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
     let mut empty_run = 0u32;
     let mut max_ledger = start;
     let mut tried_fallback = false;
+    let log = cfg!(debug_assertions) || std::env::var("OZKY_SCAN_LOG").is_ok();
+    let drain_start = std::time::Instant::now();
+    let mut pages = 0u32;
+    if log {
+        eprintln!("[ozky-scan] drain start: use_cache={use_cache} start_ledger={start} cached_commits={}", commits.len());
+    }
 
     for _ in 0..MAX_PAGES {
+        pages += 1;
         let page = get_events_page(
             &cfg.rpc_url,
             pool,
             if cursor.is_none() { Some(start) } else { None },
             cursor.as_deref(),
         );
-        let (events, next) = match page {
+        let (events, next, latest_ledger) = match page {
             Ok(p) => p,
             // The cached cursor aged out of the RPC retention window: fall back to a
             // fresh in-window start ONCE (older cached commits stay; the unqueryable gap
@@ -485,12 +537,21 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
                 tried_fallback = true;
                 start = resolve_start(&cfg.rpc_url, pool).map_err(CoreError::Chain)?;
                 max_ledger = max_ledger.max(start);
+                if log {
+                    eprintln!("[ozky-scan] cached cursor aged out → fresh start_ledger={start}");
+                }
                 continue;
             }
             Err(e) => return Err(CoreError::Chain(e)),
         };
         let n = events.len();
         total += n;
+        // Advance to the tip this page covers — NOT just the highest event ledger — so the
+        // saved `cursor_ledger` tracks the chain head and the next scan resumes near it even
+        // when the pool produced no events (otherwise the cursor ages out → full re-drain).
+        if latest_ledger > max_ledger {
+            max_ledger = latest_ledger;
+        }
 
         for raw in &events {
             if raw.ledger > max_ledger {
@@ -528,6 +589,15 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
     }
 
     commits.sort_by_key(|c| c.leaf_index);
+
+    if log {
+        eprintln!(
+            "[ozky-scan] drain done: {pages} pages, {total} new events, {} commits, {} nullifiers, tip={max_ledger} in {:?}",
+            commits.len(),
+            nullifiers.len(),
+            drain_start.elapsed()
+        );
+    }
 
     if use_cache {
         save_cache(
@@ -585,7 +655,7 @@ pub fn approved_set(cfg: &PoolConfig) -> Result<Vec<Fr>, CoreError> {
     let mut empty_run = 0u32;
 
     for _ in 0..MAX_PAGES {
-        let (events, next) = get_events_page(
+        let (events, next, _) = get_events_page(
             &cfg.rpc_url,
             policy,
             if cursor.is_none() { Some(start) } else { None },
@@ -1065,6 +1135,122 @@ pub fn submit_sponsored_trustlines(
     submit_and_poll(&cfg.rpc_url, "trustlines", &env_b64)
 }
 
+/// Establish classic trustlines on the user's OWN account, signed + fee-paid by the user —
+/// no relayer, no sponsorship. The account must already exist and hold enough XLM for each
+/// new trustline's base reserve (~0.5 XLM) plus fees; onboarding funds it first via the
+/// funder service. One `ChangeTrust` op per asset (sourced by the tx source = the user).
+/// `rpc_url`/`network_passphrase` come from the wallet config (no pool config needed).
+/// Returns the tx hash. `user_secret` is signed natively and never leaves this process.
+pub fn submit_local_trustlines(
+    rpc_url: &str,
+    network_passphrase: &str,
+    user_secret: &str,
+    assets: &[(&str, &str)],
+) -> Result<String, CoreError> {
+    if assets.is_empty() {
+        return Err(CoreError::Chain("no trustlines to establish".into()));
+    }
+    let user = super::sign::Signer::from_secret(user_secret)?;
+
+    let mut ops: Vec<Operation> = Vec::new();
+    for (code, issuer) in assets {
+        ops.push(Operation {
+            source_account: None, // tx source = the user
+            body: OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: asset_code4(code)?,
+                    issuer: account_id(issuer)?,
+                }),
+                limit: i64::MAX,
+            }),
+        });
+    }
+
+    let fee = BASE_FEE.saturating_mul(ops.len() as u32);
+    let operations: VecM<Operation, 100> =
+        ops.try_into().map_err(|_| CoreError::Chain("too many trustline ops".into()))?;
+    let seq = account_seq(rpc_url, &user.account_id())? + 1;
+    let tx = Transaction {
+        source_account: user.muxed(),
+        fee,
+        seq_num: SequenceNumber(seq),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations,
+        ext: TransactionExt::V0,
+    };
+
+    let sig = super::sign::sign_transaction(&user, network_passphrase, &tx)?;
+    let signatures: VecM<DecoratedSignature, 20> =
+        vec![sig].try_into().map_err(|_| CoreError::Chain("signatures".into()))?;
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures });
+    let env_b64 = env
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr envelope: {e}")))?;
+    submit_and_poll(rpc_url, "trustlines", &env_b64)
+}
+
+/// Submit a classic Stellar PAYMENT from the user's public (classic) account to `dest`
+/// (a `G…` address) — an ordinary, NON-private payment (no pool, no proof). Fee-sponsored
+/// by the relayer: the relayer is the tx source (pays the fee), the user sources the
+/// `Payment` op and co-signs, so the user spends only the asset. `issuer = None` ⇒ native XLM.
+pub fn submit_public_payment(
+    cfg: &PoolConfig,
+    relayer_secret: &str,
+    user_secret: &str,
+    dest: &str,
+    asset_code: &str,
+    issuer: Option<&str>,
+    amount: u64,
+) -> Result<String, CoreError> {
+    let relayer = super::sign::Signer::from_secret(relayer_secret)?;
+    let user = super::sign::Signer::from_secret(user_secret)?;
+    let dest_pk = stellar_strkey::ed25519::PublicKey::from_string(dest)
+        .map_err(|e| CoreError::Chain(format!("bad destination {dest}: {e}")))?;
+    let destination = MuxedAccount::Ed25519(Uint256(dest_pk.0));
+
+    let asset = match issuer {
+        None => Asset::Native,
+        Some(iss) => Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: asset_code4(asset_code)?,
+            issuer: account_id(iss)?,
+        }),
+    };
+    let amt: i64 = amount
+        .try_into()
+        .map_err(|_| CoreError::Chain("payment amount too large".into()))?;
+
+    let op = Operation {
+        source_account: Some(user.muxed()),
+        body: OperationBody::Payment(PaymentOp { destination, asset, amount: amt }),
+    };
+    let operations: VecM<Operation, 100> =
+        vec![op].try_into().map_err(|_| CoreError::Chain("ops".into()))?;
+    let seq = account_seq(&cfg.rpc_url, &relayer.account_id())? + 1;
+    let tx = Transaction {
+        source_account: relayer.muxed(),
+        fee: BASE_FEE,
+        seq_num: SequenceNumber(seq),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations,
+        ext: TransactionExt::V0,
+    };
+
+    // Co-sign: relayer (tx source / fee) + user (Payment op source). Identical when no
+    // separate relayer is configured — duplicate signatures are harmless.
+    let sig_relayer = super::sign::sign_transaction(&relayer, &cfg.network_passphrase, &tx)?;
+    let sig_user = super::sign::sign_transaction(&user, &cfg.network_passphrase, &tx)?;
+    let signatures: VecM<DecoratedSignature, 20> = vec![sig_relayer, sig_user]
+        .try_into()
+        .map_err(|_| CoreError::Chain("signatures".into()))?;
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures });
+    let env_b64 = env
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr envelope: {e}")))?;
+    submit_and_poll(&cfg.rpc_url, "payment", &env_b64)
+}
+
 /// Submit a `transfer` to the pool. Returns the transaction hash.
 pub fn submit_transfer(
     cfg: &PoolConfig,
@@ -1345,7 +1531,7 @@ pub fn escrow_contributions(cfg: &PoolConfig, escrow_id: u64) -> Result<Vec<Vec<
     let mut seen = 0usize;
 
     for _ in 0..MAX_PAGES {
-        let (events, next) = get_events_page(
+        let (events, next, _) = get_events_page(
             &cfg.rpc_url,
             pool,
             if cursor.is_none() { Some(start) } else { None },
@@ -1560,7 +1746,7 @@ pub fn channel_open_blob(cfg: &PoolConfig, channel_id: u64) -> Result<Option<Vec
     let mut seen = 0usize;
 
     for _ in 0..MAX_PAGES {
-        let (events, next) = get_events_page(
+        let (events, next, _) = get_events_page(
             &cfg.rpc_url,
             pool,
             if cursor.is_none() { Some(start) } else { None },

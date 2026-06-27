@@ -2,18 +2,20 @@
 	import '../app.css';
 	import { onMount } from 'svelte';
 	import Titlebar from '$lib/components/chrome/Titlebar.svelte';
-	import Sidebar from '$lib/components/nav/Sidebar.svelte';
+	import TopNav from '$lib/components/nav/TopNav.svelte';
 	import Onboarding from '$lib/components/onboarding/Onboarding.svelte';
 	import SignIn from '$lib/components/onboarding/SignIn.svelte';
 	import RuneGlyphField from '$lib/components/chrome/RuneGlyphField.svelte';
 	import { Toaster } from '$lib/components/ui/sonner';
 	import { Spinner } from '$lib/components/ui/spinner';
 	import { wallet } from '$lib/wallet.svelte';
+	import { installDevLog } from '$lib/devlog';
 
 	const { children } = $props();
 
 	let ready = $state(false);
 	onMount(async () => {
+		installDevLog();
 		try {
 			await wallet.refreshStatus();
 			if (wallet.unlocked) await wallet.loadSession();
@@ -25,7 +27,7 @@
 	});
 </script>
 
-<Toaster theme="dark" position="bottom-right" richColors />
+<Toaster theme="dark" position="top-center" richColors />
 
 <div class="app">
 	<Titlebar />
@@ -47,10 +49,13 @@
 			</div>
 		{:else}
 			<div class="body">
-				<Sidebar />
-				<main class="content">
-					{@render children()}
-				</main>
+				<RuneGlyphField />
+				<div class="shell">
+					<TopNav />
+					<main class="content">
+						{@render children()}
+					</main>
+				</div>
 			</div>
 		{/if}
 	</div>
@@ -69,10 +74,20 @@
 		min-height: 0;
 	}
 	.body {
-		display: flex;
+		position: relative;
 		flex: 1;
 		min-height: 0;
 		width: 100%;
+		overflow: hidden;
+	}
+	/* The rune field is an absolute z-0 backdrop; the shell floats above it. */
+	.shell {
+		position: relative;
+		z-index: 1;
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
 	}
 	.content {
 		flex: 1;

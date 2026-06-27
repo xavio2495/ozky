@@ -8,15 +8,16 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Textarea } from '$lib/components/ui/textarea';
 	import CopyButton from '$lib/components/shared/CopyButton.svelte';
+	import AccountAvatar from './AccountAvatar.svelte';
 	import { wallet } from '$lib/wallet.svelte';
-	import { MAX_ACCOUNTS, errMessage } from '$lib/api';
+	import { api, MAX_ACCOUNTS, errMessage } from '$lib/api';
 	import { truncate } from '$lib/format';
 	import { toast } from 'svelte-sonner';
 	import ChevronsUpDownIcon from '@lucide/svelte/icons/chevrons-up-down';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import DownloadIcon from '@lucide/svelte/icons/download';
-	import WalletIcon from '@lucide/svelte/icons/wallet';
+	import PencilIcon from '@lucide/svelte/icons/pencil';
 	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
 
 	let open = $state(false);
@@ -26,10 +27,21 @@
 	let revealOpen = $state(false);
 	let newPhrase = $state('');
 
+	// Funder + trustline provisioning for the freshly-created account (shown in the reveal dialog).
+	let provisioning = $state(false);
+	let provisionDone = $state(false);
+	let provisionError = $state('');
+	let provisionResult = $state<{ created: boolean; added: string[] } | null>(null);
+
 	// Import dialog.
 	let importOpen = $state(false);
 	let importText = $state('');
 	let importLabel = $state('');
+
+	// Rename dialog.
+	let renameOpen = $state(false);
+	let renameIndex = $state(0);
+	let renameValue = $state('');
 
 	const active = $derived(wallet.activeAccount);
 	const atLimit = $derived(wallet.accounts.length >= MAX_ACCOUNTS);
@@ -60,10 +72,51 @@
 			newPhrase = created.mnemonic;
 			open = false;
 			revealOpen = true;
+			// The new account is its own fresh Stellar account — fund it (10 XLM via the funder)
+			// and add its USDC/EURC trustlines, same as onboarding. Runs while the user backs up
+			// the phrase; status shows in the reveal dialog + a toast on completion.
+			void provisionNew();
 		} catch (e) {
 			toast.error('Could not create account', { description: errMessage(e) });
 		} finally {
 			busy = false;
+		}
+	}
+
+	async function provisionNew() {
+		provisioning = true;
+		provisionDone = false;
+		provisionError = '';
+		provisionResult = null;
+		const id = toast.loading('Funding new account & setting up trustlines…');
+		try {
+			const r = await api.provisionAccount();
+			provisionResult = { created: r.account_created, added: r.added };
+			await wallet.refreshPublicBalances();
+			toast.success('New account ready', {
+				id,
+				description: r.account_created
+					? `Funded with 10 XLM${r.added.length ? ` · trustlines ${r.added.join(', ')}` : ''}`
+					: r.added.length
+						? `Trustlines added: ${r.added.join(', ')}`
+						: 'Account already set up'
+			});
+		} catch (e) {
+			provisionError = errMessage(e);
+			toast.error('Account funding failed', { id, description: errMessage(e) });
+		} finally {
+			provisioning = false;
+			provisionDone = true;
+		}
+	}
+
+	async function maybeProvisionImported() {
+		// Only auto-provision a BLANK imported account — one with no Stellar account on-chain
+		// yet (no XLM, no trustlines), e.g. a freshly generated seed that was never funded.
+		// importAccount already refreshed publicBalances for the now-active imported account;
+		// an empty list means Horizon has no account (404). An established wallet is untouched.
+		if (wallet.publicBalances.length === 0) {
+			await provisionNew();
 		}
 	}
 
@@ -84,8 +137,29 @@
 			await wallet.importAccount(importText.trim(), importLabel.trim() || undefined);
 			importOpen = false;
 			toast.success('Wallet imported');
+			void maybeProvisionImported();
 		} catch (e) {
 			toast.error('Could not import', { description: errMessage(e) });
+		} finally {
+			busy = false;
+		}
+	}
+
+	function openRename(index: number, label: string) {
+		renameIndex = index;
+		renameValue = label;
+		open = false;
+		renameOpen = true;
+	}
+
+	async function doRename() {
+		busy = true;
+		try {
+			await wallet.renameAccount(renameIndex, renameValue.trim());
+			renameOpen = false;
+			toast.success('Account renamed');
+		} catch (e) {
+			toast.error('Could not rename', { description: errMessage(e) });
 		} finally {
 			busy = false;
 		}
@@ -96,9 +170,7 @@
 	<Popover.Trigger>
 		{#snippet child({ props })}
 			<button {...props} class="trigger" disabled={busy}>
-				<span class="grid size-8 place-items-center rounded-md bg-primary/15 text-primary">
-					<WalletIcon class="size-4" />
-				</span>
+				<AccountAvatar seed={active?.address ?? ''} size={32} />
 				<span class="min-w-0 flex-1 text-left">
 					<span class="block truncate text-sm font-medium">{active?.label ?? 'Account'}</span>
 					<span class="block truncate font-mono text-[11px] text-muted-foreground">
@@ -115,18 +187,27 @@
 		</p>
 		<div class="flex flex-col gap-0.5">
 			{#each wallet.accounts as acct (acct.index)}
-				<button class="row" onclick={() => select(acct.index)} disabled={busy}>
-					<span class="grid size-7 place-items-center rounded-md bg-muted text-xs font-semibold">
-						{acct.index + 1}
-					</span>
-					<span class="min-w-0 flex-1 text-left">
-						<span class="block truncate text-sm">{acct.label}</span>
-						<span class="block truncate font-mono text-[11px] text-muted-foreground">
-							{truncate(acct.address, 6, 6)}
+				<div class="row" class:active={acct.active}>
+					<button class="row-main" onclick={() => select(acct.index)} disabled={busy}>
+						<AccountAvatar seed={acct.address} size={28} />
+						<span class="min-w-0 flex-1 text-left">
+							<span class="block truncate text-sm">{acct.label}</span>
+							<span class="block truncate font-mono text-[11px] text-muted-foreground">
+								{truncate(acct.address, 6, 6)}
+							</span>
 						</span>
-					</span>
-					{#if acct.active}<CheckIcon class="size-4 text-primary" />{/if}
-				</button>
+						{#if acct.active}<CheckIcon class="size-4 text-primary" />{/if}
+					</button>
+					<button
+						class="rename-btn"
+						title="Rename"
+						aria-label="Rename {acct.label}"
+						onclick={() => openRename(acct.index, acct.label)}
+						disabled={busy}
+					>
+						<PencilIcon class="size-3.5" />
+					</button>
+				</div>
 			{/each}
 		</div>
 		<div class="mt-1.5 flex flex-col gap-0.5 border-t border-border pt-1.5">
@@ -163,6 +244,23 @@
 			<TriangleAlertIcon />
 			<Alert.Description>Anyone with this phrase controls this account's funds.</Alert.Description>
 		</Alert.Root>
+		<div class="prov" class:ok={provisionDone && !provisionError} class:warn={!!provisionError}>
+			{#if provisioning}
+				<Spinner class="size-4" />
+				<span>Funding account &amp; setting up trustlines…</span>
+			{:else if provisionError}
+				<TriangleAlertIcon class="size-4" />
+				<span>Couldn't auto-fund this account — set it up later from Settings.</span>
+			{:else if provisionDone}
+				<CheckIcon class="size-4" />
+				<span>
+					{provisionResult?.created ? 'Funded with 10 XLM' : 'Account ready'}{provisionResult &&
+					provisionResult.added.length
+						? ` · trustlines ${provisionResult.added.join(', ')}`
+						: ''}
+				</span>
+			{/if}
+		</div>
 		<Dialog.Footer>
 			<CopyButton text={newWords.join(' ')} label="Copy phrase" />
 			<Button onclick={() => (revealOpen = false)}>I've saved it</Button>
@@ -198,15 +296,43 @@
 	</Dialog.Content>
 </Dialog.Root>
 
+<!-- Rename an account -->
+<Dialog.Root bind:open={renameOpen}>
+	<Dialog.Content>
+		<Dialog.Header>
+			<Dialog.Title>Rename account</Dialog.Title>
+			<Dialog.Description>Give this account a name you'll recognise.</Dialog.Description>
+		</Dialog.Header>
+		<Field.Group>
+			<Field.Field>
+				<Field.Label for="rename-label">Account name</Field.Label>
+				<Input
+					id="rename-label"
+					bind:value={renameValue}
+					placeholder="e.g. Savings"
+					onkeydown={(e) => e.key === 'Enter' && doRename()}
+				/>
+			</Field.Field>
+		</Field.Group>
+		<Dialog.Footer>
+			<Button variant="outline" onclick={() => (renameOpen = false)} disabled={busy}>Cancel</Button>
+			<Button onclick={doRename} disabled={busy}>
+				{#if busy}<Spinner data-icon="inline-start" />{/if}
+				Save
+			</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
+
 <style>
 	.trigger {
 		display: flex;
 		align-items: center;
 		gap: 10px;
 		width: 100%;
-		padding: 8px 10px;
+		padding: 6px 12px 6px 6px;
 		border: 1px solid var(--border);
-		border-radius: var(--radius-md);
+		border-radius: 9999px;
 		background: color-mix(in oklch, var(--card) 50%, transparent);
 		transition: border-color 0.15s ease, background 0.15s ease;
 	}
@@ -216,13 +342,58 @@
 	.row {
 		display: flex;
 		align-items: center;
-		gap: 10px;
-		padding: 7px 8px;
+		gap: 2px;
 		border-radius: var(--radius-sm);
 		transition: background 0.12s ease;
 	}
 	.row:hover {
 		background: var(--accent);
+	}
+	/* Recolour the account label, address, and check icon to read on the gold hover fill. */
+	.row:hover .row-main,
+	.row:hover .row-main span,
+	.row:hover .row-main :global(svg) {
+		color: var(--accent-foreground);
+	}
+	.row-main {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex: 1;
+		min-width: 0;
+		padding: 7px 8px;
+	}
+	.rename-btn {
+		display: grid;
+		place-items: center;
+		width: 28px;
+		height: 28px;
+		flex-shrink: 0;
+		margin-right: 6px;
+		border-radius: var(--radius-sm);
+		color: var(--muted-foreground);
+		opacity: 0;
+		transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+	}
+	.row:hover .rename-btn {
+		opacity: 1;
+	}
+	.rename-btn:hover {
+		color: var(--primary);
+		background: color-mix(in oklch, var(--primary) 12%, transparent);
+	}
+	.prov {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 0.8125rem;
+		color: var(--muted-foreground);
+	}
+	.prov.ok {
+		color: var(--primary);
+	}
+	.prov.warn {
+		color: var(--destructive);
 	}
 	.phrase {
 		display: grid;

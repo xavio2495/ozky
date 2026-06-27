@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+# Two binaries exist (ozky desktop app + ozky-keeper cloud service); without this
+# `cargo run` / `tauri dev` can't pick one. The desktop app is the default.
+default-run = "ozky"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

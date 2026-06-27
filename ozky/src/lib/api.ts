@@ -16,25 +16,40 @@ export type NewAccount = { index: number; mnemonic: string };
 
 export const MAX_ACCOUNTS = 5;
 
+/** One account's recovery phrase, for the global "export all recovery codes" backup. */
+export type RecoveryExport = { index: number; label: string; mnemonic: string };
+
 /** A public (unshielded) balance on the wallet's classic Stellar account. */
 export type PublicBalance = { code: string; balance: string; issuer: string | null };
 
 /** A payroll payee (shielded code + base-unit amount, optional cross-asset receive). */
 export type Payee = { code: string; amount: number; recv_asset?: string };
 
+/** One funding group of a payroll: a funding asset + its payees (a tab in the composer). */
+export type PayGroup = { asset: string; payees: Payee[]; total: number };
+
 /** A payroll as returned by the backend (+ computed `due`). */
 export type Payroll = {
 	id: number;
 	label: string;
-	asset: string;
-	payees: Payee[];
+	groups: PayGroup[];
 	cadence: string; // "weekly" | "monthly" | "days"
 	interval_days: number;
 	next_run_unix: number;
 	last_run_unix: number | null;
+	end_unix: number | null;
+	auditor: string | null;
+	/** "auto" | "manual" (null = manual). */
+	approval: string | null;
+	/** "local" | "cloud" (null = local). */
+	run_location: string | null;
 	enabled: boolean;
 	due: boolean;
+	/** Cross-group base-unit sum (rough; assets may differ). */
 	total: number;
+	/** First group's funding asset, for compact list/calendar display. */
+	primary_asset: string;
+	payee_count: number;
 };
 
 /** A headless-keeper armed run summary (no proof bytes). */
@@ -52,11 +67,18 @@ export type KeeperRun = {
 export type PayrollInput = {
 	id: number;
 	label: string;
-	asset: string;
-	payees: Payee[];
+	groups: { asset: string; payees: Payee[] }[];
 	cadence: string;
 	interval_days: number;
 	start_unix: number;
+	/** Unix seconds to stop after; 0 = no end. */
+	end_unix: number;
+	/** Stellar `G…` auditor address; empty = none. */
+	auditor: string;
+	/** "auto" | "manual" (empty = manual). */
+	approval: string;
+	/** "local" | "cloud" (empty = local). */
+	run_location: string;
 };
 
 /** A push subscription as returned by the backend (+ computed `due`). */
@@ -71,6 +93,9 @@ export type Subscription = {
 	next_run_unix: number;
 	last_run_unix: number | null;
 	end_unix: number | null;
+	auditor: string | null;
+	approval: string | null;
+	run_location: string | null;
 	enabled: boolean;
 	due: boolean;
 };
@@ -86,6 +111,12 @@ export type SubscriptionInput = {
 	interval_days: number;
 	start_unix: number;
 	end_unix: number;
+	/** Stellar `G…` auditor address; empty = none. */
+	auditor: string;
+	/** "auto" | "manual" (empty = manual). */
+	approval: string;
+	/** "local" | "cloud" (empty = local). */
+	run_location: string;
 };
 
 /** One contribution this wallet made to an escrow (for the refund affordance). */
@@ -210,11 +241,20 @@ export type TrustlineReport = {
 	tx: string | null;
 };
 
+/** One disclosed note in an audit result (its opening, re-verified against the on-chain leaf). */
+export type DisclosedNote = {
+	leaf_index: number;
+	value: number;
+	asset_tag: string;
+	epoch: number;
+	commitment: string;
+};
+
 /** Result of `audit_disclosure`: a verified, read-only view of an owner's notes for a
  * time-bounded epoch range. */
 export type AuditResult = {
 	total: number;
-	notes: unknown[];
+	notes: DisclosedNote[];
 	fromEpoch: number;
 	toEpoch: number;
 };
@@ -224,8 +264,12 @@ export const api = {
 	createWallet: (password: string) => invoke<WalletSetup>('create_wallet', { password }),
 	restoreWallet: (phrase: string, password: string) =>
 		invoke<WalletSetup>('restore_wallet', { phrase, password }),
+	/** Confirm onboarding 2FA + commit the staged wallet. `false` ⇒ wrong code (retry). */
+	finishSetup: (code: string) => invoke<boolean>('finish_setup', { code }),
 	unlock: (password: string, code: string) => invoke<void>('unlock', { password, code }),
 	lock: () => invoke<void>('lock'),
+	logout: () => invoke<void>('logout'),
+	exportRecoveryPhrases: () => invoke<RecoveryExport[]>('export_recovery_phrases'),
 	verifyTotp: (code: string) => invoke<boolean>('verify_totp', { code }),
 
 	listAccounts: () => invoke<AccountInfo[]>('list_accounts'),
@@ -234,6 +278,8 @@ export const api = {
 	importAccount: (phrase: string, label?: string) =>
 		invoke<number>('import_account', { phrase, label: label ?? null }),
 	switchAccount: (index: number) => invoke<void>('switch_account', { index }),
+	renameAccount: (index: number, label: string) =>
+		invoke<void>('rename_account', { index, label }),
 
 	publicBalances: () => invoke<PublicBalance[]>('public_balances'),
 	assetPrices: () => invoke<Spot[]>('asset_prices'),
@@ -257,6 +303,10 @@ export const api = {
 	deposit: (asset: string, amount: number) => invoke<string>('deposit', { asset, amount }),
 	send: (asset: string, recipient: string, amount: number) =>
 		invoke<string>('send', { asset, recipient, amount }),
+	publicSend: (asset: string, dest: string, amount: number) =>
+		invoke<string>('public_send', { asset, dest, amount }),
+	publicToShielded: (asset: string, recipient: string, amount: number) =>
+		invoke<string>('public_to_shielded', { asset, recipient, amount }),
 	consolidate: (asset: string) => invoke<string>('consolidate', { asset }),
 	split: (asset: string, recipients: { recipient: string; amount: number }[]) =>
 		invoke<string>('split', { asset, recipients }),
@@ -335,6 +385,8 @@ export const api = {
 		invoke<string[]>('multi_send', { payAsset, recipients }),
 
 	ensureTrustlines: () => invoke<TrustlineReport>('ensure_trustlines'),
+	/** Onboarding: fund the new account via the server funder (10 XLM) + add trustlines locally. */
+	provisionAccount: () => invoke<TrustlineReport>('provision_account'),
 
 	fundingAddress: () => invoke<string>('funding_address'),
 	receiveAddress: () => invoke<string>('receive_address'),

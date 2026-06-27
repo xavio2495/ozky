@@ -28,6 +28,7 @@ pub mod disclose;
 pub mod encrypt;
 pub mod enroll;
 pub mod escrow;
+pub mod funder;
 pub mod history;
 pub mod keeper;
 pub mod keeper_task;

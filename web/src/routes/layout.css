@@ -1,3 +1,69 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 @plugin '@tailwindcss/typography';
+
+@theme {
+	/* Palette — exactly three colors site-wide. No opacity, gradients, or tints. */
+	--color-gold: #ffd60a; /* primary accent */
+	--color-ink: #222222; /* dark panels / text */
+	--color-grey: #bababa; /* light surfaces / muted text */
+
+	/* Legacy token aliases (map onto the 3-color palette; sections migrate to gold/ink/grey) */
+	--color-orange: #ffd60a;
+	--color-coal: #222222;
+	--color-paper: #bababa;
+	--color-line: #222222;
+
+	/* Type */
+	--font-display: 'Inter', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: 'Space Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+	/* Brutalist: no rounded corners anywhere by default */
+	--radius-xs: 0;
+	--radius-sm: 0;
+	--radius-md: 0;
+	--radius-lg: 0;
+	--radius-xl: 0;
+	--radius-2xl: 0;
+	--radius-3xl: 0;
+}
+
+@layer base {
+	html {
+		background: var(--color-grey);
+		color: var(--color-ink);
+		-webkit-font-smoothing: antialiased;
+		text-rendering: optimizeLegibility;
+	}
+
+	body {
+		font-family: var(--font-display);
+		overflow-x: hidden;
+	}
+
+	/* Tight display tracking for oversized grotesque headlines */
+	.font-display {
+		letter-spacing: -0.02em;
+	}
+
+	/* Technical monospace caption treatment */
+	.mono {
+		font-family: var(--font-mono);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+}
+
+/* Lenis smooth-scroll requirements */
+html.lenis,
+html.lenis body {
+	height: auto;
+}
+
+.lenis.lenis-smooth {
+	scroll-behavior: auto !important;
+}
+
+.lenis.lenis-stopped {
+	overflow: hidden;
+}

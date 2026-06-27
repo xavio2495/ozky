@@ -41,7 +41,7 @@ pub fn u256_from_hex(env: &Env, h: &str) -> Option<U256> {
     Some(U256::from_be_bytes(env, &Bytes::from_array(env, &bytes)))
 }
 
-pub fn u256_to_hex(env: &Env, v: &U256) -> String {
+pub fn u256_to_hex(_env: &Env, v: &U256) -> String {
     let bytes = v.to_be_bytes();
     let mut arr = [0u8; 32];
     bytes.copy_into_slice(&mut arr);

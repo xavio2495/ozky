@@ -66,8 +66,8 @@ pub struct Commit {
 #[derive(Clone, Debug)]
 pub enum PoolEvent {
     Commit(Commit),
-    Nullifier { value: String, ledger: u32 },
-    Roots { commitment_root: String, nullifier_root: String, ledger: u32 },
+    Nullifier { value: String },
+    Roots { commitment_root: String, nullifier_root: String },
 }
 
 pub fn classify(e: &RawEvent) -> Option<PoolEvent> {
@@ -107,14 +107,12 @@ pub fn classify(e: &RawEvent) -> Option<PoolEvent> {
         }
         "nullif" => Some(PoolEvent::Nullifier {
             value: u256_hex(&value)?,
-            ledger: e.ledger,
         }),
         "roots" => {
             if let ScVal::Vec(Some(items)) = &value {
                 Some(PoolEvent::Roots {
                     commitment_root: u256_hex(items.get(0)?)?,
                     nullifier_root: u256_hex(items.get(1)?)?,
-                    ledger: e.ledger,
                 })
             } else {
                 None

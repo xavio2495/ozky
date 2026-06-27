@@ -11,7 +11,6 @@ pub struct Rpc {
 #[derive(Clone, Debug)]
 pub struct RawEvent {
     pub ledger: u32,
-    pub id: String,
     pub tx_hash: String,
     /// Base64 XDR of each topic ScVal.
     pub topics: Vec<String>,
@@ -94,7 +93,6 @@ impl Rpc {
                     .unwrap_or_default();
                 events.push(RawEvent {
                     ledger: e.get("ledger").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    id: e.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     tx_hash: e.get("txHash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     topics,
                     value: e.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),

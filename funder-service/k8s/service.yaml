@@ -1,0 +1,16 @@
+# External LoadBalancer fronting the funder. The app POSTs http://<EXTERNAL-IP>/fund.
+# (For TLS/a stable hostname, put a GKE Ingress + ManagedCertificate in front instead.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ozky-funder
+  labels:
+    app: ozky-funder
+spec:
+  type: LoadBalancer
+  selector:
+    app: ozky-funder
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

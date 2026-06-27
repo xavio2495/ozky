@@ -64,11 +64,28 @@ pub fn poll_once(rpc: &Rpc, pool: &str, state: &Arc<Mutex<State>>) -> Result<usi
             let s = state.lock().unwrap();
             (s.cursor.clone(), s.start_ledger)
         };
-        let page = rpc.get_events(
+        let page = match rpc.get_events(
             pool,
             if cursor.is_none() { Some(start) } else { None },
             cursor.as_deref(),
-        )?;
+        ) {
+            Ok(p) => p,
+            // The start ledger / cursor fell behind the RPC's sliding retention window. Its
+            // lower bound advances as ledgers close, so a start picked near the edge (the
+            // default lookback ≈ the retention span) — or a cursor that sat through enough
+            // closes — eventually drops out of range. Re-anchor to the current floor, drop
+            // the stale cursor, and retry; the forward re-scan is idempotent (ingest dedups).
+            Err(e) if is_retention_error(&e) => {
+                let Some(floor) = parse_range_floor(&e) else {
+                    return Err(e);
+                };
+                let mut s = state.lock().unwrap();
+                s.start_ledger = floor;
+                s.cursor = None;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let n = page.events.len();
         total += n;
 
@@ -105,4 +122,22 @@ pub fn poll_once(rpc: &Rpc, pool: &str, state: &Arc<Mutex<State>>) -> Result<usi
         }
     }
     Ok(total)
+}
+
+/// The Soroban RPC error raised when the requested startLedger/cursor is outside the node's
+/// retained ledger window. Message shape: "… must be within the ledger range: <lo> - <hi>".
+fn is_retention_error(e: &str) -> bool {
+    e.contains("must be within the ledger range")
+}
+
+/// Parse `<lo>` (the current retention floor) out of that error message.
+fn parse_range_floor(e: &str) -> Option<u32> {
+    e.split("range:")
+        .nth(1)?
+        .trim()
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }

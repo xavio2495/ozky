@@ -41,9 +41,16 @@ fn main() {
     );
 
     let rpc = Rpc::new(rpc_url.clone());
-    let start = rpc
-        .resolve_start(&pool, lookback)
-        .expect("resolve start ledger");
+    // Don't die on a transient startup network/DNS hiccup — retry until the RPC answers.
+    let start = loop {
+        match rpc.resolve_start(&pool, lookback) {
+            Ok(s) => break s,
+            Err(e) => {
+                eprintln!("ozky-indexer: resolve start ledger failed ({e}); retrying in 5s…");
+                thread::sleep(Duration::from_secs(5));
+            }
+        }
+    };
     eprintln!("ozky-indexer: pool={pool} rpc={rpc_url} start_ledger={start} port={port}");
 
     let state = Arc::new(Mutex::new(State {

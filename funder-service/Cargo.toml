@@ -1,0 +1,27 @@
+[package]
+name = "ozky-funder-service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Onboarding account funder (scope: server/GKE funder). A tiny HTTP service that, given a
+# brand-new wallet address, submits a classic CreateAccount(10 XLM) from a server-held key
+# so the account exists on-chain (a Soroban contract can't create accounts; the app can't
+# self-fund). Holds ONLY the funder key (a small XLM float) — no user key material. Lean
+# deps (no soroban-sdk / tauri) so the image builds fast like the keeper-service / indexer.
+
+[[bin]]
+name = "ozky-funder-service"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+tiny_http = "0.12"
+stellar-xdr = { version = "23", features = ["std", "base64", "curr"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+stellar-strkey = "0.0.13"
+
+[profile.release]
+opt-level = 2

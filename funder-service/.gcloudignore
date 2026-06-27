@@ -1,0 +1,6 @@
+# Keep the Cloud Build / Cloud Run source upload small: ship only Cargo.toml + src.
+target/
+.git/
+*.md
+k8s/
+deploy_*.sh

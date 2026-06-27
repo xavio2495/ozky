@@ -1,0 +1,63 @@
+# GKE Deployment for the ozky onboarding funder. The funder key (and optional bearer token)
+# come from the `ozky-funder-secret` Secret created by deploy_gke.sh. `${IMAGE}` is filled in
+# by the deploy script (envsubst). Single replica is plenty — funding is serialized anyway.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ozky-funder
+  labels:
+    app: ozky-funder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ozky-funder
+  template:
+    metadata:
+      labels:
+        app: ozky-funder
+    spec:
+      containers:
+        - name: ozky-funder
+          image: ${IMAGE}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: OZKY_RPC_URL
+              value: "${RPC_URL}"
+            - name: OZKY_NETWORK_PASSPHRASE
+              value: "${PASSPHRASE}"
+            - name: OZKY_FUND_AMOUNT
+              value: "${FUND_AMOUNT}"
+            - name: OZKY_FUNDER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ozky-funder-secret
+                  key: funder-secret
+            # Optional bearer token; the key is always present (empty string when unused).
+            - name: OZKY_FUNDER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ozky-funder-secret
+                  key: funder-token
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

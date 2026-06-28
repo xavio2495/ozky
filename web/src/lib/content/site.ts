@@ -39,9 +39,9 @@ export const footer = {
 	],
 	legal: [
 		{ label: '©2026 ozky labs' },
-		{ label: 'License Agreement', href: '/' },
-		{ label: 'Privacy Policy', href: '/' },
-		{ label: 'Terms of Use', href: '/' }
+		{ label: 'License Agreement', href: '/legal/license' },
+		{ label: 'Privacy Policy', href: '/legal/privacy' },
+		{ label: 'Terms of Use', href: '/legal/terms' }
 	] as { label: string; href?: string }[]
 };
 

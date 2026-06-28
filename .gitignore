@@ -1,0 +1,55 @@
+# ozky — root .gitignore. Covers every sub-project's build/generated artifacts;
+# the per-directory .gitignore files (contracts/, ozky/, web/, src-tauri/) still
+# apply within their scopes. Cargo.lock / package-lock.json are intentionally
+# tracked (apps + binaries) and are NOT ignored.
+
+# ---- Rust / Cargo (contracts, indexer, ozky/src-tauri) ----
+# Matches any `target/` dir at any depth — also catches Noir's circuit build output.
+target/
+**/*.rs.bk
+
+# ---- Noir / Barretenberg (circuits/*/target: proof, vk, public_inputs, *.gz, *.json) ----
+# Covered by the `target/` rule above; listed here for clarity.
+# circuits/*/target/
+
+# ---- Soroban ----
+# Regenerable test snapshots from soroban-sdk tests.
+**/test_snapshots/
+# Local CLI state + deploy bookkeeping.
+.soroban/
+.stellar/
+**/.contract_id
+
+# ---- Node / SvelteKit (ozky/, web/) ----
+node_modules/
+.svelte-kit/
+build/
+dist/
+.vercel/
+vite.config.*.timestamp-*
+
+# ---- Tauri generated ----
+**/gen/schemas/
+
+# ---- Secrets / local config (never commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Local dev config holding deployed contract IDs + a relayer secret.
+ozky.config.json
+
+# ---- Logs / temp ----
+*.log
+*.tmp
+tmp/
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+#assets
+*.stackdump
+#*.md

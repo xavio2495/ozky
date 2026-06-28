@@ -170,14 +170,14 @@ Every shielded action is a **Noir / UltraHonk** circuit proved **client-side** i
 
 | Circuit | Shape | What it proves |
 |---|---|---|
-| `deposit` | public → 1 note | Shields public funds into a fresh note; commitment well-formed, value matches the public on-ramp amount. |
-| `transfer` / `transfer4` | up to 4-in / 2-out | Private transfer: spends owned notes, conserves value, emits recipient + change notes. `transfer4` enables multi-input sends and **consolidate**. |
-| `withdraw` | 1 note → public | Unshields to a public `G…` address with `dest_bind` enforced in-circuit, so the off-ramp destination can't be redirected. |
-| `split` | 1-in / N-out (padded 6) | Splits one note into several owned notes for denomination management and pay-many. |
-| `notes` | — | Shared note-format library: commitment and nullifier derivation used by the other circuits. |
-| `shielded_swap` | burn A / mint B | In-pool constant-product AMM (`x·y=k`): burns a note of asset A, mints a note of asset B proving value against reserves. One atomic tx, no public DEX edge; 14 public inputs. |
-| `escrow_contribute` / `escrow_payout` | hidden-sum | Hidden-sum escrow over Pedersen-over-Grumpkin commitments: contributors add to a hidden total, payout proves the sum without revealing per-party amounts. |
-| `channel_close` | merchant-pull | Settles a one-way payment channel; an in-circuit Schnorr-over-Grumpkin signature authorizes the offline draw (open → close / expiry → reclaim). |
+| [`deposit`](https://github.com/xavio2495/ozky/blob/main/circuits/deposit/src/main.nr) | public → 1 note | Shields public funds into a fresh note; commitment well-formed, value matches the public on-ramp amount. |
+| [`transfer`](https://github.com/xavio2495/ozky/blob/main/circuits/transfer/src/main.nr) / [`transfer4`](https://github.com/xavio2495/ozky/blob/main/circuits/transfer4/src/main.nr) | up to 4-in / 2-out | Private transfer: spends owned notes, conserves value, emits recipient + change notes. `transfer4` enables multi-input sends and **consolidate**. |
+| [`withdraw`](https://github.com/xavio2495/ozky/blob/main/circuits/withdraw/src/main.nr) | 1 note → public | Unshields to a public `G…` address with `dest_bind` enforced in-circuit, so the off-ramp destination can't be redirected. |
+| [`split`](https://github.com/xavio2495/ozky/blob/main/circuits/split/src/main.nr) | 1-in / N-out (padded 6) | Splits one note into several owned notes for denomination management and pay-many. |
+| [`notes`](https://github.com/xavio2495/ozky/blob/main/circuits/notes/src/lib.nr) | — | Shared note-format library: commitment and nullifier derivation used by the other circuits. |
+| [`shielded_swap`](https://github.com/xavio2495/ozky/blob/main/circuits/shielded_swap/src/main.nr) | burn A / mint B | In-pool constant-product AMM (`x·y=k`): burns a note of asset A, mints a note of asset B proving value against reserves. One atomic tx, no public DEX edge; 14 public inputs. |
+| [`escrow_contribute`](https://github.com/xavio2495/ozky/blob/main/circuits/escrow_contribute/src/main.nr) / [`escrow_payout`](https://github.com/xavio2495/ozky/blob/main/circuits/escrow_payout/src/main.nr) | hidden-sum | Hidden-sum escrow over Pedersen-over-Grumpkin commitments: contributors add to a hidden total, payout proves the sum without revealing per-party amounts. |
+| [`channel_close`](https://github.com/xavio2495/ozky/blob/main/circuits/channel_close/src/main.nr) | merchant-pull | Settles a one-way payment channel; an in-circuit Schnorr-over-Grumpkin signature authorizes the offline draw (open → close / expiry → reclaim). |
 
 Compliance and disclosure ride alongside the spend proofs: every transfer additionally proves **ASP approved-set membership** (`owner_pk ∈ asp_root`, depth 20) against the `policy` contract, while scoped view keys carry the viewing secret + `owner_pk` only — **never** `owner_sk`.
 
@@ -216,10 +216,6 @@ Each row points at the file that implements the capability.
 | **ASP approved-set enrollment** (`owner_pk ∈ asp_root`) | [`core/enroll.rs`](https://github.com/xavio2495/ozky/blob/main/ozky/src-tauri/src/core/enroll.rs) |
 | **Raw-RPC chain client → `pool_state`** | [`core/chain.rs`](https://github.com/xavio2495/ozky/blob/main/ozky/src-tauri/src/core/chain.rs) |
 
-### Circuits
-
-Noir / UltraHonk circuits under [`circuits/`](https://github.com/xavio2495/ozky/tree/main/circuits) — each is a verified **entrypoint of the pool**, not a separate contract: `deposit`, `transfer` / `transfer4` (4-in/2-out), `withdraw`, `split` (1-in/N-out, padded 6), `notes`, `shielded_swap`, `escrow_contribute` / `escrow_payout`, `channel_close`.
-
 ### Cloud runtimes (optional — never receive keys or note plaintext)
 
 | Runtime | Code |
@@ -243,10 +239,9 @@ prover-sidecar/   Native ozky-prover (SEA: bb.js + noir_js WASM) — Docker-free
 keeper-service/   Headless payroll keeper (Cloud Run)
 funder-service/   Account onboarding / funder (CreateAccount + trustlines)
 indexer/          Event/tree speed-layer indexer (Cloud Run)
-claude-docs/      Project brief & frozen spec (build_plan · handoff · docs)
 ```
 
-The ZK toolchain (Noir/Barretenberg) has no native Windows build and runs in Docker; the wallet and web app build natively. See `CLAUDE.md` for the dev-container details.
+The ZK toolchain (Noir/Barretenberg) has no native Windows build and runs in Docker; the wallet and web app build natively.
 
 ---
 

@@ -127,7 +127,7 @@
 		<div data-load class="flex h-[75dvh] flex-col justify-center bg-gold px-8 pt-24 text-ink">
 			<div class="flex flex-wrap items-start gap-x-12 gap-y-4">
 				<h1
-					class="overflow-hidden font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
+					class="-mb-[0.2em] overflow-hidden pb-[0.2em] font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
 				>
 					<span data-title-line class="block">{lander.titleTop}</span>
 				</h1>
@@ -138,7 +138,7 @@
 				</p>
 			</div>
 			<h1
-				class="overflow-hidden font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.045em]"
+				class="-mb-[0.2em] overflow-hidden pb-[0.2em] font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.045em]"
 			>
 				<span data-title-line class="block">{lander.titleBottom}</span>
 			</h1>
@@ -188,7 +188,7 @@
 				role="img"
 				aria-label="ozky"
 				fill="currentColor"
-				class="h-[clamp(1.6rem,2.2vw,2.6rem)] w-auto self-center text-ink"
+				class="h-[4.2rem] w-auto self-center text-ink"
 				xmlns="http://www.w3.org/2000/svg"
 			>
 				<path

@@ -67,3 +67,26 @@ html.lenis body {
 .lenis.lenis-stopped {
 	overflow: hidden;
 }
+
+/* Custom scrollbar — very thin, grey track with an ink pill (both axes).
+   Applies to the page and any inner scroller; the pitch deck keeps its own
+   hidden bar via the higher-specificity `.no-scrollbar` rule. */
+html {
+	scrollbar-width: thin; /* Firefox: inherited by descendants */
+	scrollbar-color: var(--color-ink) var(--color-grey); /* thumb · track */
+}
+
+::-webkit-scrollbar {
+	width: 6px;
+	height: 6px;
+}
+::-webkit-scrollbar-track {
+	background: var(--color-grey);
+}
+::-webkit-scrollbar-thumb {
+	background: var(--color-ink);
+	border-radius: 999px;
+}
+::-webkit-scrollbar-corner {
+	background: var(--color-grey);
+}

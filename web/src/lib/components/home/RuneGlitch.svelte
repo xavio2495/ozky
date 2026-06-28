@@ -13,8 +13,17 @@
 		fill = false,
 		cell = 16,
 		gap = 7,
-		runeSize = 14
-	}: { fill?: boolean; cell?: number; gap?: number; runeSize?: number } = $props();
+		runeSize = 14,
+		base = 'var(--color-grey)',
+		accent = 'var(--color-gold)'
+	}: {
+		fill?: boolean;
+		cell?: number;
+		gap?: number;
+		runeSize?: number;
+		base?: string;
+		accent?: string;
+	} = $props();
 
 	const RUNES = [
 		'sym_back_c',
@@ -79,8 +88,8 @@
 					class="rune"
 					in:fade={{ duration: 500 }}
 					style="opacity:{cell.o}; background:{cell.g
-						? 'var(--color-gold)'
-						: 'var(--color-grey)'}; -webkit-mask-image:url(/runes/{cell.r}.svg); mask-image:url(/runes/{cell.r}.svg);"
+						? accent
+						: base}; -webkit-mask-image:url(/runes/{cell.r}.svg); mask-image:url(/runes/{cell.r}.svg);"
 				></span>
 			{/key}
 		</span>

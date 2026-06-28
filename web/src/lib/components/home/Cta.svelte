@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import Slash from '../graphics/Slash.svelte';
 	import Button from '../ui/Button.svelte';
 	import { gsap, ScrollTrigger } from '$lib/scroll';
 	import { cta } from '$lib/content/home';
@@ -33,7 +32,7 @@
 		<h2
 			class="font-display text-center text-[clamp(2.6rem,8vw,7rem)] font-semibold leading-[0.92] tracking-[-0.04em]"
 		>
-			{cta.lead}<br />fully<Slash />shielded?
+			{cta.lead}<br />fully shielded?
 		</h2>
 		<Button href={cta.download.href} variant="solid-dark">{cta.download.label}</Button>
 	</div>

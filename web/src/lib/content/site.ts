@@ -6,6 +6,7 @@ export type NavItem = { label: string; href: string; children?: SubLink[] };
 
 export const nav: NavItem[] = [
 	{ label: 'Home', href: '/' },
+	{ label: 'Pitch', href: '/pitch' },
 	{ label: 'Download', href: '/downloads' },
 	{ label: 'Quickstart', href: '/quickstart' },
 	{

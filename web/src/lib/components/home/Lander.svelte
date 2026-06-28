@@ -11,7 +11,11 @@
 	let stickyTop = $state(0); // bottom-pin offset for the right column
 
 	function measure() {
-		if (!rightCol) return;
+		// The right column only bottom-pins on desktop; below lg it stacks in flow.
+		if (!rightCol || window.innerWidth < 1024) {
+			stickyTop = 0;
+			return;
+		}
 		stickyTop = window.innerHeight - rightCol.offsetHeight;
 	}
 
@@ -120,39 +124,58 @@
 	});
 </script>
 
-<section bind:this={section} data-nav class="relative flex w-full items-start">
+<!-- Mobile (<lg): a 2-col grid; the two columns become `display:contents` so their
+     blocks re-interleave via `order`. At lg the original 3/4 + 1/4 columns restore. -->
+<section
+	bind:this={section}
+	data-nav
+	class="relative grid w-full grid-cols-2 lg:flex lg:items-start"
+>
 	<!-- LEFT COLUMN — 3/4 width: title · video · features -->
-	<div class="flex w-3/4 flex-col">
+	<div class="contents lg:flex lg:w-3/4 lg:flex-col">
 		<!-- title — 75dvh, gold -->
-		<div data-load class="flex h-[75dvh] flex-col justify-center bg-gold px-8 pt-24 text-ink">
+		<div
+			data-load
+			class="order-1 col-span-2 flex h-[75dvh] flex-col justify-center bg-gold px-8 pt-24 text-ink lg:order-none"
+		>
+			<!-- subhead — sits ABOVE the title on mobile; on desktop it moves beside titleTop -->
+			<p
+				class="mb-4 max-w-[34ch] font-display text-[clamp(0.95rem,3.4vw,1.4rem)] font-medium leading-tight lg:hidden"
+			>
+				{lander.subhead}
+			</p>
 			<div class="flex flex-wrap items-start gap-x-12 gap-y-4">
 				<h1
-					class="-mb-[0.2em] overflow-hidden pb-[0.2em] font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
+					class="-mb-[0.2em] w-[80dvw] overflow-hidden pb-[0.2em] font-display text-[clamp(3.6rem,17vw,11rem)] font-semibold leading-[0.8] tracking-[-0.04em] lg:w-auto"
 				>
 					<span data-title-line class="block">{lander.titleTop}</span>
 				</h1>
 				<p
-					class="mt-3 max-w-[22ch] font-display text-[clamp(1rem,1.6vw,1.4rem)] font-medium leading-tight"
+					class="mt-3 hidden max-w-[22ch] font-display text-[clamp(1rem,1.6vw,1.4rem)] font-medium leading-tight lg:block"
 				>
 					{lander.subhead}
 				</p>
 			</div>
 			<h1
-				class="-mb-[0.2em] overflow-hidden pb-[0.2em] font-display text-[clamp(4rem,12vw,11rem)] font-semibold leading-[0.8] tracking-[-0.045em]"
+				class="-mb-[0.2em] w-[80dvw] overflow-hidden pb-[0.2em] font-display text-[clamp(3.6rem,17vw,11rem)] font-semibold leading-[0.8] tracking-[-0.045em] lg:w-auto"
 			>
 				<span data-title-line class="block">{lander.titleBottom}</span>
 			</h1>
 		</div>
 
 		<!-- video band — banner_pop (dark image → light nav tone) -->
-		<div data-load data-nav="light" class="h-[80dvh] w-full overflow-hidden">
+		<div
+			data-load
+			data-nav="light"
+			class="order-2 col-span-2 h-[28dvh] w-full overflow-hidden lg:order-none lg:h-[80dvh]"
+		>
 			<img src="/img/banner_pop.png" alt="ozky on Stellar" class="h-full w-full object-cover" />
 		</div>
 
 		<!-- features — three 3:2 cards, each with an NW→SE drawn border -->
-		<div class="grid grid-cols-3">
+		<div class="order-6 col-span-2 grid grid-cols-1 lg:order-none lg:grid-cols-3">
 			{#each feats as feat (feat.title)}
-				<article data-onscreen class="relative aspect-[3/2] p-8">
+				<article data-onscreen class="relative aspect-[2/1] p-7 lg:aspect-[3/2] lg:p-8">
 					<div
 						data-feat-border
 						class="pointer-events-none absolute inset-0 border border-ink"
@@ -175,12 +198,17 @@
 	     Bottom-pins (sticky) once its base reaches the viewport bottom. -->
 	<aside
 		bind:this={rightCol}
-		class="sticky flex w-1/4 flex-col self-start"
+		class="contents lg:sticky lg:flex lg:w-1/4 lg:flex-col lg:self-start"
 		style:top="{stickyTop}px"
 	>
 		<!-- tagline — 50dvh, grey: tagline on top, inline wordmark anchored bottom-centre -->
-		<div data-load class="flex h-[50dvh] flex-col justify-between bg-grey px-7 pt-8 pb-8 text-ink">
-			<p class="font-display text-[clamp(1.05rem,1.4vw,1.35rem)] font-medium leading-snug">
+		<div
+			data-load
+			class="order-4 col-span-1 flex aspect-square flex-col justify-between bg-grey px-5 pt-6 pb-6 text-ink lg:order-none lg:aspect-auto lg:h-[50dvh] lg:px-7 lg:pt-8 lg:pb-8"
+		>
+			<p
+				class="font-display text-[clamp(0.85rem,3.4vw,1.05rem)] font-medium leading-snug lg:text-[clamp(1.05rem,1.4vw,1.35rem)]"
+			>
 				{lander.tagline}
 			</p>
 			<svg
@@ -188,7 +216,7 @@
 				role="img"
 				aria-label="ozky"
 				fill="currentColor"
-				class="h-[4.2rem] w-auto self-center text-ink"
+				class="h-[2.6rem] w-auto self-center text-ink lg:h-[4.2rem]"
 				xmlns="http://www.w3.org/2000/svg"
 			>
 				<path
@@ -207,7 +235,11 @@
 		</div>
 
 		<!-- system status — 50dvh, ink, small text + rune glitch -->
-		<div data-load data-nav="light" class="flex h-[65dvh] flex-col bg-ink px-7 py-7 text-grey">
+		<div
+			data-load
+			data-nav="light"
+			class="order-3 col-span-2 flex h-[55dvh] flex-col bg-ink px-7 py-7 text-grey lg:order-none lg:h-[65dvh]"
+		>
 			<h3 class="font-display text-xl font-medium">System Status</h3>
 			<ol class="mono mt-4 space-y-[3px] text-[9px] text-grey">
 				{#each status as item, i (item)}
@@ -227,16 +259,18 @@
 			href={lander.exploreHref}
 			data-onscreen
 			data-explore
-			class="flex aspect-square flex-col justify-between bg-gold p-7 text-ink"
+			class="order-5 col-span-1 flex aspect-square flex-col justify-between bg-gold p-5 text-ink lg:order-none lg:p-7"
 		>
 			<img
 				data-arrow
 				src="/img/arrow_l.svg"
 				alt=""
 				aria-hidden="true"
-				class="h-[5.2rem] w-[5.2rem] self-end object-contain"
+				class="h-[3rem] w-[3rem] self-end object-contain lg:h-[5.2rem] lg:w-[5.2rem]"
 			/>
-			<span class="font-display text-[clamp(1.1rem,1.5vw,1.6rem)] font-medium leading-tight">
+			<span
+				class="font-display text-[clamp(0.95rem,3.6vw,1.2rem)] font-medium leading-tight lg:text-[clamp(1.1rem,1.5vw,1.6rem)]"
+			>
 				{lander.exploreLabel}
 			</span>
 		</a>

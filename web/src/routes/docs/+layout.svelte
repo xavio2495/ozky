@@ -49,6 +49,39 @@
 <section data-nav="light" class="flex w-full items-start bg-ink text-grey">
 	<!-- LEFT — documentation content (3/4), black page -->
 	<div class="w-full px-8 pt-32 pb-20 lg:w-3/4">
+		<!-- mobile index — title + sticky dropdown (desktop shows the right rail instead) -->
+		<h1
+			class="font-display mb-5 text-[clamp(1.8rem,7vw,2.4rem)] font-semibold leading-[0.95] tracking-[-0.03em] text-gold lg:hidden"
+		>
+			{title}
+		</h1>
+		<details class="sticky top-[68px] z-30 mb-10 border border-grey bg-ink lg:hidden">
+			<summary
+				class="mono flex cursor-pointer list-none items-center justify-between px-4 py-3 text-[11px] text-grey"
+			>
+				<span>Index</span>
+				<span class="text-gold">▾</span>
+			</summary>
+			<ol
+				class="mono max-h-[60vh] space-y-[6px] overflow-y-auto border-t border-grey px-4 py-4 text-[11px]"
+			>
+				{#each docsOrder as item, i (item.href)}
+					{@const active = page.url.pathname === item.href}
+					<li>
+						<a
+							href={item.href}
+							class="flex items-center gap-2 py-0.5 transition-colors hover:text-gold {active
+								? 'font-semibold text-gold'
+								: ''} {item.level === 1 ? 'pl-4' : ''}"
+						>
+							<span>{String(i + 1).padStart(2, '0')}.</span>
+							<span>{item.label}</span>
+						</a>
+					</li>
+				{/each}
+			</ol>
+		</details>
+
 		<div
 			bind:this={content}
 			class="prose prose-invert max-w-[70ch] prose-headings:font-display prose-headings:font-semibold prose-headings:tracking-[-0.02em] prose-a:text-gold prose-a:no-underline hover:prose-a:underline prose-strong:text-grey prose-code:text-gold prose-code:before:content-none prose-code:after:content-none [&_pre]:rounded-none [&_pre]:bg-gold [&_pre]:text-ink [&_pre_code]:text-ink"

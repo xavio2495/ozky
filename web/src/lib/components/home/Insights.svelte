@@ -10,7 +10,11 @@
 	let stickyTop = $state(0); // bottom-pin offset for the left column
 
 	function measure() {
-		if (!leftCol) return;
+		// Left column only bottom-pins on desktop; below lg it stacks in flow.
+		if (!leftCol || window.innerWidth < 1024) {
+			stickyTop = 0;
+			return;
+		}
 		stickyTop = window.innerHeight - leftCol.offsetHeight;
 	}
 
@@ -83,10 +87,18 @@
 	});
 </script>
 
-<section bind:this={section} id="insights" class="flex w-full items-start bg-grey text-ink">
+<section
+	bind:this={section}
+	id="insights"
+	class="flex w-full flex-col items-start bg-grey text-ink lg:flex-row"
+>
 	<!-- LEFT COLUMN — image + black text block. Bottom-pins once its base hits the viewport bottom. -->
-	<div bind:this={leftCol} class="sticky flex w-1/2 flex-col self-start" style:top="{stickyTop}px">
-		<div data-nav="light" class="h-[45dvh] w-full overflow-hidden">
+	<div
+		bind:this={leftCol}
+		class="flex w-full flex-col lg:sticky lg:w-1/2 lg:self-start"
+		style:top="{stickyTop}px"
+	>
+		<div data-nav="light" class="h-[22dvh] w-full overflow-hidden lg:h-[45dvh]">
 			<img
 				data-img
 				src="/img/banner_sml.jpg"
@@ -97,7 +109,7 @@
 		<div
 			data-fill
 			data-nav="light"
-			class="flex h-[55dvh] flex-col justify-end bg-ink p-10 text-grey"
+			class="flex h-[40dvh] flex-col justify-end bg-ink p-7 text-grey lg:h-[55dvh] lg:p-10"
 		>
 			<h2
 				class="font-display text-[clamp(2.2rem,4.4vw,4rem)] font-medium leading-[0.98] tracking-[-0.03em]"
@@ -112,18 +124,20 @@
 
 	<!-- RIGHT COLUMN — f1..fn, 2-up. Each cell draws only top+left borders so adjacent
 	     edges never double up; the outer right/bottom edges are closed on the container. -->
-	<div class="grid w-1/2 grid-cols-2 border-r border-b border-ink">
+	<div class="grid w-full grid-cols-2 border-r border-b border-ink lg:w-1/2">
 		{#each integrations as item (item.title)}
 			<a
 				href={item.href}
 				data-cell
-				class="group relative flex h-[45dvh] flex-col justify-end p-8 text-ink transition-colors duration-300 hover:bg-ink hover:text-grey"
+				class="group relative flex h-[26dvh] flex-col justify-end p-5 text-ink transition-colors duration-300 hover:bg-ink hover:text-grey lg:h-[45dvh] lg:p-8"
 			>
 				<div
 					data-cell-border
 					class="pointer-events-none absolute inset-0 border-t border-l border-current"
 				></div>
-				<h3 class="font-display text-[clamp(1.4rem,2vw,2rem)] font-medium tracking-[-0.02em]">
+				<h3
+					class="font-display text-[clamp(1.05rem,4vw,2rem)] font-medium tracking-[-0.02em] lg:text-[clamp(1.4rem,2vw,2rem)]"
+				>
 					{item.title}
 				</h3>
 				<p class="mono mt-3 text-[10px] tracking-[0.08em]">{item.sub}</p>

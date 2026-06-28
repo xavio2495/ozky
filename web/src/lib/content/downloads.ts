@@ -36,7 +36,8 @@ export const downloads = {
 			note: 'Modern desktop',
 			types: [
 				{ label: '.AppImage — portable', match: '.AppImage' },
-				{ label: '.deb — Debian / Ubuntu', match: '.deb' }
+				{ label: '.deb — Debian / Ubuntu', match: '.deb' },
+				{ label: '.rpm — Fedora / RHEL', match: '.rpm' }
 			]
 		}
 	] as Platform[],

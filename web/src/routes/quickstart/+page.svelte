@@ -54,11 +54,14 @@
 
 <svelte:head><title>ozky — Quickstart</title></svelte:head>
 
-<section bind:this={section} data-nav class="flex w-full items-start">
+<section bind:this={section} data-nav class="flex w-full flex-col items-start lg:flex-row">
 	<!-- LEFT — title + video band (3/4). Pins to the top so the title stays locked
 	     while the steps scroll; resumes once the steps column reaches its end. -->
 	<div class="flex w-full flex-col lg:sticky lg:top-0 lg:h-fit lg:w-3/4 lg:self-start">
-		<div data-load class="flex h-[75dvh] flex-col justify-center bg-gold px-8 pt-24 text-ink">
+		<div
+			data-load
+			class="flex h-[56dvh] flex-col justify-center bg-gold px-8 pt-24 text-ink lg:h-[75dvh]"
+		>
 			<h1
 				class="overflow-hidden font-display text-[clamp(3.5rem,11vw,10rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
 			>
@@ -71,7 +74,7 @@
 			</p>
 		</div>
 
-		<div data-load data-nav="light" class="h-[80dvh] w-full overflow-hidden">
+		<div data-load data-nav="light" class="h-[30dvh] w-full overflow-hidden lg:h-[80dvh]">
 			<img src="/img/banner_pop.png" alt="ozky on Stellar" class="h-full w-full object-cover" />
 		</div>
 	</div>

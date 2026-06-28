@@ -79,7 +79,7 @@
 				<span class="h-[1.5px] w-full bg-ink"></span>
 				<span class="h-[1.5px] w-2/3 bg-ink"></span>
 			</span>
-			Menu
+			<span class="hidden lg:inline">Menu</span>
 		</button>
 	</div>
 </header>

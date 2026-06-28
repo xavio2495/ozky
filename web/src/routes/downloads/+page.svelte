@@ -14,6 +14,9 @@
 	let assets = $state<Asset[]>([]);
 	let loaded = $state(false);
 	let userOs = $state<'macOS' | 'Windows' | 'Linux' | ''>('');
+	// Android/iOS have no ozky build — flag them so we don't mis-detect a desktop binary
+	// (Android UA contains "Linux", iOS contains "Mac OS X").
+	let mobileOs = $state(false);
 	// Per-OS selected file-type index for the dropdowns.
 	let sel = $state<Record<string, number>>({ macOS: 0, Windows: 0, Linux: 0 });
 
@@ -63,13 +66,16 @@
 
 	onMount(() => {
 		const ua = navigator.userAgent;
-		userOs = /Mac/i.test(ua)
-			? 'macOS'
-			: /Win/i.test(ua)
-				? 'Windows'
-				: /Linux/i.test(ua)
-					? 'Linux'
-					: '';
+		mobileOs = /Android|iPhone|iPad|iPod/i.test(ua);
+		userOs = mobileOs
+			? ''
+			: /Mac/i.test(ua)
+				? 'macOS'
+				: /Win/i.test(ua)
+					? 'Windows'
+					: /Linux/i.test(ua)
+						? 'Linux'
+						: '';
 
 		(async () => {
 			try {
@@ -155,12 +161,12 @@
 <section
 	bind:this={hero}
 	data-nav
-	class="relative min-h-screen overflow-hidden bg-gold px-8 pt-32 pb-8 text-ink"
+	class="relative flex min-h-screen flex-col bg-gold px-8 pt-32 pb-8 text-ink lg:block lg:overflow-hidden"
 >
 	<!-- subtitle: version, centred -->
 	<p
 		data-hero-sub
-		class="mx-auto mt-[12vh] max-w-[24ch] text-center font-display text-[clamp(1.2rem,2vw,1.8rem)] font-medium leading-snug"
+		class="mx-auto mt-[6vh] max-w-[24ch] text-center font-display text-[clamp(1.2rem,2vw,1.8rem)] font-medium leading-snug lg:mt-[12vh]"
 	>
 		version: {loaded ? (version ?? 'unavailable') : 'checking…'}
 	</p>
@@ -169,10 +175,18 @@
 	<div
 		data-hero-box
 		data-nav="light"
-		class="absolute top-24 right-8 hidden w-[380px] bg-ink p-8 text-gold lg:block"
+		class="order-3 mt-8 w-full bg-ink p-8 text-gold lg:absolute lg:top-24 lg:right-8 lg:mt-0 lg:w-[380px]"
 	>
 		<Tetra class="mb-6 h-12 w-12 text-gold" />
-		{#if userOs}
+		{#if mobileOs}
+			<h2 class="font-display text-[clamp(1.4rem,1.8vw,1.7rem)] font-medium leading-tight">
+				No mobile build.
+			</h2>
+			<p class="mono mt-5 text-[11px] leading-[1.8] text-gold">
+				ozky is a desktop wallet — there's no Android or iOS build. Open this page on macOS,
+				Windows, or Linux to download.
+			</p>
+		{:else if userOs}
 			<h2 class="font-display text-[clamp(1.4rem,1.8vw,1.7rem)] font-medium leading-tight">
 				Download for {userOs}.
 			</h2>
@@ -194,7 +208,7 @@
 
 	<!-- giant title, bottom-left -->
 	<h1
-		class="absolute bottom-4 left-6 overflow-hidden font-display text-[clamp(4rem,16vw,15rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
+		class="order-2 mt-10 overflow-hidden font-display text-[clamp(3rem,16vw,15rem)] font-semibold leading-[0.8] tracking-[-0.04em] lg:absolute lg:bottom-4 lg:left-6 lg:mt-0"
 	>
 		<span data-hero-title class="block">{downloads.heading}</span>
 	</h1>

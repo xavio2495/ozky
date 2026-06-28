@@ -63,15 +63,20 @@
 
 <div bind:this={root}>
 	<!-- hero -->
-	<section class="relative min-h-screen overflow-hidden bg-gold px-8 pt-32 pb-8 text-ink">
+	<section
+		class="relative flex min-h-screen flex-col bg-gold px-8 pt-32 pb-8 text-ink lg:block lg:overflow-hidden"
+	>
 		<p
 			data-rise
-			class="mx-auto mt-[10vh] max-w-[20ch] text-center font-display text-[clamp(1.2rem,2vw,1.8rem)] font-medium leading-snug"
+			class="mx-auto mt-[6vh] max-w-[20ch] text-center font-display text-[clamp(1.2rem,2vw,1.8rem)] font-medium leading-snug lg:mt-[10vh]"
 		>
 			{about.hero}
 		</p>
 
-		<div data-fill class="absolute top-24 right-8 hidden w-[360px] bg-ink p-8 text-gold lg:block">
+		<div
+			data-fill
+			class="order-3 mt-8 w-full bg-ink p-8 text-gold lg:absolute lg:top-24 lg:right-8 lg:mt-0 lg:w-[360px]"
+		>
 			<Tetra class="mb-6 h-12 w-12 text-gold" />
 			<h2 class="font-display text-[clamp(1.4rem,1.8vw,1.7rem)] font-medium leading-tight">
 				{about.mission.title}
@@ -80,7 +85,7 @@
 		</div>
 
 		<h1
-			class="absolute bottom-4 left-6 overflow-hidden font-display text-[clamp(4rem,16vw,15rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
+			class="order-2 mt-10 overflow-hidden font-display text-[clamp(3rem,16vw,15rem)] font-semibold leading-[0.8] tracking-[-0.04em] lg:absolute lg:bottom-4 lg:left-6 lg:mt-0"
 		>
 			<span data-giant class="block">{about.giant}</span>
 		</h1>

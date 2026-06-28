@@ -90,7 +90,7 @@
 		>
 			{solutions.heading}
 		</h2>
-		<div data-arrows class="flex shrink-0 gap-2.5">
+		<div data-arrows class="hidden shrink-0 gap-2.5 lg:flex">
 			<button
 				onclick={() => scrollByCard(-1)}
 				aria-label="Previous"
@@ -120,14 +120,14 @@
 		{#each cards as card, i (card.title)}
 			{@const G = graphics[card.graphic]}
 			<article
-				class="group flex min-h-[78vh] w-[88vw] shrink-0 snap-start flex-col border border-ink bg-grey p-9 transition-colors duration-300 hover:bg-gold sm:w-[60vw] lg:w-[calc(100%/3)] {i >
+				class="group flex min-h-[52vh] w-[88vw] shrink-0 snap-start flex-col border border-ink bg-grey p-7 transition-colors duration-300 hover:bg-gold sm:w-[60vw] sm:p-9 lg:min-h-[78vh] lg:w-[calc(100%/3)] {i >
 				0
 					? '-ml-px'
 					: ''}"
 			>
 				<div class="grid flex-1 place-items-center">
 					<div data-vector>
-						<G class="h-56 w-56 text-ink" />
+						<G class="h-36 w-36 text-ink lg:h-56 lg:w-56" />
 					</div>
 				</div>
 				<h3 class="font-display text-[clamp(1.4rem,2vw,1.9rem)] font-medium tracking-[-0.02em]">

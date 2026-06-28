@@ -40,7 +40,10 @@
 
 <footer bind:this={root} data-footer class="bg-gold px-8 pt-8 pb-8">
 	<!-- black box — 80dvh, slightly rounded -->
-	<div data-box class="flex h-[85dvh] flex-col rounded-[16px] bg-ink px-10 py-12 text-gold">
+	<div
+		data-box
+		class="flex min-h-[62dvh] flex-col rounded-[16px] bg-ink px-7 py-10 text-gold sm:px-10 sm:py-12 lg:h-[85dvh] lg:min-h-[85dvh]"
+	>
 		<!-- logo left · page nav right-aligned -->
 		<div class="flex flex-wrap items-start gap-x-16 gap-y-10">
 			<div data-ftext><Logo tone="gold" size={30} /></div>
@@ -68,14 +71,14 @@
 		</div>
 
 		<!-- tagline + address + socials — justified across the box -->
-		<div data-ftext class="mt-14 flex flex-col gap-8 sm:flex-row sm:justify-between">
-			<p class="mono max-w-[16ch] text-[11px] leading-relaxed">
+		<div data-ftext class="mt-10 flex flex-row flex-wrap justify-between gap-4 lg:mt-14">
+			<p class="mono max-w-[14ch] text-left text-[10px] leading-relaxed sm:text-[11px]">
 				{#each footer.tagline as line (line)}{line}<br />{/each}
 			</p>
-			<p class="mono text-[11px] leading-relaxed sm:text-center">
+			<p class="mono text-center text-[10px] leading-relaxed sm:text-[11px]">
 				{#each footer.address as line (line)}{line}<br />{/each}
 			</p>
-			<ul class="mono space-y-1 text-[11px] leading-relaxed sm:text-right">
+			<ul class="mono space-y-1 text-right text-[10px] leading-relaxed sm:text-[11px]">
 				{#each footer.links as l (l.label)}
 					<li><a href={l.href} class="transition-colors hover:text-grey">{l.label} ↗</a></li>
 				{/each}
@@ -87,7 +90,7 @@
 			data-ftext
 			src="/img/logo_with_icon.svg"
 			alt="ozky"
-			class="mt-auto block h-[35dvh] w-auto max-w-full self-center object-contain object-center pt-8 select-none"
+			class="mt-auto block h-[22dvh] w-auto max-w-full self-center object-contain object-center pt-8 select-none lg:h-[35dvh]"
 		/>
 	</div>
 

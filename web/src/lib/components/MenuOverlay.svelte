@@ -30,7 +30,7 @@
 
 <!-- Floating popup anchored to the top-right -->
 <aside
-	class="fixed top-4 right-4 z-[70] flex min-h-[40dvw] w-[40dvw] min-w-[340px] flex-col rounded-[18px] bg-grey p-7 text-ink shadow-xl transition-all duration-300 ease-in-out"
+	class="fixed top-4 right-4 z-[70] flex min-h-[60dvh] w-[88dvw] min-w-0 flex-col rounded-[18px] bg-grey p-7 text-ink shadow-xl transition-all duration-300 ease-in-out sm:min-h-[40dvw] sm:w-[40dvw] sm:min-w-[340px]"
 	style:transform-origin="top right"
 	class:pointer-events-none={!open}
 	class:scale-95={!open}
@@ -49,7 +49,7 @@
 			{#if item.children}
 				<button
 					onclick={() => toggle(item.label)}
-					class="font-display flex w-fit items-start text-[clamp(1.4rem,2.6vw,2.2rem)] leading-[1.15] font-semibold tracking-[-0.03em] text-ink"
+					class="font-display flex w-fit items-start text-[clamp(2rem,7vw,2.4rem)] leading-[1.15] font-semibold tracking-[-0.03em] text-ink lg:text-[clamp(1.4rem,2.6vw,2.2rem)]"
 				>
 					{item.label}<sup class="mt-5 ml-0.5 text-[0.5em] font-medium">{item.children.length}</sup>
 				</button>
@@ -63,7 +63,7 @@
 								<a
 									href={c.href}
 									onclick={close}
-									class="font-display block py-0.5 text-[clamp(0.95rem,1.4vw,1.2rem)] font-medium text-ink"
+									class="font-display block py-0.5 text-[clamp(1.1rem,4vw,1.3rem)] font-medium text-ink lg:text-[clamp(0.95rem,1.4vw,1.2rem)]"
 								>
 									↳ {c.label}
 								</a>
@@ -75,7 +75,7 @@
 				<a
 					href={item.href}
 					onclick={close}
-					class="font-display w-fit text-[clamp(1.4rem,2.6vw,2.2rem)] leading-[1.15] font-semibold tracking-[-0.03em] text-ink"
+					class="font-display w-fit text-[clamp(2rem,7vw,2.4rem)] leading-[1.15] font-semibold tracking-[-0.03em] text-ink lg:text-[clamp(1.4rem,2.6vw,2.2rem)]"
 				>
 					{item.label}
 				</a>

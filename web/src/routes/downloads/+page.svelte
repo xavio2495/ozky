@@ -1,21 +1,67 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import Tetra from '$lib/components/graphics/Tetra.svelte';
+	import Globe from '$lib/components/graphics/Globe.svelte';
+	import Halftone from '$lib/components/graphics/Halftone.svelte';
+	import { gsap, ScrollTrigger } from '$lib/scroll';
 	import { downloads } from '$lib/content/downloads';
 
-	type Asset = { name: string; browser_download_url: string };
+	type Asset = { name: string; browser_download_url: string; digest?: string | null };
+
+	const graphics = { macOS: Tetra, Windows: Globe, Linux: Halftone };
+
 	let version = $state<string | null>(null);
 	let assets = $state<Asset[]>([]);
 	let loaded = $state(false);
-	let userOs = $state<string>('');
+	let userOs = $state<'macOS' | 'Windows' | 'Linux' | ''>('');
+	// Per-OS selected file-type index for the dropdowns.
+	let sel = $state<Record<string, number>>({ macOS: 0, Windows: 0, Linux: 0 });
 
-	function assetFor(match: string[]): string | null {
-		const hit = assets.find((a) =>
-			match.some((m) => a.name.toLowerCase().endsWith(m.toLowerCase()))
-		);
-		return hit ? hit.browser_download_url : null;
+	let hero = $state<HTMLElement>();
+	let section = $state<HTMLElement>();
+	let track = $state<HTMLElement>();
+
+	function assetFor(match: string): Asset | null {
+		return assets.find((a) => a.name.toLowerCase().endsWith(match.toLowerCase())) ?? null;
 	}
 
-	onMount(async () => {
+	// The detected platform's preferred (first resolvable) asset, for the hero box.
+	let heroAsset = $derived.by<Asset | null>(() => {
+		if (!userOs) return null;
+		const p = downloads.platforms.find((p) => p.os === userOs);
+		if (!p) return null;
+		for (const t of p.types) {
+			const a = assetFor(t.match);
+			if (a) return a;
+		}
+		return null;
+	});
+
+	// Release assets that carry a sha256 digest, for the checksum list.
+	let checksums = $derived(
+		assets
+			.filter((a) => a.digest && a.digest.startsWith('sha256:'))
+			.map((a) => ({ name: a.name, sha: a.digest!.slice('sha256:'.length) }))
+	);
+
+	function scrollByCard(dir: 1 | -1) {
+		if (!track) return;
+		const card = track.querySelector('article');
+		const w = card ? card.getBoundingClientRect().width : track.clientWidth / 3;
+		const target = Math.max(
+			0,
+			Math.min(track.scrollWidth - track.clientWidth, track.scrollLeft + dir * w)
+		);
+		const proxy = { x: track.scrollLeft };
+		gsap.to(proxy, {
+			x: target,
+			duration: 0.8,
+			ease: 'power2.inOut',
+			onUpdate: () => track && (track.scrollLeft = proxy.x)
+		});
+	}
+
+	onMount(() => {
 		const ua = navigator.userAgent;
 		userOs = /Mac/i.test(ua)
 			? 'macOS'
@@ -24,89 +70,242 @@
 				: /Linux/i.test(ua)
 					? 'Linux'
 					: '';
-		try {
-			const res = await fetch(downloads.latestApi, {
-				headers: { Accept: 'application/vnd.github+json' }
-			});
-			if (res.ok) {
-				const data = await res.json();
-				version = data.tag_name ?? null;
-				assets = Array.isArray(data.assets) ? data.assets : [];
+
+		(async () => {
+			try {
+				const res = await fetch(downloads.latestApi, {
+					headers: { Accept: 'application/vnd.github+json' }
+				});
+				if (res.ok) {
+					const data = await res.json();
+					version = data.tag_name ?? null;
+					assets = Array.isArray(data.assets) ? data.assets : [];
+				}
+			} catch {
+				// offline / rate-limited — hero + cards fall back to the releases page
 			}
-		} catch {
-			// offline / rate-limited — fall back to the releases page links
+			loaded = true;
+			ScrollTrigger.refresh();
+		})();
+
+		gsap.registerPlugin(ScrollTrigger);
+		const tweens: gsap.core.Tween[] = [];
+
+		// hero — reveal on load (about-01 field)
+		if (hero) {
+			const qh = (s: string) => Array.from(hero!.querySelectorAll<HTMLElement>(s));
+			tweens.push(
+				gsap.from(qh('[data-hero-title]'), { yPercent: 115, duration: 1.2, ease: 'power3.inOut' })
+			);
+			tweens.push(
+				gsap.fromTo(
+					qh('[data-hero-box]'),
+					{ clipPath: 'inset(0 0 100% 0)' },
+					{ clipPath: 'inset(0 0 0% 0)', duration: 1.2, ease: 'power2.inOut', delay: 0.15 }
+				)
+			);
+			tweens.push(
+				gsap.from(qh('[data-hero-sub]'), {
+					y: 30,
+					autoAlpha: 0,
+					duration: 1.2,
+					ease: 'power2.inOut',
+					delay: 0.1
+				})
+			);
 		}
-		loaded = true;
+
+		// scroll section — title wipe + card vectors
+		if (section) {
+			const q = (s: string) => Array.from(section!.querySelectorAll<HTMLElement>(s));
+			tweens.push(
+				gsap.fromTo(
+					q('[data-title]'),
+					{ clipPath: 'inset(0 100% 0 0)' },
+					{
+						clipPath: 'inset(0 0% 0 0)',
+						duration: 1.2,
+						ease: 'power2.inOut',
+						scrollTrigger: { trigger: section, start: 'top 80%' }
+					}
+				)
+			);
+			q('[data-vector]').forEach((el) => {
+				tweens.push(
+					gsap.from(el, {
+						scale: 0.55,
+						autoAlpha: 0,
+						duration: 1.2,
+						ease: 'power2.inOut',
+						transformOrigin: 'center',
+						scrollTrigger: { trigger: el, start: 'top 88%' }
+					})
+				);
+			});
+		}
+
+		ScrollTrigger.refresh();
+		return () => tweens.forEach((t) => (t.scrollTrigger?.kill(), t.kill()));
 	});
 </script>
 
 <svelte:head><title>ozky — Download</title></svelte:head>
 
-<section class="min-h-screen bg-grey px-8 pt-32 pb-20 text-ink">
-	<div class="flex flex-wrap items-end justify-between gap-6">
-		<h1
-			class="font-display text-[clamp(3rem,9vw,7rem)] font-semibold leading-[0.85] tracking-[-0.04em]"
-		>
-			{downloads.heading}
-		</h1>
-		<a
-			href={version ? downloads.latestReleaseUrl : downloads.releasesUrl}
-			class="mono text-[11px] text-ink hover:opacity-60"
-		>
-			{loaded ? (version ?? 'latest release ↗') : 'checking latest…'}
-		</a>
-	</div>
-
+<!-- HERO — about-01 layout: gold field, giant title, top-right download box -->
+<section
+	bind:this={hero}
+	data-nav
+	class="relative min-h-screen overflow-hidden bg-gold px-8 pt-32 pb-8 text-ink"
+>
+	<!-- subtitle: version, centred -->
 	<p
-		class="mt-6 max-w-[46ch] font-display text-[clamp(1.1rem,1.8vw,1.5rem)] font-medium leading-snug"
+		data-hero-sub
+		class="mx-auto mt-[12vh] max-w-[24ch] text-center font-display text-[clamp(1.2rem,2vw,1.8rem)] font-medium leading-snug"
 	>
-		{downloads.blurb}
+		version: {loaded ? (version ?? 'unavailable') : 'checking…'}
 	</p>
 
-	<!-- testnet banner -->
-	<p class="mono mt-8 inline-block bg-ink px-4 py-2 text-[10px] text-gold">{downloads.notice}</p>
-
-	<!-- OS cards -->
-	<div class="mt-12 grid grid-cols-1 gap-px bg-ink md:grid-cols-3">
-		{#each downloads.platforms as p (p.os)}
-			{@const url = assetFor(p.match)}
-			<div
-				class="flex flex-col bg-grey p-8 {userOs === p.os ? 'outline outline-2 outline-ink' : ''}"
+	<!-- top-right: direct download for the detected OS -->
+	<div
+		data-hero-box
+		data-nav="light"
+		class="absolute top-24 right-8 hidden w-[380px] bg-ink p-8 text-gold lg:block"
+	>
+		<Tetra class="mb-6 h-12 w-12 text-gold" />
+		{#if userOs}
+			<h2 class="font-display text-[clamp(1.4rem,1.8vw,1.7rem)] font-medium leading-tight">
+				Download for {userOs}.
+			</h2>
+			<p class="mono mt-5 text-[11px] leading-[1.8] text-gold">{downloads.notice}</p>
+			<a
+				href={heroAsset?.browser_download_url ?? downloads.releasesUrl}
+				download={heroAsset ? '' : undefined}
+				class="mono mt-7 inline-flex w-fit items-center rounded-full border border-gold bg-gold px-7 py-3 text-[11px] leading-none text-ink transition-opacity duration-300 hover:opacity-80"
 			>
-				{#if userOs === p.os}<span class="mono mb-3 text-[10px] text-ink">Detected</span>{/if}
-				<h2 class="font-display text-2xl font-medium">{p.os}</h2>
-				<p class="mono mt-2 text-[11px] text-ink">{p.note}</p>
-				<a
-					href={url ?? downloads.latestReleaseUrl}
-					class="mono mt-8 inline-flex w-fit items-center rounded-full border border-ink px-7 py-3 text-[11px] leading-none text-ink transition-colors duration-300 hover:bg-ink hover:text-grey"
+				{loaded ? (heroAsset ? `Download ${heroAsset.name} ↓` : 'Get it on GitHub ↗') : 'Checking…'}
+			</a>
+		{:else}
+			<h2 class="font-display text-[clamp(1.4rem,1.8vw,1.7rem)] font-medium leading-tight">
+				Choose your platform below.
+			</h2>
+			<p class="mono mt-5 text-[11px] leading-[1.8] text-gold">{downloads.notice}</p>
+		{/if}
+	</div>
+
+	<!-- giant title, bottom-left -->
+	<h1
+		class="absolute bottom-4 left-6 overflow-hidden font-display text-[clamp(4rem,16vw,15rem)] font-semibold leading-[0.8] tracking-[-0.04em]"
+	>
+		<span data-hero-title class="block">{downloads.heading}</span>
+	</h1>
+</section>
+
+<!-- SCROLL — all platforms, Solutions-style card track with file-type dropdowns -->
+<section bind:this={section} class="bg-grey pt-16 text-ink">
+	<div class="flex items-end justify-between gap-6 px-8 pb-10">
+		<h2
+			data-title
+			class="font-display max-w-[16ch] text-[clamp(1.4rem,2.8vw,2.3rem)] leading-[1.05] font-normal tracking-[-0.02em]"
+		>
+			Every platform. Pick a build, pick a format.
+		</h2>
+		<div class="flex shrink-0 gap-2.5">
+			<button
+				onclick={() => scrollByCard(-1)}
+				aria-label="Previous"
+				class="grid h-[2.1rem] w-[2.1rem] place-items-center rounded-full bg-ink text-grey transition-colors hover:bg-grey hover:text-ink"
+			>
+				<svg viewBox="0 0 24 24" class="h-3 w-3" fill="none"
+					><path d="M15 5 L8 12 L15 19" stroke="currentColor" stroke-width="2.4" /></svg
 				>
-					{loaded && url ? `Download ↓` : 'Get it on GitHub ↗'}
+			</button>
+			<button
+				onclick={() => scrollByCard(1)}
+				aria-label="Next"
+				class="grid h-[2.1rem] w-[2.1rem] place-items-center rounded-full bg-ink text-grey transition-colors hover:bg-grey hover:text-ink"
+			>
+				<svg viewBox="0 0 24 24" class="h-3 w-3" fill="none"
+					><path d="M9 5 L16 12 L9 19" stroke="currentColor" stroke-width="2.4" /></svg
+				>
+			</button>
+		</div>
+	</div>
+
+	<div
+		bind:this={track}
+		class="flex snap-x snap-mandatory overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+	>
+		{#each downloads.platforms as p, i (p.os)}
+			{@const G = graphics[p.os]}
+			{@const asset = assetFor(p.types[sel[p.os]].match)}
+			<article
+				class="flex min-h-[72vh] w-[88vw] shrink-0 snap-start flex-col border border-ink bg-grey p-9 sm:w-[60vw] lg:w-[calc(100%/3)] {i >
+				0
+					? '-ml-px'
+					: ''}"
+			>
+				<div class="flex items-center justify-between">
+					<h3 class="font-display text-[clamp(1.4rem,2vw,1.9rem)] font-medium tracking-[-0.02em]">
+						{p.os}
+					</h3>
+					{#if userOs === p.os}<span class="mono text-[10px] text-ink">Detected</span>{/if}
+				</div>
+				<p class="mono mt-2 text-[11px] text-ink">{p.note}</p>
+
+				<div class="grid flex-1 place-items-center">
+					<div data-vector>
+						<G class="h-48 w-48 text-ink" />
+					</div>
+				</div>
+
+				<!-- file-type dropdown -->
+				<label class="mono block text-[10px] text-ink">
+					File type
+					<select
+						bind:value={sel[p.os]}
+						class="mono mt-2 w-full border border-ink bg-grey px-3 py-2 text-[11px] text-ink focus:ring-0"
+					>
+						{#each p.types as t, ti (t.match)}
+							<option value={ti}>{t.label}</option>
+						{/each}
+					</select>
+				</label>
+
+				<a
+					href={asset?.browser_download_url ?? downloads.releasesUrl}
+					download={asset ? '' : undefined}
+					class="mono mt-5 inline-flex w-fit items-center rounded-full border border-ink px-7 py-3 text-[11px] leading-none text-ink transition-colors duration-300 hover:bg-ink hover:text-grey"
+				>
+					{loaded ? (asset ? 'Download ↓' : 'Not in this release — GitHub ↗') : 'Checking…'}
 				</a>
-			</div>
+			</article>
 		{/each}
 	</div>
+</section>
 
-	<!-- requirements + source -->
-	<div class="mt-16 grid grid-cols-1 gap-10 lg:grid-cols-[1fr_1fr]">
-		<div>
-			<h3 class="mono text-[11px] text-ink">Requirements</h3>
-			<ul class="mono mt-4 space-y-2 text-[11px] leading-[1.7] text-ink">
-				{#each downloads.requirements as r (r)}
-					<li>— {r}</li>
-				{/each}
-			</ul>
-		</div>
-		<div>
-			<h3 class="mono text-[11px] text-ink">Prefer to build it yourself?</h3>
-			<p class="mono mt-4 max-w-[40ch] text-[11px] leading-[1.7] text-ink">
-				ozky is open source. Clone the repo and build the Tauri app from source.
-			</p>
-			<a
-				href={downloads.sourceUrl}
-				class="mono mt-6 inline-flex w-fit items-center rounded-full border border-ink px-7 py-3 text-[11px] leading-none text-ink transition-colors duration-300 hover:bg-ink hover:text-grey"
-			>
-				View source ↗
-			</a>
-		</div>
-	</div>
+<!-- SHA-256 — checksums from the GitHub build -->
+<section class="bg-ink px-8 py-24 text-grey">
+	<h2 class="font-display text-[clamp(1.6rem,3vw,2.6rem)] font-medium tracking-[-0.02em]">
+		SHA-256 checksums
+	</h2>
+	<p class="mono mt-4 max-w-[60ch] text-[11px] leading-[1.8] text-grey">
+		Verify your download against the digest published with the {version ?? 'latest'} release build.
+	</p>
+
+	{#if loaded && checksums.length}
+		<ul class="mono mt-10 space-y-5 text-[10px] leading-[1.7]">
+			{#each checksums as c (c.name)}
+				<li class="border-t border-grey pt-4">
+					<p class="text-gold">{c.name}</p>
+					<p class="mt-1 break-all text-grey">{c.sha}</p>
+				</li>
+			{/each}
+		</ul>
+	{:else}
+		<p class="mono mt-10 text-[11px] text-grey">
+			{loaded
+				? 'No digests published for this release yet — verify against the assets on GitHub.'
+				: 'Loading checksums…'}
+		</p>
+	{/if}
 </section>

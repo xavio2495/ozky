@@ -1,33 +1,32 @@
 # Features
 
-## Core payments
+What you can actually do in the app, grouped by where it lives. Each feature has its own
+page. Everything is **testnet-first and unaudited**.
 
-- **Deposit / Withdraw** — move stablecoins between your public balance and the shielded pool.
-- **Send** — a shielded transfer; amount, sender, and receiver are hidden, and change returns to
-  you automatically.
-- **Consolidate** — merge several notes into one.
-- **Split** — pay one sender's balance out to many recipients in a single transfer.
+## Wallet & balances
 
-## Money movement
+- **[Shielded send](/docs/features/shielded-send)** — pay anyone with amount, sender, and
+  receiver hidden on-chain.
+- **[Deposit & withdraw](/docs/features/deposit-withdraw)** — move value between your public
+  balance and the shielded pool.
+- **[Consolidate & split](/docs/features/notes)** — manage your notes for cleaner, cheaper
+  future spends.
 
-- **Swap** — exchange one asset for another (edge phase; privacy ends at the public DEX leg).
-- **Pay** — pay in one asset funded from another.
-- **Multi-send** — one payment fanned out to many recipients.
+## Payments
 
-## Escrow & channels
-
-- **Escrow** — many payers fund one payee privately (invoices / group pay), with refund on expiry.
-  This is the honest substitute for "pull", since no one can spend your notes for you.
-- **Payment channels** — open a capped, shielded channel for high-frequency draw-down, settled
-  with a single on-chain close.
+- **[Shielded swap & pay](/docs/features/swap)** — swap between stablecoins in-pool (shielded
+  AMM, no public edge) and pay in an asset you don't hold.
+- **[Escrow](/docs/features/escrow)** — private, conditional contribute-then-payout flows.
+- **[Payment channels](/docs/features/channels)** — merchant-pull channel: many authorized
+  draws, one on-chain settlement.
 
 ## Automation
 
-- **Payroll** — a saved recipient list + amounts + cadence, with run history and a "next run".
-  Each run is one multi-output transfer.
-- **Subscriptions** — recurring push payments you control; cancel by removing the schedule.
-- **Keeper** — a local or cloud keeper that **replays wallet-prepared proofs** on schedule. It
-  cannot forge spends — it has no spending key.
+- **[Payroll & subscriptions](/docs/features/payroll)** — the scheduler: recurring shielded
+  payments, run locally or by the cloud keeper.
 
-> Recurring flows amplify timing/amount fingerprints, so correlation defenses (standard
-> denominations, jittered timing) matter most here.
+## Compliance & disclosure
+
+- **[ASP compliance](/docs/features/compliance)** — prove funds are clean without revealing
+  the graph.
+- **[Auditor disclosure](/docs/features/disclosure)** — share scoped, revocable view keys.

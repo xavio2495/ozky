@@ -41,37 +41,41 @@
 <footer bind:this={root} data-footer class="bg-gold px-8 pt-8 pb-8">
 	<!-- black box — 80dvh, slightly rounded -->
 	<div data-box class="flex h-[85dvh] flex-col rounded-[16px] bg-ink px-10 py-12 text-gold">
-		<!-- nav inline with the logo -->
+		<!-- logo left · page nav right-aligned -->
 		<div class="flex flex-wrap items-start gap-x-16 gap-y-10">
 			<div data-ftext><Logo tone="gold" size={30} /></div>
 
-			{#each nav as item (item.label)}
-				<div data-ftext class="font-display text-base leading-tight font-medium">
-					<a href={item.href} class="transition-colors hover:text-grey">
-						{item.label}{#if item.children}<sup class="ml-0.5 text-[0.5em]"
-								>{item.children.length}</sup
-							>{/if}
-					</a>
-					{#if item.children}
-						<ul class="mt-1 space-y-0.5 text-sm">
-							{#each item.children as c (c.label)}
-								<li><a href={c.href} class="transition-colors hover:text-grey">↳ {c.label}</a></li>
-							{/each}
-						</ul>
-					{/if}
-				</div>
-			{/each}
+			<nav class="ml-auto flex flex-wrap items-start justify-end gap-x-12 gap-y-6 text-right">
+				{#each nav as item (item.label)}
+					<div data-ftext class="font-display text-base leading-tight font-medium">
+						<a href={item.href} class="transition-colors hover:text-grey">
+							{item.label}{#if item.children}<sup class="ml-0.5 text-[0.5em]"
+									>{item.children.length}</sup
+								>{/if}
+						</a>
+						{#if item.children}
+							<ul class="mt-1 space-y-0.5 text-sm">
+								{#each item.children as c (c.label)}
+									<li>
+										<a href={c.href} class="transition-colors hover:text-grey">{c.label} ↲</a>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</div>
+				{/each}
+			</nav>
 		</div>
 
-		<!-- tagline + address + socials -->
-		<div data-ftext class="mt-14 grid grid-cols-1 gap-8 sm:grid-cols-3">
+		<!-- tagline + address + socials — justified across the box -->
+		<div data-ftext class="mt-14 flex flex-col gap-8 sm:flex-row sm:justify-between">
 			<p class="mono max-w-[16ch] text-[11px] leading-relaxed">
 				{#each footer.tagline as line (line)}{line}<br />{/each}
 			</p>
-			<p class="mono text-[11px] leading-relaxed">
+			<p class="mono text-[11px] leading-relaxed sm:text-center">
 				{#each footer.address as line (line)}{line}<br />{/each}
 			</p>
-			<ul class="mono space-y-1 text-[11px] leading-relaxed">
+			<ul class="mono space-y-1 text-[11px] leading-relaxed sm:text-right">
 				{#each footer.links as l (l.label)}
 					<li><a href={l.href} class="transition-colors hover:text-grey">{l.label} ↗</a></li>
 				{/each}

@@ -5,9 +5,20 @@ export type SubLink = { label: string; href: string };
 export type NavItem = { label: string; href: string; children?: SubLink[] };
 
 export const nav: NavItem[] = [
+	{ label: 'Home', href: '/' },
 	{ label: 'Download', href: '/downloads' },
 	{ label: 'Quickstart', href: '/quickstart' },
-	{ label: 'Docs', href: '/docs' },
+	{
+		label: 'Docs',
+		href: '/docs',
+		children: [
+			{ label: 'Concepts', href: '/docs/concepts' },
+			{ label: 'Contracts', href: '/docs/contracts' },
+			{ label: 'Circuits', href: '/docs/circuits' },
+			{ label: 'Features', href: '/docs/features' },
+			{ label: 'Cloud runtimes', href: '/docs/cloud' }
+		]
+	},
 	{ label: 'About', href: '/about' }
 ];
 

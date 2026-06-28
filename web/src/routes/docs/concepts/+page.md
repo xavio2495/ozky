@@ -1,20 +1,19 @@
 # Concepts
 
-ozky's engine is a UTXO shielded pool. A few primitives do all the work.
+ozky is a **UTXO shielded pool** for stablecoins on Stellar/Soroban — not account
+balances. This page covers the zero-knowledge primitives it is built on and **where each
+one shows up in the app**. It is testnet-first and unaudited.
 
-## Notes
+## Notes — the unit of value
 
-Your balance is not an account number — it is a set of **notes**. A note is private data held
-by its owner:
+Your balance is a set of private **notes**, never a public number. A note is private data
+held by its owner — `value`, `asset_tag`, `owner_pk`, a random `blinding`, the `epoch`,
+and a per-note seed `rho`. On-chain a note exists only as its commitment.
 
-- `value` — the amount, in base units
-- `asset_tag` — which asset (USDC, USDT, EURC); a note redeems only against its own vault
-- `owner_pk` — the owner's public spending key
-- `blinding` — random value that makes the commitment hiding
-- `epoch` — the ledger window the note belongs to
-- `rho` — a per-note nullifier seed
+_Where in the app:_ the **Wallet** page shows your spendable balance by scanning and
+summing the notes only you can decrypt.
 
-## Commitments
+## Commitments & the Merkle tree
 
 The on-chain leaf is a **Poseidon commitment** to the note:
 
@@ -22,28 +21,74 @@ The on-chain leaf is a **Poseidon commitment** to the note:
 commitment = Poseidon(value, asset_tag, owner_pk, blinding, epoch, rho)
 ```
 
-Commitments are appended to an append-only **Merkle tree** (depth 20). The tree's root is
-published on-chain.
+Commitments are appended to an append-only **Merkle tree** (depth 20). The root is the
+public anchor for "all value that exists in the pool."
 
-## Nullifiers
+_Where in the app:_ every action that creates value — **Deposit**, change from a
+**Send**, a **Swap** output — appends a new commitment.
 
-To spend a note you publish a **nullifier**:
+## Nullifiers — spending without linking
+
+To spend a note you publish a **nullifier** and prove in zero-knowledge that the note is
+in the tree:
 
 ```
 nullifier = Poseidon(rho, owner_sk)
 ```
 
-It is deterministic (so double-spends are caught), unlinkable to the commitment, and only the
-note's owner can produce it. **Nobody can spend your notes for you** — there is no "pull".
+It is deterministic (double-spends are caught), unlinkable to the commitment, and only the
+owner can produce it — there is no "pull". So spends can't be linked to deposits.
 
-## View tags & epochs
+_Where in the app:_ **Send**, **Withdraw**, **Swap**, and **Consolidate** spend notes and
+publish nullifiers; the **Transactions** page reads your local history, not the chain graph.
 
-A cheap **view tag** lets you scan the chain for notes addressed to you without trial-decrypting
-everything. **Epochs** are deterministic ledger-sequence windows used for view-key scoping,
-batching, and archiving — derived from the ledger, with no oracle or wall-clock.
+## Proving — Noir / UltraHonk
 
-## Keys
+Proofs are written as **Noir** circuits and proved with **UltraHonk**, fully
+**client-side** in the native Rust core, off the UI thread. The chain only ever sees a
+proof and its public inputs — never your keys or amounts.
 
-Everything derives from a single **12-word recovery phrase**: it produces your Stellar key and,
-separately, a BN254-native ZK spending key plus a hierarchy of viewing keys scoped by
-`(account, asset, epoch)`. The ZK keys are derived from — never equal to — the Stellar key.
+_Where in the app:_ proving runs in the `ozky-prover` sidecar; the UI just shows progress.
+
+## View tags & scanning
+
+Incoming notes are found by trial-decryption accelerated with cheap **view tags**, so you
+scan the chain for your notes without decrypting everything. Scanning runs in the Rust core.
+
+_Where in the app:_ receiving a payment "just appears" in **Wallet** once the scanner
+detects it.
+
+## Keys — separate from your Stellar key
+
+Everything derives from one **12-word BIP39 phrase**, but the in-circuit **`owner_sk`**
+(BN254-native) is **never** the Ed25519 Stellar key — they are kept separate by design.
+A **BIP32-style view-key tree** derives scoped, revocable read-only keys per
+`account / asset / epoch`.
+
+_Where in the app:_ **Settings** manages the phrase; the **Auditor** page hands out scoped
+view keys. See **[Auditor disclosure](/docs/features/disclosure)**.
+
+## Compliance — approved-set membership
+
+Every transfer proves **in-circuit** that its funds trace to a depositor in an
+**Association Set Provider (ASP)** approved set — without revealing which one. Shielded
+funds are provably clean while the graph stays private.
+
+_Where in the app:_ surfaced as a status on **Send/Withdraw**; see
+**[ASP compliance](/docs/features/compliance)**.
+
+## Epochs
+
+Note encryption and view-key scoping are partitioned by **epoch**
+(`LEDGER_PER_EPOCH = 110_000`) — deterministic ledger-sequence windows, no oracle or
+wall-clock. Epochs bound disclosure windows and keep scanning bounded.
+
+## The edges
+
+Privacy is strongest **inside** the pool. **Deposits, withdrawals, and bridges** are public
+Stellar legs — ozky labels them and offers a denomination/timing policy to reduce
+correlation, framed as _speed vs. privacy_. (Swaps are now a fully in-pool
+**[shielded AMM](/docs/features/swap)** — no public DEX edge.) A pre-funded **relayer** pays
+XLM fees so you never touch a public XLM account.
+
+> Next: **[Contracts](/docs/contracts)** — the on-chain layer that verifies all of this.

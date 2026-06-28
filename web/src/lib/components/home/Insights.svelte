@@ -114,7 +114,8 @@
 	     edges never double up; the outer right/bottom edges are closed on the container. -->
 	<div class="grid w-1/2 grid-cols-2 border-r border-b border-ink">
 		{#each integrations as item (item.title)}
-			<article
+			<a
+				href={item.href}
 				data-cell
 				class="group relative flex h-[45dvh] flex-col justify-end p-8 text-ink transition-colors duration-300 hover:bg-ink hover:text-grey"
 			>
@@ -126,7 +127,7 @@
 					{item.title}
 				</h3>
 				<p class="mono mt-3 text-[10px] tracking-[0.08em]">{item.sub}</p>
-			</article>
+			</a>
 		{/each}
 	</div>
 </section>

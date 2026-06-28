@@ -51,7 +51,7 @@
 					onclick={() => toggle(item.label)}
 					class="font-display flex w-fit items-start text-[clamp(1.4rem,2.6vw,2.2rem)] leading-[1.15] font-semibold tracking-[-0.03em] text-ink"
 				>
-					{item.label}<sup class="mt-1 ml-1 text-[0.3em] font-medium">{item.children.length}</sup>
+					{item.label}<sup class="mt-5 ml-0.5 text-[0.5em] font-medium">{item.children.length}</sup>
 				</button>
 				{#if expanded === item.label}
 					<ul

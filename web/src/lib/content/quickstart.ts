@@ -1,11 +1,20 @@
 // Quickstart page content — zero to first shielded payment.
-export const quickstart = {
+type Step = { title: string; body: string; href?: string; hrefLabel?: string };
+
+export const quickstart: {
+	heading: string;
+	blurb: string;
+	steps: Step[];
+	footerNote: string;
+} = {
 	heading: 'Quickstart.',
 	blurb: 'From install to your first fully shielded payment in about five minutes.',
 	steps: [
 		{
 			title: 'Download & install',
-			body: 'Grab the desktop app for macOS, Windows, or Linux and open it.'
+			body: 'Grab the desktop app for macOS, Windows, or Linux and open it.',
+			href: '/downloads',
+			hrefLabel: 'Go to downloads ↗'
 		},
 		{
 			title: 'Create your wallet',

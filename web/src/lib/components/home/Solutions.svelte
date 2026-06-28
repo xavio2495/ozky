@@ -135,11 +135,12 @@
 				</h3>
 				<p class="mono mt-4 max-w-[42ch] text-[11px] leading-[1.7] text-ink">{card.body}</p>
 				<div class="mt-7">
-					<span
+					<a
+						href={card.href}
 						class="mono inline-flex items-center rounded-full border border-ink px-7 py-3 text-[11px] leading-none text-ink transition-colors duration-300 group-hover:bg-ink group-hover:text-grey"
 					>
-						Explore
-					</span>
+						Explore ↗
+					</a>
 				</div>
 			</article>
 		{/each}

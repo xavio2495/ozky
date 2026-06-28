@@ -3,8 +3,8 @@
 export const lander = {
 	titleTop: 'Fully',
 	titleBottom: 'Shielded',
-	subhead: 'Private Payments for Every Asset, Every Wallet, Every Transfer.',
-	tagline: 'Powering private stablecoin payments across Stellar and Soroban.',
+	subhead: 'Powering private stablecoin payments on Stellar',
+	tagline: '',
 	status: [
 		'Poseidon Commitments',
 		'Nullifiers',
@@ -35,59 +35,104 @@ export const lander = {
 		}
 	],
 	exploreLabel: 'Explore the platform.',
-	exploreHref: '/technology'
+	exploreHref: '/downloads'
 };
 
 export type SolutionCard = {
 	title: string;
 	body: string;
+	href: string;
 	graphic: 'tetra' | 'globe' | 'halftone' | 'starburst';
 };
 
 export const solutions = {
-	heading: 'Shielded Money Solutions',
+	heading: 'Zero-knowledge money — for the jobs a wallet actually does.',
 	cards: [
 		{
-			title: 'Shielded Send',
-			body: 'Move USDC, USDT, and EURC with amount, sender, and receiver hidden on-chain by default.',
+			title: 'Pay many at once',
+			body: 'One shielded transfer fans out to many recipients — split a bill, pay a team — amounts and parties hidden on-chain.',
+			href: '/docs/features/notes',
 			graphic: 'tetra'
 		},
 		{
-			title: 'Selective Disclosure',
-			body: 'Share scoped, revocable view keys so an auditor sees exactly what they need — nothing more.',
+			title: 'Run payroll',
+			body: 'Scheduled shielded payouts over a saved list, run locally or by a cloud keeper that never holds a spending key.',
+			href: '/docs/features/payroll',
 			graphic: 'globe'
 		},
 		{
-			title: 'Compliance',
-			body: 'In-circuit approved-set membership keeps shielded funds provably clean without revealing balances.',
+			title: 'Show your books',
+			body: 'Hand an auditor a scoped, revocable view key — they verify against the chain and see nothing outside the scope.',
+			href: '/docs/features/disclosure',
 			graphic: 'halftone'
 		},
 		{
-			title: 'Research',
-			body: 'Open primitives — Poseidon commitments, nullifiers, UltraHonk proofs — built in the open on Soroban.',
+			title: 'Escrow & group pay',
+			body: 'Many payers fund one payee privately, with a guaranteed refund on expiry — the honest substitute for a "pull".',
+			href: '/docs/features/escrow',
 			graphic: 'starburst'
+		},
+		{
+			title: 'Swap in private',
+			body: 'Move between stablecoins on an in-pool shielded AMM — one atomic transaction, no public DEX edge.',
+			href: '/docs/features/swap',
+			graphic: 'tetra'
+		},
+		{
+			title: 'Stay compliant',
+			body: 'Every spend proves in-circuit that funds trace to an approved set — provably clean, with the graph still private.',
+			href: '/docs/features/compliance',
+			graphic: 'globe'
 		}
 	] as SolutionCard[]
 };
 
+export type FeatureTile = { title: string; sub: string; href: string };
+
 export const integrates = {
-	title: 'ozky integrates.',
+	title: 'Every feature, end to end.',
 	blurb:
-		'Private rails for the money and tooling you already use — every layer of the open Stellar stack, shielded by default.',
+		'Each capability the wallet ships today — open the docs to see exactly how it works on Stellar and Soroban.',
 	items: [
-		{ title: 'Stellar', sub: 'Settlement Layer' },
-		{ title: 'Soroban', sub: 'Smart Contracts' },
-		{ title: 'USDC', sub: 'Shielded Stablecoin' },
-		{ title: 'EURC', sub: 'Shielded Stablecoin' },
-		{ title: 'Noir · UltraHonk', sub: 'Zero-Knowledge Prover' },
-		{ title: 'Poseidon · BN254', sub: 'In-Circuit Hashing' },
-		{ title: 'Freighter', sub: 'Wallet Signing' },
-		{ title: 'Stellar SDK', sub: 'Transaction Layer' }
-	]
+		{
+			title: 'Shielded send',
+			sub: 'Hidden amount, sender, receiver',
+			href: '/docs/features/shielded-send'
+		},
+		{
+			title: 'Deposit & withdraw',
+			sub: 'Shield / unshield at the edge',
+			href: '/docs/features/deposit-withdraw'
+		},
+		{ title: 'Consolidate & split', sub: 'Manage notes, pay many', href: '/docs/features/notes' },
+		{ title: 'Shielded swap', sub: 'In-pool shielded AMM', href: '/docs/features/swap' },
+		{ title: 'Escrow', sub: 'Contribute-then-payout', href: '/docs/features/escrow' },
+		{
+			title: 'Payment channels',
+			sub: 'Merchant-pull, one settlement',
+			href: '/docs/features/channels'
+		},
+		{
+			title: 'Payroll & subscriptions',
+			sub: 'Scheduled shielded payouts',
+			href: '/docs/features/payroll'
+		},
+		{
+			title: 'Auditor disclosure',
+			sub: 'Scoped, revocable view keys',
+			href: '/docs/features/disclosure'
+		},
+		{
+			title: 'ASP compliance',
+			sub: 'Provably clean, still private',
+			href: '/docs/features/compliance'
+		},
+		{ title: 'All features', sub: 'Read the docs ↗', href: '/docs/features' }
+	] as FeatureTile[]
 };
 
 export const cta = {
 	lead: 'Ready to go',
 	emphasis: 'fully shielded?',
-	download: { label: 'Download ozky', href: '/' }
+	download: { label: 'Download ozky', href: '/downloads' }
 };

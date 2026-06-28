@@ -3,8 +3,18 @@
 	// new random rune on its OWN random schedule (0.5–3s) and fades in, so the field
 	// shimmers asynchronously like decoding glyphs. Runes are masked to grey; an
 	// occasional cell flashes gold. Decorative; pointer-events:none.
+	//
+	// `fill` makes it cover its (absolutely-positioned) parent — used by the Loader —
+	// sizing the count to the viewport instead of the fixed 8-row band.
 	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
+
+	let {
+		fill = false,
+		cell = 16,
+		gap = 7,
+		runeSize = 14
+	}: { fill?: boolean; cell?: number; gap?: number; runeSize?: number } = $props();
 
 	const RUNES = [
 		'sym_back_c',
@@ -27,8 +37,6 @@
 		'sym_v_doublecross_line',
 		'sym_window'
 	];
-	// 8 rows; auto-fill clips overflow columns on any panel width.
-	const COUNT = 160;
 	const rune = () => RUNES[(Math.random() * RUNES.length) | 0];
 	const opacity = () => 0.28 + Math.random() * 0.38;
 	const gold = () => Math.random() < 0.12;
@@ -37,7 +45,15 @@
 	let cells = $state<{ r: string; o: number; g: boolean }[]>([]);
 
 	onMount(() => {
-		cells = Array.from({ length: COUNT }, () => ({ r: rune(), o: opacity(), g: gold() }));
+		// 8 rows by default; full-screen sizes to the viewport (capped for perf).
+		let count = 160;
+		if (fill) {
+			const pitch = cell + gap;
+			const cols = Math.ceil(window.innerWidth / pitch);
+			const rows = Math.ceil(window.innerHeight / pitch);
+			count = Math.min(cols * rows + cols, 800);
+		}
+		cells = Array.from({ length: count }, () => ({ r: rune(), o: opacity(), g: gold() }));
 		const timers: ReturnType<typeof setTimeout>[] = [];
 		const schedule = (i: number) => {
 			timers[i] = setTimeout(() => {
@@ -45,12 +61,17 @@
 				schedule(i);
 			}, nextDelay());
 		};
-		for (let i = 0; i < COUNT; i++) schedule(i);
+		for (let i = 0; i < count; i++) schedule(i);
 		return () => timers.forEach(clearTimeout);
 	});
 </script>
 
-<div class="field" aria-hidden="true">
+<div
+	class="field"
+	class:fill
+	style="--cell:{cell}px; --gap:{gap}px; --rune:{runeSize}px;"
+	aria-hidden="true"
+>
 	{#each cells as cell, i (i)}
 		<span class="cell">
 			{#key cell.r}
@@ -69,12 +90,21 @@
 <style>
 	.field {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(16px, 1fr));
-		grid-auto-rows: 16px;
-		gap: 7px;
-		max-height: calc(8 * 16px + 7 * 7px);
+		grid-template-columns: repeat(auto-fill, minmax(var(--cell), 1fr));
+		grid-auto-rows: var(--cell);
+		gap: var(--gap);
+		max-height: calc(8 * var(--cell) + 7 * var(--gap));
 		overflow: hidden;
 		pointer-events: none;
+	}
+	.field.fill {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		max-height: none;
+		justify-content: center;
+		align-content: center;
 	}
 	.cell {
 		position: relative;
@@ -83,8 +113,8 @@
 	}
 	.rune {
 		position: absolute;
-		width: 14px;
-		height: 14px;
+		width: var(--rune);
+		height: var(--rune);
 		-webkit-mask-repeat: no-repeat;
 		mask-repeat: no-repeat;
 		-webkit-mask-position: center;

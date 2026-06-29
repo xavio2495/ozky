@@ -23,6 +23,8 @@
 	import CoinsIcon from '@lucide/svelte/icons/coins';
 	import ServerIcon from '@lucide/svelte/icons/server';
 	import LogOutIcon from '@lucide/svelte/icons/log-out';
+	import BugIcon from '@lucide/svelte/icons/bug';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { toast } from 'svelte-sonner';
 	import { api, errMessage, type RecoveryExport } from '$lib/api';
 	import { wallet, runAction } from '$lib/wallet.svelte';
@@ -191,6 +193,15 @@
 			loggingOut = false;
 		}
 	}
+
+	// Open the GitHub "new issue" page in the user's real browser (not the webview).
+	async function reportBug() {
+		try {
+			await openUrl('https://github.com/xavio2495/ozky/issues/new');
+		} catch (e) {
+			toast.error('Could not open browser', { description: errMessage(e) });
+		}
+	}
 </script>
 
 <div class="hub">
@@ -338,6 +349,19 @@
 					Consolidate
 				</Button>
 			</div>
+		</section>
+
+		<!-- Report a bug ------------------------------------------------------->
+		<section class="card pane">
+			<div class="pane-head"><BugIcon class="size-4 text-primary" /><h2 class="pane-title">Report a bug</h2></div>
+			<p class="hint">
+				Hit something broken or unexpected? Open an issue on GitHub — describe what you did and
+				what happened. Opens in your browser.
+			</p>
+			<Button variant="outline" class="self-start" onclick={reportBug}>
+				<BugIcon data-icon="inline-start" />
+				Report a bug
+			</Button>
 		</section>
 
 		<!-- Sign out ----------------------------------------------------------->

@@ -62,6 +62,8 @@
 		pointer-events: none;
 		background:
 			radial-gradient(120% 80% at 50% 0%, color-mix(in oklch, var(--primary) 6%, transparent), transparent 60%),
+			radial-gradient(55% 40% at 0% 100%, color-mix(in oklch, var(--primary) 6%, transparent), transparent 60%),
+			radial-gradient(55% 40% at 100% 100%, color-mix(in oklch, var(--primary) 6%, transparent), transparent 60%),
 			var(--background);
 	}
 	.cell {

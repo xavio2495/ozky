@@ -21,6 +21,17 @@ const SERVICES = [
 	['keeper', 'OZKY_KEEPER_URL']
 ] as const;
 
+// Non-secret deployment config the built app needs but can't hardcode (it ships without
+// ozky.config.json). These are public on-chain contract IDs + network endpoints — safe to
+// serve. Do NOT add OZKY_RELAYER_SECRET or any key material here; this endpoint is public.
+const CONFIG_KEYS = [
+	'OZKY_POOL_CONTRACT',
+	'OZKY_POLICY_CONTRACT',
+	'OZKY_VIEWKEYS_CONTRACT',
+	'OZKY_RPC_URL',
+	'OZKY_NETWORK_PASSPHRASE'
+] as const;
+
 /** GET <url>/health with a short timeout; true on a 2xx, false on anything else. */
 async function probe(url: string): Promise<boolean> {
 	try {
@@ -49,7 +60,16 @@ const handler: RequestHandler = async () => {
 	// `reachable` = at least one configured service answered; lets the app distinguish
 	// "broker reached, backends are configured" from a totally unconfigured deployment.
 	const reachable = Object.values(services).some((s) => s.up);
-	return json({ ok: true, reachable, services }, { headers: CORS });
+
+	// Non-secret deployment config the built app applies as a cfg_var fallback (pool/policy
+	// contract IDs, network endpoints) so it works without a local ozky.config.json.
+	const config: Record<string, string> = {};
+	for (const k of CONFIG_KEYS) {
+		const v = env[k]?.trim();
+		if (v) config[k] = v;
+	}
+
+	return json({ ok: true, reachable, services, config }, { headers: CORS });
 };
 
 // The app POSTs to discover (per the connect flow); GET is supported for manual checks.

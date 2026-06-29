@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
+	import { page } from '$app/stores';
 	import { fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import * as Tabs from '$lib/components/ui/tabs';
@@ -37,7 +39,11 @@
 	import DownloadIcon from '@lucide/svelte/icons/download';
 
 	type Tab = 'payroll' | 'subscriptions' | 'channels' | 'escrow';
-	let tab = $state<Tab>('payroll');
+	// Honors a `?tab=` param so dashboard links (e.g. /payroll?tab=escrow) land on that tab.
+	const tabParam = get(page).url.searchParams.get('tab') ?? '';
+	let tab = $state<Tab>(
+		(['payroll', 'subscriptions', 'channels', 'escrow'].includes(tabParam) ? tabParam : 'payroll') as Tab
+	);
 	let proving = $state(false);
 	let provingTitle = $state('Working');
 

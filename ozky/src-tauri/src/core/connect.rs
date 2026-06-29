@@ -1,17 +1,22 @@
 //! Service discovery via the marketing site's `/connect` broker.
 //!
-//! The shipped app does NOT hardcode the GCP (Cloud Run) backend URLs. Instead it asks
-//! the website's `/connect` endpoint (`OZKY_CONNECT_URL`, default `https://ozky.vercel.app
-//! /connect`), which reads the URLs from its own env vars and live-probes each service's
-//! `/health`. The app uses the returned links to reach the servers; if a needed server is
+//! The shipped app does NOT hardcode the GCP (Cloud Run) backend URLs or the deployed
+//! contract IDs. Instead it asks the website's `/connect` endpoint (`OZKY_CONNECT_URL`,
+//! default `https://ozky.vercel.app/connect`), which reads the URLs + non-secret config
+//! from its own env vars and live-probes each service's `/health`. The app uses the
+//! returned links to reach the servers and the returned `config` (pool/policy/viewkeys
+//! contract IDs + network endpoints) as a `cfg_var` fallback — so a build with no
+//! `ozky.config.json` still resolves `OZKY_POOL_CONTRACT` etc. If a needed server is
 //! missing or down, the UI shows a "service unavailable — contact the developer" popup.
 //!
-//! Dev override: a present `ozky.config.json` (or env) `OZKY_FUNDER_URL` short-circuits the
-//! funder lookup to a local service, so discovery isn't required while developing.
+//! Dev override: a present `ozky.config.json` (or env) value short-circuits the matching
+//! lookup, so discovery isn't required while developing.
 
 use super::config::cfg_var;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const DEFAULT_CONNECT_URL: &str = "https://ozky.vercel.app/connect";
 
@@ -51,22 +56,76 @@ struct ConnectResponse {
     reachable: bool,
     #[serde(default)]
     services: Services,
+    #[serde(default)]
+    config: HashMap<String, String>,
 }
 
-/// POST the broker and parse the discovery result. Never errors: a broker/transport
-/// failure yields `Discovery::default()` (everything down), which the UI treats as
-/// "services unavailable".
+/// In-memory cache of the non-secret config the broker returned (`OZKY_*` → value).
+/// Read by `config::cfg_var` as the last fallback after env + `ozky.config.json`.
+fn discovered_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A config value the broker previously returned, if any.
+pub fn discovered_var(key: &str) -> Option<String> {
+    discovered_cache().lock().ok()?.get(key).cloned()
+}
+
+fn store_config(cfg: HashMap<String, String>) {
+    if let Ok(mut g) = discovered_cache().lock() {
+        for (k, v) in cfg {
+            if !v.trim().is_empty() {
+                g.insert(k, v);
+            }
+        }
+    }
+}
+
+/// POST the broker and parse the discovery result, caching any returned config. Never
+/// errors: a broker/transport failure yields `Discovery::default()` (everything down),
+/// which the UI treats as "services unavailable".
 pub fn discover() -> Discovery {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).build();
     match agent.post(&connect_url()).call() {
         Ok(resp) => match resp.into_json::<ConnectResponse>() {
-            Ok(parsed) => Discovery {
-                broker_reachable: true,
-                reachable: parsed.reachable,
-                services: parsed.services,
-            },
+            Ok(parsed) => {
+                store_config(parsed.config);
+                Discovery {
+                    broker_reachable: true,
+                    reachable: parsed.reachable,
+                    services: parsed.services,
+                }
+            }
             Err(_) => Discovery { broker_reachable: true, ..Default::default() },
         },
         Err(_) => Discovery::default(),
+    }
+}
+
+/// Lazily populate the config cache from the broker when a needed contract ID isn't yet
+/// known — used by `PoolConfig::load()` in a build without `ozky.config.json`. No-op once
+/// the cache has the pool contract; throttled to one attempt / 20s so a down broker can't
+/// stall every call with repeated timeouts.
+pub fn ensure_discovered() {
+    if discovered_var("OZKY_POOL_CONTRACT").is_some() {
+        return;
+    }
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let gate = LAST.get_or_init(|| Mutex::new(None));
+    let attempt = {
+        let mut g = match gate.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        let ok = g.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(20));
+        if ok {
+            *g = Some(now);
+        }
+        ok
+    };
+    if attempt {
+        discover();
     }
 }

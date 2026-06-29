@@ -15,9 +15,11 @@
 	import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right';
 	import ScaleIcon from '@lucide/svelte/icons/scale';
 
+	// Send/Receive/Deposit are tabs of the Wallet page (receive = its QR panel), not their
+	// own routes — link to /wallet with a ?tab= the page honors. Swap/Audit are real routes.
 	const actions = [
-		{ href: '/send', label: 'Send', icon: ArrowUpRightIcon },
-		{ href: '/receive', label: 'Receive', icon: ArrowDownLeftIcon },
+		{ href: '/wallet?tab=send', label: 'Send', icon: ArrowUpRightIcon },
+		{ href: '/wallet', label: 'Receive', icon: ArrowDownLeftIcon },
 		{ href: '/swap', label: 'Swap', icon: ArrowLeftRightIcon },
 		{ href: '/auditor', label: 'Audit', icon: ScaleIcon }
 	];
@@ -90,20 +92,20 @@
 		for (const p of wallet.payrolls.filter((p) => p.due))
 			rows.push({ label: `Payroll "${p.label}" due`, href: '/payroll' });
 		for (const s of wallet.subscriptions.filter((s) => s.due))
-			rows.push({ label: `Subscription "${s.label}" due`, href: '/subscriptions' });
+			rows.push({ label: `Subscription "${s.label}" due`, href: '/payroll?tab=subscriptions' });
 		for (const e of wallet.escrows.filter((e) => e.releasable || e.refundable))
 			rows.push({
 				label: `Escrow #${e.id} ${e.releasable ? 'releasable' : 'refundable'}`,
-				href: '/escrow'
+				href: '/payroll?tab=escrow'
 			});
 		for (const c of wallet.channels.filter((c) => c.closeable || c.reclaimable))
 			rows.push({
 				label: `Channel #${c.id} ${c.closeable ? 'closeable' : 'reclaimable'}`,
-				href: '/subscriptions'
+				href: '/payroll?tab=channels'
 			});
 		for (const pb of wallet.publicBalances)
 			if ((Number(pb.balance) || 0) > 0)
-				rows.push({ label: `Deposit ${prettyAmount(pb.balance)} ${pb.code}`, href: '/deposit' });
+				rows.push({ label: `Deposit ${prettyAmount(pb.balance)} ${pb.code}`, href: '/wallet?tab=self' });
 		return rows;
 	});
 	let activityTab = $state<'recent' | 'upcoming'>('upcoming');
@@ -115,7 +117,7 @@
 			if (p.next_run_unix) list.push({ label: `Payroll "${p.label}"`, ts: p.next_run_unix, href: '/payroll' });
 		for (const s of wallet.subscriptions)
 			if (s.next_run_unix)
-				list.push({ label: `Subscription "${s.label}"`, ts: s.next_run_unix, href: '/subscriptions' });
+				list.push({ label: `Subscription "${s.label}"`, ts: s.next_run_unix, href: '/payroll?tab=subscriptions' });
 		return list.sort((a, b) => a.ts - b.ts).slice(0, 6);
 	});
 

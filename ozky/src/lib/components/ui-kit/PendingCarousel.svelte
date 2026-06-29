@@ -53,7 +53,7 @@
 			icon: Repeat2Icon,
 			title: 'Merchant channels',
 			body: 'Let merchants pull up to a hidden per-period cap — cancel anytime.',
-			href: '/subscriptions',
+			href: '/payroll?tab=channels',
 			cta: 'Explore channels'
 		},
 		{

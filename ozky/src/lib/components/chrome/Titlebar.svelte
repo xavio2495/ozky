@@ -15,6 +15,11 @@
 
 	const appWindow = getCurrentWindow();
 
+	// On macOS the window uses native controls (Overlay traffic lights, top-left — see
+	// tauri.macos.conf.json), so we hide our custom min/max/close buttons there and let the
+	// OS draw them; the action buttons (notifications/settings/lock) stay right-aligned.
+	const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent);
+
 	async function lock() {
 		try {
 			await wallet.lock();
@@ -41,17 +46,19 @@
 			<div class="sep"></div>
 		{/if}
 
-		<div class="controls">
-			<button class="ctl" aria-label="Minimize" onclick={() => appWindow.minimize()}>
-				<MinusIcon class="size-3.5" />
-			</button>
-			<button class="ctl" aria-label="Maximize" onclick={() => appWindow.toggleMaximize()}>
-				<SquareIcon class="size-3" />
-			</button>
-			<button class="ctl close" aria-label="Close" onclick={() => appWindow.close()}>
-				<XIcon class="size-3.5" />
-			</button>
-		</div>
+		{#if !isMac}
+			<div class="controls">
+				<button class="ctl" aria-label="Minimize" onclick={() => appWindow.minimize()}>
+					<MinusIcon class="size-3.5" />
+				</button>
+				<button class="ctl" aria-label="Maximize" onclick={() => appWindow.toggleMaximize()}>
+					<SquareIcon class="size-3" />
+				</button>
+				<button class="ctl close" aria-label="Close" onclick={() => appWindow.close()}>
+					<XIcon class="size-3.5" />
+				</button>
+			</div>
+		{/if}
 	</div>
 </header>
 

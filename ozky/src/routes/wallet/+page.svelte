@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
+	import { page } from '$app/stores';
 	import { fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import * as Tabs from '$lib/components/ui/tabs';
@@ -141,7 +143,9 @@
 	let proving = $state(false);
 	let provingTitle = $state('Working');
 	// Active right-side tab — Advanced collapses the left column for a bigger canvas.
-	let activeTab = $state('send');
+	// Honors a `?tab=` param so dashboard quick-actions (e.g. /wallet?tab=send) land here.
+	const tabParam = get(page).url.searchParams.get('tab') ?? '';
+	let activeTab = $state(['self', 'send', 'multi', 'advanced'].includes(tabParam) ? tabParam : 'send');
 	let advRef = $state<WalletAdvanced>();
 
 	async function refresh() {

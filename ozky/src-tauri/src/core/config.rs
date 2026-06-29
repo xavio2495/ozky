@@ -30,12 +30,14 @@ fn file_config() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Resolve an `OZKY_*` setting: environment first, then the config file, else `None`.
+/// Resolve an `OZKY_*` setting: environment first, then the config file, then any value the
+/// `/connect` broker supplied (built app with no `ozky.config.json`), else `None`.
 pub fn cfg_var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| file_config().get(key).cloned().filter(|s| !s.is_empty()))
+        .or_else(|| super::connect::discovered_var(key).filter(|s| !s.is_empty()))
 }
 
 /// A v1 asset the wallet can transact. `tag` is the in-circuit `asset_tag` (bound into
@@ -136,6 +138,11 @@ impl PoolConfig {
     /// Resolve from the environment. `OZKY_POOL_CONTRACT` is required (the deployed
     /// pool's id); the rest fall back to testnet defaults.
     pub fn load() -> Result<PoolConfig, CoreError> {
+        // A build without `ozky.config.json` has no contract IDs — pull them (pool/policy/
+        // viewkeys + network) from the `/connect` broker, cached after the first success.
+        if cfg_var("OZKY_POOL_CONTRACT").is_none() {
+            super::connect::ensure_discovered();
+        }
         let pool_contract = cfg_var("OZKY_POOL_CONTRACT").ok_or_else(|| {
             CoreError::Chain(
                 "OZKY_POOL_CONTRACT not set (the deployed pool contract id to send against)".into(),
@@ -220,11 +227,15 @@ mod tests {
     fn load_requires_pool_contract() {
         // With neither the env var NOR a config file providing it, load() errors. Point
         // OZKY_CONFIG at a nonexistent path so the dev machine's ozky.config.json (which
-        // legitimately sets the contract) doesn't satisfy the requirement here.
+        // legitimately sets the contract) doesn't satisfy the requirement here. Point the
+        // /connect broker at a dead local address so the discovery fallback fails fast
+        // (hermetic — no real network) and load() still errors.
         std::env::remove_var("OZKY_POOL_CONTRACT");
         std::env::set_var("OZKY_CONFIG", "/nonexistent/ozky.config.json");
+        std::env::set_var("OZKY_CONNECT_URL", "http://127.0.0.1:1/connect");
         let r = PoolConfig::load();
         std::env::remove_var("OZKY_CONFIG");
+        std::env::remove_var("OZKY_CONNECT_URL");
         assert!(r.is_err());
     }
 

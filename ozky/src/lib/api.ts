@@ -259,6 +259,18 @@ export type AuditResult = {
 	toEpoch: number;
 };
 
+/** One backend service's discovered link + liveness (from the website /connect broker). */
+export type ServiceInfo = { url: string | null; up: boolean };
+
+/** Result of discovering the GCP backend services via the website /connect broker. */
+export type ServiceDiscovery = {
+	/** The website /connect endpoint itself answered. */
+	broker_reachable: boolean;
+	/** At least one backend service is up. */
+	reachable: boolean;
+	services: { funder: ServiceInfo; indexer: ServiceInfo; keeper: ServiceInfo };
+};
+
 export const api = {
 	walletStatus: () => invoke<WalletStatus>('wallet_status'),
 	createWallet: (password: string) => invoke<WalletSetup>('create_wallet', { password }),
@@ -390,6 +402,9 @@ export const api = {
 
 	fundingAddress: () => invoke<string>('funding_address'),
 	receiveAddress: () => invoke<string>('receive_address'),
+
+	/** Discover the GCP backend services (links + liveness) via the website /connect broker. */
+	connectServices: () => invoke<ServiceDiscovery>('connect_services'),
 
 	shareWithAuditor: (auditor: string, fromEpoch: number, toEpoch: number) =>
 		invoke<string>('share_with_auditor', { auditor, fromEpoch, toEpoch }),

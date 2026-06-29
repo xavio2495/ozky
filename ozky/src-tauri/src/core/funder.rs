@@ -10,10 +10,20 @@
 use super::config::cfg_var;
 use super::CoreError;
 
-/// The configured funder endpoint (`OZKY_FUNDER_URL`), or `None` (funding disabled — e.g.
-/// dev without the service deployed).
+/// The funder endpoint (a full `…/fund` URL). A configured `OZKY_FUNDER_URL` (dev / explicit
+/// override) wins; otherwise the shipped app discovers the base URL from the website
+/// `/connect` broker (which only returns it when the service is up) and appends `/fund`.
+/// `None` ⇒ funding disabled (no funder reachable).
 pub fn funder_url() -> Option<String> {
-    cfg_var("OZKY_FUNDER_URL")
+    if let Some(url) = cfg_var("OZKY_FUNDER_URL") {
+        return Some(url);
+    }
+    let svc = super::connect::discover().services.funder;
+    if svc.up {
+        svc.url.map(|u| format!("{}/fund", u.trim_end_matches('/')))
+    } else {
+        None
+    }
 }
 
 /// Ask the funder service to create + fund `address` with the onboarding grant (10 XLM).

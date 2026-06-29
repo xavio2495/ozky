@@ -49,5 +49,9 @@ export const footer = {
 export const meta = {
 	title: 'ozky — fully shielded stablecoin payments',
 	description:
-		'ozky is a fully shielded stablecoin wallet — private payments for every asset, every wallet, every transfer, on Stellar.'
+		'ozky is a fully shielded stablecoin wallet — private payments for every asset, every wallet, every transfer, on Stellar.',
+	// Canonical site URL + social preview image (served from web/static/preview.png).
+	// Update `url` if the production domain changes.
+	url: 'https://ozky.vercel.app',
+	image: 'https://ozky.vercel.app/preview.png'
 };

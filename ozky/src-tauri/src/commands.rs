@@ -1413,6 +1413,15 @@ pub async fn multi_send(
     .await
 }
 
+/// Discover the backend services via the website `/connect` broker: returns each
+/// service's link + liveness, plus whether the broker and any backend are reachable. The
+/// UI calls this on startup and shows a "services unavailable — contact the developer"
+/// popup when nothing is reachable. (connect flow)
+#[tauri::command]
+pub async fn connect_services() -> core::connect::Discovery {
+    blocking(|| Ok(core::connect::discover())).await.unwrap_or_default()
+}
+
 /// This wallet's **public Stellar funding address** (`G…`). Give this to any wallet or
 /// exchange to receive funds publicly; then [`deposit`] shields them into the pool.
 /// This is a normal Stellar account — usable from non-ozky wallets. (A3)

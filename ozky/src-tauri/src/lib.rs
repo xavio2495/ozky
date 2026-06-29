@@ -101,6 +101,7 @@ pub fn run() {
             commands::pay_quote,
             commands::pay,
             commands::multi_send,
+            commands::connect_services,
             commands::funding_address,
             commands::receive_address,
             commands::share_with_auditor,

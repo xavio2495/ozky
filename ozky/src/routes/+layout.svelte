@@ -6,6 +6,7 @@
 	import Onboarding from '$lib/components/onboarding/Onboarding.svelte';
 	import SignIn from '$lib/components/onboarding/SignIn.svelte';
 	import RuneGlyphField from '$lib/components/chrome/RuneGlyphField.svelte';
+	import ServiceStatusGate from '$lib/components/shared/ServiceStatusGate.svelte';
 	import { Toaster } from '$lib/components/ui/sonner';
 	import { Spinner } from '$lib/components/ui/spinner';
 	import { wallet } from '$lib/wallet.svelte';
@@ -28,6 +29,10 @@
 </script>
 
 <Toaster theme="dark" position="top-center" richColors />
+
+{#if ready}
+	<ServiceStatusGate />
+{/if}
 
 <div class="app">
 	<Titlebar />

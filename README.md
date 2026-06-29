@@ -15,7 +15,7 @@
 
 <br>
 
-**[Background](#the-background)** · **[What it does](#what-it-does)** · **[Architecture](#architecture)** · **[User Flow](#user-flow)** · **[Contracts](#deployed-contracts-stellar-testnet)** · **[Circuits](#circuits)** · **[Where it lives](#where-it-lives)** · **[Develop](#continuing-development)** · **[License](#license)**
+**[Background](#the-background)** · **[What it does](#what-it-does)** · **[Install](#install)** · **[Architecture](#architecture)** · **[User Flow](#user-flow)** · **[Contracts](#deployed-contracts-stellar-testnet)** · **[Circuits](#circuits)** · **[Where it lives](#where-it-lives)** · **[Develop](#continuing-development)** · **[License](#license)**
 
 <br><br><br>
 </div>
@@ -67,6 +67,39 @@ You install a desktop app, create a wallet from a 12-word phrase, and move stabl
 - **Share-with-auditor** exports a scoped, read-only view key; the auditor re-derives exactly that scope and verifies every note against chain.
 
 The 12-word phrase derives **two separate keys**: an Ed25519 Stellar key for public transactions and a **BN254-native `owner_sk`** used only in-circuit — the Stellar key is never reused inside a proof.
+
+---
+
+## Install
+
+ozky ships as a native desktop app for **macOS, Windows, and Linux**. Download the latest installer for your OS from the [GitHub Releases](https://github.com/xavio2495/ozky/releases) page (or the site's [Download](https://ozky.vercel.app/downloads) page), then follow the per-OS steps below.
+
+> **Testnet · unaudited** — builds are not notarized or code-signed with a paid certificate, so each OS shows a one-time first-run warning you clear yourself. This is expected and does not mean the app is unsafe.
+
+### macOS — `.dmg` / `.app`
+
+macOS builds are **ad-hoc signed** (free, no Apple Developer certificate), so Gatekeeper reports an "unidentified developer". On first launch:
+
+1. Open the `.dmg` and drag **ozky** into **Applications**.
+2. In Applications, **Control-click** (right-click) **ozky → Open**, then click **Open** in the dialog. (A plain double-click won't show the override.)
+3. If it's still blocked, open  → **System Settings → Privacy & Security**, find the message about ozky, and click **Open Anyway**.
+
+Apple's reference: [Open a Mac app from an unidentified developer](https://support.apple.com/en-in/guide/mac-help/mh40616/mac). You only do this once.
+
+### Windows — `.msi` / `.exe`
+
+The Windows build is **unsigned**, so **SmartScreen** shows "Windows protected your PC" the first time. Signing is *not* required to run ozky — as long as you're fine clearing the SmartScreen prompt (or didn't download through a browser that flags it):
+
+1. Run the `.msi` (or `.exe`).
+2. On the SmartScreen dialog, click **More info → Run anyway**.
+
+### Linux — `.AppImage` / `.deb` / `.rpm`
+
+Installs directly — no signing prompt:
+
+- **AppImage:** `chmod +x ozky_*.AppImage && ./ozky_*.AppImage`
+- **Debian / Ubuntu:** `sudo apt install ./ozky_*.deb`
+- **Fedora / RHEL:** `sudo dnf install ./ozky_*.rpm`
 
 ---
 
@@ -285,13 +318,13 @@ Licensed under the **GNU General Public License v3.0** (GPL-3.0). See [`LICENSE`
 
 ---
 
-<br><br><br>
+<br><br>
 
 <div align="center">
 
 <h3>Built By
 
-[Immanuel](https://github.com/xavio2495)
+[Immanuel](https://github.com/xavio2495) x [Charles](https://github.com/charlesms1246/)
 
 </h3>
 </div>

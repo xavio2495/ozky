@@ -5,8 +5,17 @@
 use super::CoreError;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const CG: &str = "https://api.coingecko.com/api/v3";
+
+/// Spot prices barely move minute-to-minute; cache them so repeated UI calls (wallet store
+/// refresh, swap page, per-token loops) don't each hit CoinGecko's rate-limited free API.
+const SPOT_TTL: Duration = Duration::from_secs(60);
+/// History changes slowly and is heavier; cache longer.
+const HISTORY_TTL: Duration = Duration::from_secs(300);
 
 /// CoinGecko coin id for an ozky asset code. USDC/EURC track fiat but still have a
 /// real (≈1) market price; XLM floats.
@@ -42,6 +51,33 @@ fn get_json(url: &str) -> Result<Value, CoreError> {
         .map_err(|e| CoreError::Chain(format!("price decode: {e}")))
 }
 
+fn cache() -> &'static Mutex<HashMap<String, (Instant, Value)>> {
+    static C: OnceLock<Mutex<HashMap<String, (Instant, Value)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `get_json` with a short-lived in-process cache keyed by URL. Within `ttl` the cached value
+/// is returned without a network call, so repeated UI calls across pages/tokens don't hammer
+/// CoinGecko's rate-limited free API (→ 429). On a fetch error (e.g. a 429), the last cached
+/// value is served even if stale — better than failing the UI with no price.
+fn get_json_cached(url: &str, ttl: Duration) -> Result<Value, CoreError> {
+    if let Some((at, v)) = cache().lock().unwrap().get(url) {
+        if at.elapsed() < ttl {
+            return Ok(v.clone());
+        }
+    }
+    match get_json(url) {
+        Ok(v) => {
+            cache().lock().unwrap().insert(url.to_string(), (Instant::now(), v.clone()));
+            Ok(v)
+        }
+        Err(e) => match cache().lock().unwrap().get(url) {
+            Some((_, v)) => Ok(v.clone()),
+            None => Err(e),
+        },
+    }
+}
+
 /// Current USD spot + 24h change for the given asset codes.
 pub fn spot(codes: &[String]) -> Result<Vec<Spot>, CoreError> {
     let ids: Vec<&str> = codes.iter().filter_map(|c| coin_id(c)).collect();
@@ -52,7 +88,7 @@ pub fn spot(codes: &[String]) -> Result<Vec<Spot>, CoreError> {
         "{CG}/simple/price?ids={}&vs_currencies=usd&include_24hr_change=true",
         ids.join(",")
     );
-    let v = get_json(&url)?;
+    let v = get_json_cached(&url, SPOT_TTL)?;
     let mut out = Vec::new();
     for code in codes {
         if let Some(id) = coin_id(code) {
@@ -73,7 +109,7 @@ pub fn history(code: &str, days: u32) -> Result<Vec<Point>, CoreError> {
     let id = coin_id(code).ok_or_else(|| CoreError::Chain(format!("unknown asset {code}")))?;
     let days = days.clamp(1, 365);
     let url = format!("{CG}/coins/{id}/market_chart?vs_currency=usd&days={days}");
-    let v = get_json(&url)?;
+    let v = get_json_cached(&url, HISTORY_TTL)?;
     let prices = v
         .get("prices")
         .and_then(|p| p.as_array())

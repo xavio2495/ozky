@@ -4,7 +4,7 @@
   "version": "0.2.3",
   "identifier": "com.xavio.ozky",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node src-tauri/dev-prover-bundle.mjs && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build && node src-tauri/stage-prover-bundle.mjs",
     "frontendDist": "../build"

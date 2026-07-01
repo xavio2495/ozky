@@ -235,6 +235,30 @@ pub fn rename_account(index: u32, label: String) -> Result<(), CoreError> {
     core::accounts::rename(index, label)
 }
 
+/// Remove an account from the wallet: erase its seed from the vault, its label, and its
+/// local encrypted data files, then activate a remaining account. Refuses to remove the
+/// only account. Returns the new active index. Irreversible without the recovery phrase. (auth)
+#[tauri::command]
+pub fn remove_account(index: u32) -> Result<u32, CoreError> {
+    core::session::mnemonic()?; // must be unlocked
+    let count = core::session::account_count();
+    if index >= count {
+        return Err(CoreError::Crypto("no such account".into()));
+    }
+    if count <= 1 {
+        return Err(CoreError::Crypto("cannot remove the only account".into()));
+    }
+    // Derive the removed account's address first, so its data files can be cleaned up.
+    let phrase = core::session::mnemonic_at(index)?;
+    let address = core::keys::derive_from_mnemonic(&phrase)?
+        .stellar_address()
+        .to_string();
+    let new_active = core::session::remove_account(index)?;
+    core::accounts::remove(index)?;
+    core::notes::remove_data_files(&address);
+    Ok(new_active)
+}
+
 /// The active account's PUBLIC (unshielded) Stellar balances — XLM + any trustline assets.
 /// Read from Horizon; off the UI thread. (deriving keys + network)
 #[tauri::command]

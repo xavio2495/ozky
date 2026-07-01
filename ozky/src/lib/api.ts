@@ -292,6 +292,7 @@ export const api = {
 	switchAccount: (index: number) => invoke<void>('switch_account', { index }),
 	renameAccount: (index: number, label: string) =>
 		invoke<void>('rename_account', { index, label }),
+	removeAccount: (index: number) => invoke<number>('remove_account', { index }),
 
 	publicBalances: () => invoke<PublicBalance[]>('public_balances'),
 	assetPrices: () => invoke<Spot[]>('asset_prices'),

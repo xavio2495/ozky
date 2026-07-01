@@ -51,6 +51,7 @@ pub fn run() {
             commands::import_account,
             commands::switch_account,
             commands::rename_account,
+            commands::remove_account,
             commands::asset_prices,
             commands::price_history,
             commands::public_balances,

@@ -130,3 +130,29 @@ pub fn add_account(mnemonic: String) -> Result<u32, CoreError> {
     s.active = index;
     Ok(index)
 }
+
+/// Remove the account at `index` (its `Zeroizing` mnemonic is zeroed on drop), re-encrypt
+/// the vault, and remap the active account: removing an account before the active one
+/// shifts it down; removing the active one selects the previous account (or the new first).
+/// Refuses to remove the last remaining account. Returns the new active index.
+pub fn remove_account(index: u32) -> Result<u32, CoreError> {
+    let mut g = lock_guard();
+    let s = g.as_mut().ok_or(CoreError::Locked)?;
+    let i = index as usize;
+    if i >= s.content.accounts.len() {
+        return Err(CoreError::Crypto("no such account".into()));
+    }
+    if s.content.accounts.len() == 1 {
+        return Err(CoreError::Crypto("cannot remove the only account".into()));
+    }
+    s.content.accounts.remove(i);
+    super::vault::save(&s.key, &s.content)?;
+    let mut active = s.active as usize;
+    if active == i {
+        active = i.saturating_sub(1);
+    } else if active > i {
+        active -= 1;
+    }
+    s.active = active.min(s.content.accounts.len() - 1) as u32;
+    Ok(s.active)
+}

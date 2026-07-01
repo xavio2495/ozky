@@ -373,6 +373,15 @@ class WalletStore {
 		await this.refreshAccounts();
 	}
 
+	/** Remove an account (erases its seed + local data), then reload the now-active account. */
+	async removeAccount(index: number) {
+		await api.removeAccount(index);
+		this.activity = [];
+		await this.refreshAccounts();
+		await this.refreshBalances();
+		await this.refreshPublicBalances();
+	}
+
 	async refreshStatus() {
 		this.status = await api.walletStatus();
 	}

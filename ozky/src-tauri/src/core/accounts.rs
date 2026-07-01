@@ -82,6 +82,25 @@ pub fn rename(index: u32, label: String) -> Result<(), CoreError> {
     save(&meta)
 }
 
+/// Remove an account's label and remap the active index. Mirrors the vault-side remap in
+/// [`super::session::remove_account`] so the two stay consistent.
+pub fn remove(index: u32) -> Result<(), CoreError> {
+    let mut meta = load()?;
+    let i = index as usize;
+    if i >= meta.labels.len() {
+        return Err(CoreError::Crypto("no such account".into()));
+    }
+    meta.labels.remove(i);
+    let mut active = meta.active as usize;
+    if active == i {
+        active = i.saturating_sub(1);
+    } else if active > i {
+        active -= 1;
+    }
+    meta.active = active.min(meta.labels.len().saturating_sub(1)) as u32;
+    save(&meta)
+}
+
 /// Remove the account-metadata entry entirely (logout / device wipe).
 pub fn wipe() -> Result<(), CoreError> {
     super::keychain::delete(META_ACCOUNT)

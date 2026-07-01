@@ -1,6 +1,7 @@
 <script lang="ts">
 	import * as Popover from '$lib/components/ui/popover';
 	import * as Dialog from '$lib/components/ui/dialog';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import * as Field from '$lib/components/ui/field';
 	import * as Alert from '$lib/components/ui/alert';
 	import { Button } from '$lib/components/ui/button';
@@ -18,6 +19,7 @@
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import DownloadIcon from '@lucide/svelte/icons/download';
 	import PencilIcon from '@lucide/svelte/icons/pencil';
+	import Trash2Icon from '@lucide/svelte/icons/trash-2';
 	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
 
 	let open = $state(false);
@@ -42,6 +44,11 @@
 	let renameOpen = $state(false);
 	let renameIndex = $state(0);
 	let renameValue = $state('');
+
+	// Remove-account confirmation.
+	let removeOpen = $state(false);
+	let removeIndex = $state(0);
+	let removeLabel = $state('');
 
 	const active = $derived(wallet.activeAccount);
 	const atLimit = $derived(wallet.accounts.length >= MAX_ACCOUNTS);
@@ -160,6 +167,26 @@
 			toast.success('Account renamed');
 		} catch (e) {
 			toast.error('Could not rename', { description: errMessage(e) });
+		} finally {
+			busy = false;
+		}
+	}
+
+	function openRemove() {
+		removeIndex = renameIndex;
+		removeLabel = renameValue.trim() || `Account ${renameIndex + 1}`;
+		renameOpen = false;
+		removeOpen = true;
+	}
+
+	async function doRemove() {
+		busy = true;
+		try {
+			await wallet.removeAccount(removeIndex);
+			removeOpen = false;
+			toast.success('Account removed');
+		} catch (e) {
+			toast.error('Could not remove account', { description: errMessage(e) });
 		} finally {
 			busy = false;
 		}
@@ -315,6 +342,17 @@
 			</Field.Field>
 		</Field.Group>
 		<Dialog.Footer>
+			{#if wallet.accounts.length > 1}
+				<Button
+					variant="ghost"
+					class="mr-auto gap-2 text-destructive hover:text-destructive"
+					onclick={openRemove}
+					disabled={busy}
+				>
+					<Trash2Icon class="size-4" />
+					Remove account
+				</Button>
+			{/if}
 			<Button variant="outline" onclick={() => (renameOpen = false)} disabled={busy}>Cancel</Button>
 			<Button onclick={doRename} disabled={busy}>
 				{#if busy}<Spinner data-icon="inline-start" />{/if}
@@ -323,6 +361,27 @@
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>
+
+<!-- Confirm removing an account -->
+<AlertDialog.Root bind:open={removeOpen}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>Remove {removeLabel}?</AlertDialog.Title>
+			<AlertDialog.Description>
+				This erases this account's seed and local data from this device. Its on-chain funds are
+				<strong>not</strong> touched, but you can only restore access with its 12-word recovery
+				phrase. Make sure you've backed it up.
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel disabled={busy}>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Action variant="destructive" onclick={doRemove} disabled={busy}>
+				{#if busy}<Spinner data-icon="inline-start" />{/if}
+				Remove account
+			</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
 
 <style>
 	.trigger {

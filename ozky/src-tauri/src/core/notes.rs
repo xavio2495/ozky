@@ -58,6 +58,27 @@ pub(crate) fn wipe_data_files() {
     }
 }
 
+/// Remove every per-account data file for `address` — all its `*-<tag>.enc`/`.json` stores
+/// (notes, payroll, history, escrow, subs, channel, keeper), where `tag = sha256(address)[..8]`.
+/// Best-effort; used when an account is removed from the wallet. Other accounts' files carry
+/// a different tag and are untouched; shared/pool caches don't carry the tag either.
+pub(crate) fn remove_data_files(address: &str) {
+    let tag = hex::encode(&Sha256::digest(address.as_bytes())[..8]);
+    let Ok(entries) = std::fs::read_dir(data_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.contains(&tag))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// `notes-<16 hex of sha256(stellar_address)>.enc` — keyed by the public address so
 /// multiple wallets on one machine don't collide. The address is public (not secret).
 fn store_path(wallet: &WalletKeys) -> PathBuf {

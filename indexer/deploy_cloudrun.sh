@@ -15,6 +15,9 @@ REGION="${REGION:-us-east1}"
 SERVICE="${SERVICE:-ozky-indexer}"
 POOL_ID="${POOL_ID:?set POOL_ID to the pool contract id the indexer should watch}"
 RPC_URL="${RPC_URL:-https://soroban-testnet.stellar.org}"
+# Path (inside the image) to the historical-leaf seed baked in by the Dockerfile. Set
+# empty to disable seeding. Seeds leaves that aged out of the RPC event window.
+SEED_FILE="${SEED_FILE:-/usr/local/share/ozky-seed.json}"
 
 echo "### enable required APIs (idempotent)"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
@@ -29,7 +32,7 @@ gcloud run deploy "$SERVICE" \
   --min-instances 0 \
   --max-instances 2 \
   --memory 512Mi \
-  --set-env-vars "POOL_ID=$POOL_ID,RPC_URL=$RPC_URL"
+  --set-env-vars "POOL_ID=$POOL_ID,RPC_URL=$RPC_URL,SEED_FILE=$SEED_FILE"
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --format='value(status.url)')

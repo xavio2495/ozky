@@ -12,6 +12,9 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/ozky-indexer /usr/local/bin/ozky-indexer
+# Historical-leaf seed (leaves aged out of RPC event retention). main.rs loads it when
+# SEED_FILE points here; harmless/no-op if the deployment doesn't set SEED_FILE.
+COPY seed.json /usr/local/share/ozky-seed.json
 ENV PORT=8080
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/ozky-indexer"]

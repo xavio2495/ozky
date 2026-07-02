@@ -2167,6 +2167,367 @@ mod tests {
         println!("PAY LIFECYCLE OK");
     }
 
+    /// One-off ADMIN op: fund the pool's AMM reserves so swaps / cross-asset pay have depth
+    /// on every pair (the `swap-reserves-todo` — the live pool was only ever seeded XLM+USDC,
+    /// so EURC quotes come back ~0). Reads `$OZKY_DEPLOY_MNEMONIC` (the pool admin) and
+    /// **adds** a fixed amount per asset via `chain::submit_seed_reserve` (native Soroban RPC
+    /// — no stellar CLI). `seed_reserve` is additive; override per-asset base units with
+    /// `XLM_SEED` / `USDC_SEED` / `EURC_SEED` (0 skips that asset).
+    ///
+    /// The admin account must hold the XLM + USDC + EURC being seeded (with trustlines) —
+    /// `seed_reserve` transfers real SAC from the admin into the pool.
+    ///   OZKY_DEPLOY_MNEMONIC="..." cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture seed_reserves_on_testnet
+    #[test]
+    #[ignore = "live admin op; needs network + ozky.config.json + $OZKY_DEPLOY_MNEMONIC (admin) w/ XLM+USDC+EURC"]
+    fn seed_reserves_on_testnet() {
+        let mnemonic = match std::env::var("OZKY_DEPLOY_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEPLOY_MNEMONIC (the pool admin)");
+                return;
+            }
+        };
+        let wallet = keys::derive_from_mnemonic(&mnemonic).unwrap();
+        let cfg = PoolConfig::load().expect("pool config (ozky.config.json)");
+
+        // `seed_reserve` is gated on the pool's STORED admin and transfers SAC FROM that
+        // admin account — so we must sign as the admin, not just any funded key. Find which
+        // available secret controls the on-chain admin: an explicit `OZKY_ADMIN_SECRET`, the
+        // config relayer secret, or the wallet's own key.
+        let chain_admin = chain::read_pool_admin(&cfg).expect("read pool admin");
+        eprintln!("pool admin on-chain: {chain_admin}");
+        let candidates: Vec<(&str, String)> = [
+            ("OZKY_ADMIN_SECRET", std::env::var("OZKY_ADMIN_SECRET").ok()),
+            ("config relayer_secret", cfg.relayer_secret.clone()),
+            ("wallet", Some(wallet.stellar_secret().to_string())),
+        ]
+        .into_iter()
+        .filter_map(|(name, s)| s.map(|s| (name, s)))
+        .collect();
+        let admin_secret = candidates
+            .iter()
+            .find_map(|(name, secret)| match chain::address_of_secret(secret) {
+                Ok(addr) => {
+                    eprintln!("  candidate {name}: {addr}  MATCH={}", addr == chain_admin);
+                    (addr == chain_admin).then(|| secret.clone())
+                }
+                Err(e) => {
+                    eprintln!("  candidate {name}: bad secret ({e:?})");
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("no available secret controls the pool admin {chain_admin}"));
+
+        // The admin's PUBLIC balances are the source `seed_reserve` transfers from.
+        eprintln!("admin {chain_admin} public balances:");
+        for b in chain::public_balances(&chain_admin).unwrap() {
+            eprintln!("  {} {}", b.balance, b.code);
+        }
+
+        let env_seed = |k: &str, default: u64| -> u64 {
+            std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        // Base units (7 decimals): add 500 XLM / 100 USDC / 100 EURC.
+        let seeds: [(&str, u64); 3] = [
+            ("XLM", env_seed("XLM_SEED", 5_000_000_000)),  // 500 XLM
+            ("USDC", env_seed("USDC_SEED", 1_000_000_000)), // 100 USDC
+            ("EURC", env_seed("EURC_SEED", 1_000_000_000)), // 100 EURC
+        ];
+
+        for (code, seed) in seeds {
+            let c = cfg.clone().with_asset(code).unwrap();
+            let before = chain::read_reserve(&c, &c.asset_tag).unwrap();
+            if seed == 0 {
+                eprintln!("{code}: reserve {before} base — seed 0, skip");
+                continue;
+            }
+            eprintln!("{code}: reserve {before} -> seeding +{seed} base");
+            match chain::submit_seed_reserve(&c, &admin_secret, &c.asset_tag, seed) {
+                Ok(tx) => {
+                    let after = chain::read_reserve(&c, &c.asset_tag).unwrap();
+                    eprintln!("{code}: SEEDED tx {tx} — reserve now {after} base");
+                    assert_eq!(after, before + seed as i128, "{code} reserve += seed");
+                }
+                Err(e) => eprintln!("{code}: SEED FAILED (likely insufficient admin balance): {e:?}"),
+            }
+        }
+
+        println!("=== RESERVES SEEDED ===");
+        for (code, _) in seeds {
+            let c = cfg.clone().with_asset(code).unwrap();
+            println!("{code}_RESERVE={}", chain::read_reserve(&c, &c.asset_tag).unwrap());
+        }
+    }
+
+    /// One-off: replenish the ADMIN's SHIELDED balance from the DEV account. For each asset the
+    /// dev wallet (`$OZKY_DEV_MNEMONIC`) deposits `amount` of its UNSHIELDED balance into the
+    /// pool, then shielded-`send`s that `amount` to the admin's shielded receive code (derived
+    /// from `$OZKY_ADMIN_MNEMONIC`). Net: dev unshielded −amount, admin shielded +amount.
+    /// Pairs with `seed_reserves_on_testnet` (which funds the reserve from the admin's UNSHIELDED)
+    /// so the admin is made whole in shielded form while the dev bears the real cost. Needs the
+    /// prover sidecar + network. Amounts (base units) override via `XLM_SEND` / `USDC_SEND` /
+    /// `EURC_SEND` (default 500 XLM / 100 USDC / 100 EURC).
+    ///   OZKY_DEV_MNEMONIC="illness spike…" OZKY_ADMIN_MNEMONIC="wool mammal…" \
+    ///     cargo test --lib -- --ignored --test-threads=1 --nocapture replenish_admin_shielded_on_testnet
+    #[test]
+    #[ignore = "live deposit+send across two wallets; needs prover sidecar + network + ozky.config.json"]
+    fn replenish_admin_shielded_on_testnet() {
+        use crate::core::deposit;
+        let dev_m = match std::env::var("OZKY_DEV_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEV_MNEMONIC (the sender / dev account)");
+                return;
+            }
+        };
+        let admin_m = match std::env::var("OZKY_ADMIN_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_ADMIN_MNEMONIC (the recipient / admin account)");
+                return;
+            }
+        };
+        let dev = keys::derive_from_mnemonic(&dev_m).unwrap();
+        let admin = keys::derive_from_mnemonic(&admin_m).unwrap();
+        if std::env::var("OZKY_PROVER_BIN").is_err() {
+            std::env::set_var("OZKY_PROVER_BIN", repo_root().join("prover-sidecar/dist/ozky-prover.exe"));
+        }
+        std::env::set_var("OZKY_REPO_ROOT", repo_root());
+        // Persistent notes dir — do NOT wipe (wiping discards deposit openings between runs).
+        let notes_dir = std::env::temp_dir().join("ozky-replenish-notes");
+        std::fs::create_dir_all(&notes_dir).ok();
+        std::env::set_var("OZKY_NOTES_DIR", &notes_dir);
+
+        let cfg = PoolConfig::load().expect("pool config (ozky.config.json)");
+        let admin_code = payment_code(&scan::wallet_identity(&admin).unwrap());
+        eprintln!("admin shielded receive code: {admin_code}");
+
+        // The dev account must be on the policy allow-list to `deposit` (public-edge ASP gate,
+        // Error #13 DepositNotAllowed) AND have its `owner_pk` in the approved set to later
+        // spend it (in-circuit ASP membership). `enroll` does both; `sync_asp_root` propagates
+        // the new root to the pool. Signed by the policy/pool admin (the admin wallet).
+        let admin_secret = admin.stellar_secret().to_string();
+        let dev_id = scan::wallet_identity(&dev).unwrap();
+        let dev_owner_pk = dev_id.owner_pk.to_decimal();
+        let dev_addr = dev.stellar_address().to_string();
+        eprintln!("enrolling dev {dev_addr} (owner_pk {dev_owner_pk}) into the ASP allow-list ...");
+        match chain::submit_enroll(&cfg, &admin_secret, &dev_owner_pk, &dev_addr) {
+            Ok(etx) => eprintln!("enrolled tx {etx}; waiting for asp_root sync ..."),
+            Err(e) => eprintln!("enroll returned an error (already enrolled?): {e:?} — continuing"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(8));
+
+        // The largest SINGLE owned note dev has for an asset. `send_with` uses the cheap
+        // single-input `transfer` when one note covers the amount, and only falls back to the
+        // (here problematic) 4-input `transfer4` when it must combine notes — so we ensure dev
+        // holds ONE note >= the target and let the fast path take it.
+        let dev_max_note = |c: &PoolConfig| -> u64 {
+            let st = chain::pool_state(c).unwrap();
+            scan::owned_notes(&dev_id, &st, &notes::load(&dev).unwrap(), 0)
+                .unwrap()
+                .iter()
+                .filter(|n| n.asset_tag == c.asset_tag)
+                .map(|n| n.value)
+                .max()
+                .unwrap_or(0)
+        };
+
+        // Fast diagnostic (no proving): dump dev + admin owned notes per asset, then stop.
+        if std::env::var("DIAGNOSE_ONLY").is_ok() {
+            let admin_id = scan::wallet_identity(&admin).unwrap();
+            for code in ["XLM", "USDC", "EURC"] {
+                let c = cfg.clone().with_asset(code).unwrap();
+                let st = chain::pool_state(&c).unwrap();
+                let dn = scan::owned_notes(&dev_id, &st, &notes::load(&dev).unwrap(), 0).unwrap();
+                eprintln!("DEV {code} notes:");
+                for n in dn.iter().filter(|n| n.asset_tag == c.asset_tag) {
+                    eprintln!("  leaf {} value {}", n.leaf_index, n.value);
+                }
+                let an = scan::owned_notes(&admin_id, &st, &notes::load(&admin).unwrap(), 0).unwrap();
+                let atot: u64 =
+                    an.iter().filter(|n| n.asset_tag == c.asset_tag).map(|n| n.value).sum();
+                eprintln!("ADMIN {code} shielded total: {atot}");
+            }
+            return;
+        }
+
+        let env_amt =
+            |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        // Base units: mirror the reserve seed (500 XLM / 100 USDC / 100 EURC).
+        let sends: [(&str, u64); 3] = [
+            ("XLM", env_amt("XLM_SEND", 5_000_000_000)),
+            ("USDC", env_amt("USDC_SEND", 1_000_000_000)),
+            ("EURC", env_amt("EURC_SEND", 1_000_000_000)),
+        ];
+
+        for (code, amt) in sends {
+            if amt == 0 {
+                eprintln!("{code}: amount 0, skip");
+                continue;
+            }
+            let c = cfg.clone().with_asset(code).unwrap();
+            // Ensure ONE note covers the full amount (reuse an existing big-enough note if a
+            // prior run left one; otherwise deposit the whole amount as a single fresh note).
+            let have = dev_max_note(&c);
+            if have < amt {
+                eprintln!("{code}: dev deposit {amt} base as one note (largest note {have} < {amt}) ...");
+                let dtx = deposit::deposit_with(&dev, &c, amt)
+                    .unwrap_or_else(|e| panic!("deposit {code} {amt}: {e:?}"));
+                eprintln!("{code}: deposited tx {dtx}; polling until the note indexes ...");
+                // getEvents can lag tx SUCCESS — wait until a single note >= amt is spendable.
+                let mut waited = 0;
+                while dev_max_note(&c) < amt {
+                    if waited >= 120 {
+                        panic!("{code}: deposited note not visible after {waited}s");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    waited += 6;
+                }
+                eprintln!("{code}: single note >= {amt} visible after {waited}s");
+            } else {
+                eprintln!("{code}: dev already holds a note of {have} (>= {amt}) — reuse it");
+            }
+            eprintln!("{code}: dev send {amt} base -> admin shielded (single-input transfer) ...");
+            let stx = send_with(&dev, &c, &admin_code, amt)
+                .unwrap_or_else(|e| panic!("send {code} {amt} to admin: {e:?}"));
+            eprintln!("{code}: SENT tx {stx}");
+            std::thread::sleep(std::time::Duration::from_secs(6));
+        }
+        println!("=== ADMIN SHIELDED REPLENISHED (dev -> admin) ===");
+    }
+
+    /// One-off: compensate the ADMIN with a plain PUBLIC (unshielded) payment from the DEV
+    /// account — the reliable alternative to the shielded route when this aged pool's Merkle
+    /// tree can't be rebuilt from RPC (so a shielded `send` can't be proven). Dev
+    /// (`$OZKY_DEV_MNEMONIC`) sends 500 XLM / 100 USDC / 100 EURC directly to the admin's
+    /// classic account (`$OZKY_ADMIN_MNEMONIC` → its `G…` address). No proof, no pool. Dev
+    /// signs as both fee-payer and payment source. Amounts (base units) override via
+    /// `XLM_PAY` / `USDC_PAY` / `EURC_PAY`. The admin already holds USDC/EURC trustlines.
+    ///   OZKY_DEV_MNEMONIC="illness spike…" OZKY_ADMIN_MNEMONIC="wool mammal…" \
+    ///     cargo test --lib -- --ignored --test-threads=1 --nocapture pay_admin_public_on_testnet
+    #[test]
+    #[ignore = "live public payments dev -> admin; needs network + ozky.config.json"]
+    fn pay_admin_public_on_testnet() {
+        let dev_m = match std::env::var("OZKY_DEV_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_DEV_MNEMONIC (the paying / dev account)");
+                return;
+            }
+        };
+        let admin_m = match std::env::var("OZKY_ADMIN_MNEMONIC") {
+            Ok(m) if !m.trim().is_empty() => m,
+            _ => {
+                eprintln!("skip: set OZKY_ADMIN_MNEMONIC (the recipient / admin account)");
+                return;
+            }
+        };
+        let dev = keys::derive_from_mnemonic(&dev_m).unwrap();
+        let admin = keys::derive_from_mnemonic(&admin_m).unwrap();
+        let dev_secret = dev.stellar_secret().to_string();
+        let admin_addr = admin.stellar_address().to_string();
+        let cfg = PoolConfig::load().expect("pool config (ozky.config.json)");
+
+        let env_amt =
+            |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        // Base units (7 decimals): 500 XLM / 100 USDC / 100 EURC — mirrors the reserve seed.
+        let pays: [(&str, u64); 3] = [
+            ("XLM", env_amt("XLM_PAY", 5_000_000_000)),
+            ("USDC", env_amt("USDC_PAY", 1_000_000_000)),
+            ("EURC", env_amt("EURC_PAY", 1_000_000_000)),
+        ];
+
+        // The fee-payer (tx source) must DIFFER from the payment source (dev), else the two
+        // attached signatures collapse to one key → txBAD_AUTH_EXTRA. Use the configured
+        // relayer as fee-payer; require it to be present and distinct from dev.
+        let relayer_secret = cfg
+            .relayer_secret
+            .clone()
+            .expect("OZKY_RELAYER_SECRET required as the fee-payer (must differ from dev)");
+        assert_ne!(
+            chain::address_of_secret(&relayer_secret).unwrap(),
+            dev.stellar_address(),
+            "relayer must differ from dev (else txBAD_AUTH_EXTRA)"
+        );
+        eprintln!("paying admin {admin_addr} from dev {} (relayer fee-payer) ...", dev.stellar_address());
+        for (code, amt) in pays {
+            if amt == 0 {
+                eprintln!("{code}: amount 0, skip");
+                continue;
+            }
+            let info = crate::core::config::asset_by_code(code).unwrap();
+            let tx = chain::submit_public_payment(
+                &cfg, &relayer_secret, &dev_secret, &admin_addr, info.code, info.issuer, amt,
+            )
+            .unwrap_or_else(|e| panic!("public pay {code} {amt}: {e:?}"));
+            eprintln!("{code}: PAID {amt} base -> admin, tx {tx}");
+        }
+        println!("=== ADMIN COMPENSATED PUBLICLY (dev -> admin) ===");
+        for b in chain::public_balances(&admin_addr).unwrap() {
+            println!("admin {} {}", b.balance, b.code);
+        }
+    }
+
+    /// One-off VERIFY + EXPORT: prove the local warm cache holds the pool's full commitment
+    /// set (the leaves aged out of RPC), then export the early leaves as an indexer seed.
+    /// Rebuilds the commitment tree from `pool_state` (warm cache `poolcache-<pool>.json` in
+    /// the app data dir + a forward RPC drain), computes its root via `commitment_path`, and
+    /// asserts it equals the on-chain `commitment_root()`. On match, writes
+    /// `indexer/seed-<pool>.json` (leaf_index/commitment/enc_note/ephemeral_pub/view_tag for
+    /// every leaf) — the static backfill the deployed indexer loads so cold clients get the
+    /// complete tree. Point `OZKY_NOTES_DIR` at the REAL app data dir (default
+    /// `%APPDATA%/ozky`) so the warm cache is loaded — do NOT use a throwaway dir.
+    ///   OZKY_NOTES_DIR="%APPDATA%/ozky" cargo test --lib -- --ignored --test-threads=1 \
+    ///     --nocapture verify_and_export_tree_seed
+    #[test]
+    #[ignore = "reads the machine's warm pool cache + network; exports indexer seed"]
+    fn verify_and_export_tree_seed() {
+        use crate::core::poseidon::Hasher;
+        use crate::core::witness::commitment_path;
+        let cfg = PoolConfig::load().expect("pool config (ozky.config.json)");
+
+        let state = chain::pool_state(&cfg).expect("pool_state");
+        let mut commits = state.commits;
+        commits.sort_by_key(|c| c.leaf_index);
+        let n = commits.len();
+        let lo = commits.first().map(|c| c.leaf_index).unwrap_or(0);
+        let hi = commits.last().map(|c| c.leaf_index).unwrap_or(0);
+        eprintln!("reconstructed {n} commits, leaf range {lo}..={hi}");
+        // Contiguity from leaf 0 is required for a valid append-only tree.
+        for (i, c) in commits.iter().enumerate() {
+            assert_eq!(c.leaf_index as usize, i, "leaf index gap at position {i} (missing leaves)");
+        }
+
+        let leaves = chain::commitment_leaves_from(&commits).expect("leaves");
+        let h = Hasher::new();
+        let root = commitment_path(&h, &leaves, 0).root;
+        let onchain = chain::read_commitment_root(&cfg).expect("read on-chain root");
+        eprintln!("reconstructed root: {}", root.to_hex());
+        eprintln!("on-chain root:      {}", onchain.to_hex());
+        assert_eq!(root.to_hex(), onchain.to_hex(), "tree incomplete/misordered — root mismatch");
+        eprintln!("ROOT MATCH ✓ — warm cache holds the full, correctly-ordered tree");
+
+        // Export EVERY leaf as the indexer seed (indexer dedups vs its RPC drain by leaf_index).
+        let items: Vec<String> = commits
+            .iter()
+            .map(|c| {
+                let opt = |o: &Option<String>| match o {
+                    Some(s) => format!("\"{s}\""),
+                    None => "null".into(),
+                };
+                let vt = c.view_tag.map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+                format!(
+                    "{{\"leaf_index\":{},\"commitment\":\"{}\",\"enc_note\":{},\"ephemeral_pub\":{},\"view_tag\":{}}}",
+                    c.leaf_index, c.commitment, opt(&c.enc_note), opt(&c.ephemeral_pub), vt
+                )
+            })
+            .collect();
+        let out = repo_root().join("indexer/seed.json");
+        std::fs::write(&out, format!("[{}]", items.join(",\n"))).expect("write seed");
+        println!("WROTE {} ({} leaves for pool {})", out.display(), n, cfg.pool_contract);
+    }
+
     /// One-off: perform a REAL split on the configured (split-capable) pool. Reads
     /// `$OZKY_DEPLOY_MNEMONIC`, splits 30 XLM -> 3 self-codes (10 each) + change, then
     /// rescans and asserts the 3 outputs + change landed and the input note is spent.

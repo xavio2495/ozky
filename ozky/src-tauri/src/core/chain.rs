@@ -13,10 +13,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, BeginSponsoringFutureReservesOp, BytesM,
-    ChangeTrustAsset, ChangeTrustOp, ContractId, CreateAccountOp, DecoratedSignature, Hash,
+    ChangeTrustAsset, ChangeTrustOp, ContractDataDurability, ContractId, CreateAccountOp,
+    DecoratedSignature, Hash,
     PaymentOp,
     HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntryData, LedgerKey,
-    LedgerKeyAccount, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    LedgerKeyAccount, LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec,
     SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt256Parts, Uint256, VecM,
@@ -599,6 +600,33 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
         );
     }
 
+    // Backfill leaves that aged out of the RPC event-retention window. Soroban RPC
+    // `getEvents` only serves a recent ledger window, so on a long-lived pool the earliest
+    // `commit` events fall out of range: a cold client (empty cache) drains only the recent
+    // leaves, its reconstructed tree is missing the low prefix, and its root won't match the
+    // on-chain root (spends can't be proven). When the set isn't contiguous from leaf 0, pull
+    // the full commitment history from the indexer (which persists it past RPC retention) and
+    // merge by leaf_index. Once merged + cached, the gap is closed so this won't re-trigger.
+    if use_cache && !commits.is_empty() {
+        let contiguous = commits[0].leaf_index == 0
+            && commits.windows(2).all(|w| w[1].leaf_index == w[0].leaf_index + 1);
+        if !contiguous {
+            if let Some(backfill) = fetch_indexer_commits() {
+                let have: std::collections::HashSet<u32> =
+                    commits.iter().map(|c| c.leaf_index).collect();
+                let added: Vec<CommitEntry> =
+                    backfill.into_iter().filter(|c| !have.contains(&c.leaf_index)).collect();
+                if log {
+                    eprintln!("[ozky-scan] backfilled {} early leaves from indexer", added.len());
+                }
+                commits.extend(added);
+                commits.sort_by_key(|c| c.leaf_index);
+            } else if log {
+                eprintln!("[ozky-scan] tree not contiguous from leaf 0 and indexer unreachable");
+            }
+        }
+    }
+
     if use_cache {
         save_cache(
             pool,
@@ -611,6 +639,37 @@ pub fn pool_state(cfg: &PoolConfig) -> Result<PoolState, CoreError> {
     }
 
     Ok(PoolState { commits, nullifiers })
+}
+
+/// The indexer base URL for commitment backfill: `OZKY_INDEXER_URL` if set, else the URL
+/// discovered from the `/connect` broker. `None` when neither is available.
+fn indexer_url() -> Option<String> {
+    if let Some(u) = super::config::cfg_var("OZKY_INDEXER_URL") {
+        return Some(u);
+    }
+    super::connect::discover().services.indexer.url
+}
+
+/// Fetch the full commitment set from the indexer's `/scan?from=0` (it persists the
+/// complete history past RPC event retention via its static seed). Best-effort: any
+/// missing URL / transport / parse error yields `None` and the caller proceeds with the
+/// raw-RPC set. Field shape mirrors [`CommitEntry`] (see `indexer/src/main.rs::commit_json`).
+fn fetch_indexer_commits() -> Option<Vec<CommitEntry>> {
+    let base = indexer_url()?;
+    let url = format!("{}/scan?from=0", base.trim_end_matches('/'));
+    let v: Value = http_agent().get(&url).call().ok()?.into_json().ok()?;
+    let arr = v.get("commitments")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for c in arr {
+        out.push(CommitEntry {
+            leaf_index: c.get("leaf_index")?.as_u64()? as u32,
+            commitment: c.get("commitment")?.as_str()?.to_string(),
+            enc_note: c.get("enc_note").and_then(|x| x.as_str()).map(String::from),
+            ephemeral_pub: c.get("ephemeral_pub").and_then(|x| x.as_str()).map(String::from),
+            view_tag: c.get("view_tag").and_then(|x| x.as_u64()).map(|n| n as u32),
+        });
+    }
+    Some(out)
 }
 
 /// Commitment leaves in tree order (for local Merkle-path reconstruction).
@@ -1378,6 +1437,89 @@ pub fn read_reserve(cfg: &PoolConfig, asset_tag: &Fr) -> Result<i128, CoreError>
         ScVal::I128(Int128Parts { hi, lo }) => Ok(((hi as i128) << 64) | (lo as i128)),
         _ => Err(CoreError::Chain("reserve: unexpected return type".into())),
     }
+}
+
+/// The classic `G…` address a secret key (`S…`) controls.
+pub fn address_of_secret(secret: &str) -> Result<String, CoreError> {
+    match super::sign::Signer::from_secret(secret)?.account_id() {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(b))) => {
+            Ok(stellar_strkey::ed25519::PublicKey(b).to_string())
+        }
+    }
+}
+
+/// Read the pool's stored `admin` (the account authorized for `seed_reserve` /
+/// `withdraw_reserve` / `upgrade`), by pulling `Config.admin` out of the contract's
+/// instance storage. Returns the admin's `G…` strkey.
+pub fn read_pool_admin(cfg: &PoolConfig) -> Result<String, CoreError> {
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address(&cfg.pool_contract)?,
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let kb64 = key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| CoreError::Chain(format!("xdr ledger key: {e}")))?;
+    let r = rpc_call(&cfg.rpc_url, "getLedgerEntries", json!({ "keys": [kb64] }))
+        .map_err(CoreError::Chain)?;
+    let xdr = r
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("xdr"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::Chain("pool instance entry not found".into()))?;
+    let val = match LedgerEntryData::from_xdr_base64(xdr, Limits::none())
+        .map_err(|e| CoreError::Chain(format!("decode instance entry: {e}")))?
+    {
+        LedgerEntryData::ContractData(cd) => cd.val,
+        _ => return Err(CoreError::Chain("pool entry is not contract data".into())),
+    };
+    let storage = match val {
+        ScVal::ContractInstance(i) => {
+            i.storage.ok_or_else(|| CoreError::Chain("empty instance storage".into()))?
+        }
+        _ => return Err(CoreError::Chain("pool entry is not a contract instance".into())),
+    };
+    // The `Config` struct is a Map value in instance storage; read its `admin` field.
+    for ScMapEntry { val, .. } in storage.0.iter() {
+        if let ScVal::Map(Some(m)) = val {
+            for e in m.0.iter() {
+                if matches!(&e.key, ScVal::Symbol(s) if s.0.as_slice() == b"admin") {
+                    if let ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256(bytes)),
+                    ))) = &e.val
+                    {
+                        return Ok(stellar_strkey::ed25519::PublicKey(*bytes).to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err(CoreError::Chain("admin not found in pool config".into()))
+}
+
+/// Read the pool's current on-chain commitment-tree root (the `commitment_root()` view).
+/// This is the authoritative append-only Merkle root a client's reconstructed tree must
+/// match; use it to verify a rebuilt commitment set is complete + correctly ordered.
+pub fn read_commitment_root(cfg: &PoolConfig) -> Result<Fr, CoreError> {
+    let v = simulate_invoke(cfg, &cfg.pool_contract, "commitment_root", vec![])?;
+    let hex = u256_hex(&v)
+        .ok_or_else(|| CoreError::Chain("commitment_root: not a U256".into()))?;
+    Fr::from_hex(&hex).ok_or_else(|| CoreError::Chain(format!("commitment_root bad hex: {hex}")))
+}
+
+/// Seed the pool's AMM reserve for `asset_tag` by `amount` base units (admin-only
+/// `seed_reserve`; pulls `amount` SAC from the admin into the pool and adds it to the
+/// reserve). `admin_secret` must be the pool's `admin` key. Returns the tx hash.
+pub fn submit_seed_reserve(
+    cfg: &PoolConfig,
+    admin_secret: &str,
+    asset_tag: &Fr,
+    amount: u64,
+) -> Result<String, CoreError> {
+    let args = vec![sc_u256_fr(asset_tag), sc_i128(amount)];
+    invoke_contract(cfg, admin_secret, &cfg.pool_contract, "seed_reserve", args)
 }
 
 /// Submit a `shielded_swap` to the pool. `outputs[0]` is the A change note, `outputs[1]` the minted

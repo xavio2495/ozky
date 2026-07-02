@@ -10,6 +10,7 @@ mod rpc;
 mod state;
 mod tree;
 
+use events::Commit;
 use rpc::Rpc;
 use soroban_sdk::Env;
 use state::{poll_once, State};
@@ -17,6 +18,38 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tiny_http::{Header, Method, Response, Server};
+
+/// One historical leaf in a `SEED_FILE` (aged-out commitments to pre-load; see startup).
+#[derive(serde::Deserialize)]
+struct SeedCommit {
+    leaf_index: u32,
+    commitment: String,
+    #[serde(default)]
+    enc_note: Option<String>,
+    #[serde(default)]
+    ephemeral_pub: Option<String>,
+    #[serde(default)]
+    view_tag: Option<u32>,
+}
+
+/// Load a `SEED_FILE` (JSON array of historical leaves) into indexer `Commit`s. `ledger`/
+/// `tx_hash` are synthetic (0/"seed") — clients use them for display only, not the tree.
+fn load_seed(path: &str) -> Result<Vec<Commit>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let seed: Vec<SeedCommit> = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok(seed
+        .into_iter()
+        .map(|s| Commit {
+            leaf_index: s.leaf_index,
+            commitment: s.commitment,
+            enc_note: s.enc_note,
+            ephemeral_pub: s.ephemeral_pub,
+            view_tag: s.view_tag,
+            ledger: 0,
+            tx_hash: "seed".to_string(),
+        })
+        .collect())
+}
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -57,6 +90,22 @@ fn main() {
         start_ledger: start,
         ..Default::default()
     }));
+
+    // Seed historical leaves that aged out of the RPC event-retention window (so a cold
+    // client can still build a complete, root-matching Merkle tree). Optional: set
+    // SEED_FILE to a JSON array of {leaf_index, commitment, enc_note, ephemeral_pub,
+    // view_tag}. The live poll below merges/dedups by leaf_index, so seeded + polled
+    // leaves compose into the full tree.
+    if let Ok(path) = std::env::var("SEED_FILE") {
+        match load_seed(&path) {
+            Ok(seed) => {
+                let n = seed.len();
+                state.lock().unwrap().seed_commits(seed);
+                eprintln!("seeded {n} historical commitments from {path}");
+            }
+            Err(e) => eprintln!("seed load failed ({path}): {e} — continuing without seed"),
+        }
+    }
 
     // Blocking initial ingest so the instance serves correct data immediately on
     // (cold) start — important under Cloud Run scale-to-zero, where each cold start

@@ -1125,11 +1125,16 @@ mod tests {
             Payroll {
                 id: 0,
                 label: "Cloud keeper test".into(),
+                groups: vec![],
                 asset: "XLM".into(),
                 payees,
                 cadence: Cadence::Weekly,
                 next_run_unix: payroll::now(),
                 last_run_unix: None,
+                end_unix: None,
+                auditor: None,
+                approval: None,
+                run_location: None,
                 enabled: true,
             },
         )

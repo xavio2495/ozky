@@ -22,6 +22,16 @@ pub struct State {
 }
 
 impl State {
+    /// Pre-load historical commitments (leaves that have aged out of the RPC event
+    /// retention window and can no longer be drained live). Idempotent + merges with the
+    /// live poll by `leaf_index`, so seeded leaves and freshly-polled leaves compose into
+    /// the full append-only tree. Call once at startup before polling.
+    pub fn seed_commits(&mut self, commits: Vec<Commit>) {
+        for c in commits {
+            self.ingest(PoolEvent::Commit(c));
+        }
+    }
+
     fn ingest(&mut self, ev: PoolEvent) {
         match ev {
             PoolEvent::Commit(c) => {
